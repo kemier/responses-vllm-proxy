@@ -1067,6 +1067,80 @@ impl ResponseTranslator {
         self.emit("response.completed", completed)
     }
 
+    /// Return the output items from this response — the same items that
+    /// `build_completed_event` puts in the `output` array. Used by the
+    /// WebSocket handler to append the assistant's response (messages,
+    /// function calls, reasoning) to the cached request's input array,
+    /// so that on the next incremental request (previous_response_id),
+    /// the merged conversation includes the assistant's previous output.
+    ///
+    /// Without this, the LLM sees only the original user messages + new
+    /// tool results, but NOT the assistant's text/tool calls from the
+    /// previous turn — causing it to re-do the same work (infinite loop).
+    pub fn get_output_items(&self) -> Vec<Value> {
+        let mut output = Vec::new();
+
+        // Reasoning item (if any)
+        if let Some(rid) = &self.reasoning_id {
+            let full_reasoning = &self.reasoning_buf;
+            let item = json!({
+                "id": rid,
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{
+                    "type": "summary_text",
+                    "text": full_reasoning,
+                }],
+            });
+            output.push(item);
+        }
+
+        // Message items
+        for (idx, ms) in &self.msg_states {
+            let item = json!({
+                "id": format!("msg_{}_{}", self.response_id, idx),
+                "type": "message",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "annotations": [],
+                    "logprobs": [],
+                    "text": ms.text_buf,
+                }],
+                "role": "assistant",
+            });
+            output.push(item);
+        }
+
+        // Function call items
+        for (_, fs) in &self.func_states {
+            let is_custom = is_custom_tool(&fs.name);
+            let item = if is_custom {
+                let input = extract_custom_tool_input(&fs.args_buf);
+                json!({
+                    "id": format!("fc_{}", fs.call_id),
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "input": input,
+                    "call_id": fs.call_id,
+                    "name": fs.name,
+                })
+            } else {
+                json!({
+                    "id": format!("fc_{}", fs.call_id),
+                    "type": "function_call",
+                    "status": "completed",
+                    "arguments": fs.args_buf,
+                    "call_id": fs.call_id,
+                    "name": fs.name,
+                })
+            };
+            output.push(item);
+        }
+
+        output
+    }
+
     /// Emit a translated event. Takes ownership of the payload Value (no clone).
     /// In SSE mode, wraps it in `event: <event>\ndata: <json>\n\n`.
     /// In raw JSON mode, returns just the JSON string.

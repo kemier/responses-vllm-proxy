@@ -939,6 +939,33 @@ pub async fn handle_responses_ws(
                 }
             }
 
+            // ── Append assistant output to cached request ────────────────
+            // CRITICAL: After the response completes, we must append the
+            // assistant's output items (messages, function calls, reasoning)
+            // to the cached request's input array. Without this, on the next
+            // incremental request (previous_response_id), the merged
+            // conversation would contain only the original user messages +
+            // new tool results — but NOT the assistant's previous text or
+            // tool calls. The LLM would not see its own prior output and
+            // would re-do the same work, causing an infinite loop.
+            let output_items = translator.get_output_items();
+            if !output_items.is_empty() {
+                if let Some(cached_arc) = response_request_cache.get(&response_id_for_cache).cloned() {
+                    let mut cached_arc = cached_arc;
+                    let cached = Arc::make_mut(&mut cached_arc);
+                    if let Some(input_arr) = cached.get_mut("input").and_then(|v| v.as_array_mut()) {
+                        let before_len = input_arr.len();
+                        input_arr.extend(output_items);
+                        logger::info("ws", &format!(
+                            "[{}] Appended {} assistant output items to cached request (input: {} → {})",
+                            conn_short, input_arr.len() - before_len, before_len, input_arr.len()
+                        ));
+                    }
+                    // Put the updated Arc back into the cache
+                    response_request_cache.insert(response_id_for_cache.clone(), cached_arc);
+                }
+            }
+
             // Turn complete — loop back to recv() the next request on the
             // SAME connection.  No log spam; only log on actual close.
         }
