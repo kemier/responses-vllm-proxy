@@ -14,7 +14,7 @@ log-dir: "logs"
 
 # Per-turn debug logging (instructions length, preview, tools count, input items)
 # Set to true to diagnose hallucination caused by missing system prompt on incremental requests.
-log-turn-debug: false
+log-turn-debug: true
 
 openai-compatibility:
   - name: "ericai"

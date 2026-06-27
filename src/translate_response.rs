@@ -1,6 +1,34 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+/// Return the byte length of the longest suffix of `text` that is also a
+/// prefix of `tag`. Used to detect partial tag matches at chunk boundaries.
+///
+/// For example, if `text` ends with "<thi" and `tag` is "<think>", this
+/// returns 4 (the length of "<thi"), so the caller knows to hold back those
+/// 4 bytes for the next chunk.
+///
+/// Returns at most `tag.len() - 1` — a full match means `find()` would have
+/// located the tag already.
+fn longest_suffix_prefix(text: &str, tag: &str) -> usize {
+    if text.is_empty() || tag.is_empty() {
+        return 0;
+    }
+    let max_len = text.len().min(tag.len() - 1);
+    let mut len = max_len;
+    while len > 0 {
+        // Only check at valid UTF-8 character boundaries.
+        if text.is_char_boundary(text.len() - len) {
+            let suffix = &text[text.len() - len..];
+            if tag.starts_with(suffix) {
+                return len;
+            }
+        }
+        len -= 1;
+    }
+    0
+}
+
 /// Check if a tool name corresponds to a freeform/custom tool (apply_patch).
 /// These tools must be emitted as `custom_tool_call` items in the Responses API,
 /// not as `function_call` items, because Codex dispatches them via the
@@ -32,6 +60,9 @@ struct MessageState {
     item_added: bool,
     content_added: bool,
     item_done: bool,
+    /// Pre-computed item_id ("msg_{response_id}_{idx}") to avoid format!()
+    /// on every text delta — the hottest path in the proxy.
+    item_id: String,
 }
 
 /// Per-tool-call state (keyed by "choice_idx:tool_idx"), consolidating the
@@ -78,6 +109,12 @@ pub struct ResponseTranslator {
 
     // Think tag state
     in_think_tag: bool,
+    // Buffer for content that might contain a partial think tag at a chunk
+    // boundary. When streaming, a tag like "<think>" can be split across
+    // multiple chunks (e.g. "<thi" + "nk>"). We hold back any suffix of the
+    // current chunk that is a prefix of the tag we're searching for, so the
+    // complete tag can be detected when the next chunk arrives.
+    think_pending: String,
 
     // When true, emit raw JSON strings (for WebSocket) instead of SSE
     // `event: ...\ndata: ...` envelopes (for HTTP SSE).
@@ -119,6 +156,7 @@ impl ResponseTranslator {
             reasoning_tokens: 0,
             usage_seen: false,
             in_think_tag: false,
+            think_pending: String::new(),
             raw_json,
             request_json,
         }
@@ -265,72 +303,106 @@ impl ResponseTranslator {
         out
     }
 
-    fn handle_content(&mut self, idx: usize, mut content: &str) -> Vec<String> {
+    fn handle_content(&mut self, idx: usize, content: &str) -> Vec<String> {
         let mut out = Vec::new();
 
-        // Strip think tags
-        if !self.in_think_tag {
-            if let Some(start) = content.find("<think>") {
-                let before = &content[..start];
-                if !before.is_empty() {
-                    let events = self.emit_text_delta(idx, before);
-                    out.extend(events);
-                }
-                self.in_think_tag = true;
-                content = &content[start + 7..]; // skip "<think>"
-            }
-        }
+        // Append the new chunk to the pending buffer. This lets us detect
+        // think tags that are split across chunk boundaries.
+        self.think_pending.push_str(content);
 
-        if self.in_think_tag {
-            if let Some(end) = content.find("</think>") {
-                let think_content = &content[..end];
+        // Process the buffer in a loop: each iteration either finds a complete
+        // tag (and continues with the remainder) or determines that no more
+        // complete tags can be found (and holds back a possible partial tag
+        // prefix before returning).
+        loop {
+            if !self.in_think_tag {
+                // Looking for opening tag "<think>"
+                if let Some(start) = self.think_pending.find("<think>") {
+                    // Emit any text before the tag as a text delta.
+                    let before = self.think_pending[..start].to_string();
+                    if !before.is_empty() {
+                        if self.reasoning_id.is_some() {
+                            out.extend(self.stop_reasoning());
+                        }
+                        out.extend(self.emit_text_delta(idx, &before));
+                    }
+                    self.in_think_tag = true;
+                    // Remove the processed portion (including the tag) from the buffer.
+                    self.think_pending = self.think_pending[start + 7..].to_string();
+                    // Continue the loop to process the remainder (which may
+                    // contain "</think>" or more text).
+                    continue;
+                } else {
+                    // No complete opening tag found. Check whether the buffer
+                    // ends with a prefix of "<think>" (e.g. "<thi"). If so,
+                    // hold that suffix back for the next chunk and emit the
+                    // rest as text.
+                    let suffix_len = longest_suffix_prefix(&self.think_pending, "<think>");
+                    let emit_len = self.think_pending.len() - suffix_len;
+                    if emit_len > 0 {
+                        let to_emit = self.think_pending[..emit_len].to_string();
+                        if self.reasoning_id.is_some() {
+                            out.extend(self.stop_reasoning());
+                        }
+                        out.extend(self.emit_text_delta(idx, &to_emit));
+                    }
+                    self.think_pending = self.think_pending[emit_len..].to_string();
+                    return out;
+                }
+            }
+
+            // in_think_tag is true: looking for closing tag "</think>"
+            if let Some(end) = self.think_pending.find("</think>") {
+                let think_content = self.think_pending[..end].to_string();
                 if !think_content.is_empty() {
-                    let events = self.handle_reasoning_content(idx, think_content);
-                    out.extend(events);
+                    out.extend(self.handle_reasoning_content(idx, &think_content));
                 }
                 self.in_think_tag = false;
-                content = &content[end + 8..]; // skip "</think>"
-                content = content.trim_start_matches('\n');
-            } else {
-                // Still inside think tag
-                if !content.is_empty() {
-                    let events = self.handle_reasoning_content(idx, content);
-                    out.extend(events);
+                // Remove the processed portion (including the closing tag).
+                self.think_pending = self.think_pending[end + 8..].to_string();
+                // Trim leading newlines that typically follow </think>.
+                let trimmed = self.think_pending.trim_start_matches('\n');
+                if trimmed.len() < self.think_pending.len() {
+                    self.think_pending = trimmed.to_string();
                 }
+                // Continue the loop to process the remainder as text.
+                continue;
+            } else {
+                // No complete closing tag found. Check whether the buffer ends
+                // with a prefix of "</think>" (e.g. "</thi"). Hold that suffix
+                // back and emit the rest as reasoning content.
+                let suffix_len = longest_suffix_prefix(&self.think_pending, "</think>");
+                let emit_len = self.think_pending.len() - suffix_len;
+                if emit_len > 0 {
+                    let to_emit = self.think_pending[..emit_len].to_string();
+                    out.extend(self.handle_reasoning_content(idx, &to_emit));
+                }
+                self.think_pending = self.think_pending[emit_len..].to_string();
                 return out;
             }
         }
-
-        if content.is_empty() {
-            return out;
-        }
-
-        // Stop reasoning if active
-        if self.reasoning_id.is_some() {
-            let events = self.stop_reasoning();
-            out.extend(events);
-        }
-
-        out.extend(self.emit_text_delta(idx, content));
-        out
     }
 
    fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
        let mut out = Vec::new();
 
-        // Ensure the MessageState entry exists, allocating an output index.
-        if !self.msg_states.contains_key(&idx) {
-            let ix = self.alloc_output_index();
-            self.msg_states.insert(idx, MessageState {
-                text_buf: String::new(),
-                output_ix: ix,
-                item_added: false,
-                content_added: false,
-                item_done: false,
-            });
-        }
-        let msg_output_index = self.msg_states[&idx].output_ix;
-       let item_id = format!("msg_{}_{}", self.response_id, idx);
+       // Ensure the MessageState entry exists, allocating an output index.
+       if !self.msg_states.contains_key(&idx) {
+           let ix = self.alloc_output_index();
+           let item_id = format!("msg_{}_{}", self.response_id, idx);
+           self.msg_states.insert(idx, MessageState {
+               text_buf: String::new(),
+               output_ix: ix,
+               item_added: false,
+               content_added: false,
+               item_done: false,
+               item_id,
+           });
+       }
+       let msg_output_index = self.msg_states[&idx].output_ix;
+       // Clone the pre-computed item_id (cheaper than format!() which
+       // invokes the formatting machinery on every text delta).
+       let item_id = self.msg_states[&idx].item_id.clone();
 
         let need_item_added = !self.msg_states[&idx].item_added;
         if need_item_added {
@@ -439,54 +511,58 @@ impl ResponseTranslator {
         out
     }
 
-    fn stop_reasoning(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        if let Some(rid) = self.reasoning_id.take() {
-            let rix = self.reasoning_index.take().unwrap();
+   fn stop_reasoning(&mut self) -> Vec<String> {
+       let mut out = Vec::new();
+       if let Some(rid) = self.reasoning_id.take() {
+           let rix = self.reasoning_index.take().unwrap();
 
-            let done = json!({
-                "type": "response.reasoning_summary_text.done",
-                "sequence_number": self.next_seq(),
-                "item_id": rid,
-                "output_index": rix,
-                "summary_index": 0,
-                "text": self.reasoning_buf.clone(),
-            });
-            out.push(self.emit("response.reasoning_summary_text.done", done));
+           // Take ownership of the buffer instead of cloning it 3×.
+           // After this point reasoning_buf is empty, so the explicit
+           // .clear() below is no longer needed.
+           let full_reasoning = std::mem::take(&mut self.reasoning_buf);
 
-            let part_done = json!({
-                "type": "response.reasoning_summary_part.done",
-                "sequence_number": self.next_seq(),
-                "item_id": rid,
-                "output_index": rix,
-                "summary_index": 0,
-                "part": {
-                    "type": "summary_text",
-                    "text": self.reasoning_buf.clone(),
-                }
-            });
-            out.push(self.emit("response.reasoning_summary_part.done", part_done));
+           let done = json!({
+               "type": "response.reasoning_summary_text.done",
+               "sequence_number": self.next_seq(),
+               "item_id": rid,
+               "output_index": rix,
+               "summary_index": 0,
+               "text": full_reasoning.clone(),
+           });
+           out.push(self.emit("response.reasoning_summary_text.done", done));
 
-            let item_done = json!({
-                "type": "response.output_item.done",
-                "sequence_number": self.next_seq(),
-                "output_index": rix,
-                "item": {
-                    "id": rid,
-                    "type": "reasoning",
-                    "status": "completed",
-                    "summary": [{
-                        "type": "summary_text",
-                        "text": self.reasoning_buf.clone(),
-                    }],
-                }
-            });
-            out.push(self.emit("response.output_item.done", item_done));
+           let part_done = json!({
+               "type": "response.reasoning_summary_part.done",
+               "sequence_number": self.next_seq(),
+               "item_id": rid,
+               "output_index": rix,
+               "summary_index": 0,
+               "part": {
+                   "type": "summary_text",
+                   "text": full_reasoning.clone(),
+               }
+           });
+           out.push(self.emit("response.reasoning_summary_part.done", part_done));
 
-            self.reasoning_buf.clear();
-        }
-        out
-    }
+           let item_done = json!({
+               "type": "response.output_item.done",
+               "sequence_number": self.next_seq(),
+               "output_index": rix,
+               "item": {
+                   "id": rid,
+                   "type": "reasoning",
+                   "status": "completed",
+                   "summary": [{
+                       "type": "summary_text",
+                       "text": full_reasoning,
+                   }],
+               }
+           });
+           out.push(self.emit("response.output_item.done", item_done));
+
+       }
+       out
+   }
 
     fn handle_tool_calls(&mut self, idx: usize, tcs: &[Value]) -> Vec<String> {
         let mut out = Vec::new();
@@ -794,6 +870,25 @@ impl ResponseTranslator {
 
     fn flush_and_complete(&mut self) -> Vec<String> {
         let mut out = Vec::new();
+
+        // Flush any pending think-tag buffer content. If we're not inside a
+        // think tag, the pending content is just text that was held back
+        // because it might have been a partial tag prefix. If we ARE inside a
+        // think tag that was never closed, treat the remaining content as
+        // reasoning.
+        if !self.think_pending.is_empty() {
+            if self.in_think_tag {
+                if self.reasoning_id.is_some() || !self.think_pending.is_empty() {
+                    out.extend(self.handle_reasoning_content(0, &self.think_pending.clone()));
+                }
+            } else {
+                if self.reasoning_id.is_some() {
+                    out.extend(self.stop_reasoning());
+                }
+                out.extend(self.emit_text_delta(0, &self.think_pending.clone()));
+            }
+            self.think_pending.clear();
+        }
 
         if self.reasoning_id.is_some() {
             out.extend(self.stop_reasoning());

@@ -489,9 +489,16 @@ pub async fn handle_responses_ws(
         // on incremental requests. Without restoring these fields, the LLM
         // loses its system prompt and tool definitions → hallucination.
         //
-        // Key: response_id  →  Value: full request JSON from that request
+       // Key: response_id  →  Value: full request JSON from that request
         let mut response_request_cache: std::collections::HashMap<String, Value> =
             std::collections::HashMap::new();
+        // Insertion-ordered list of response_ids so we can evict the
+        // oldest entry (FIFO) instead of a random one. HashMap.keys().next()
+        // returns an arbitrary key, which can evict the most recently
+        // inserted (and currently active) response_id — causing cache
+        // misses on the very next incremental request.
+        let mut cache_insertion_order: std::collections::VecDeque<String> =
+            std::collections::VecDeque::new();
 
         // ── Connection-reuse loop ──────────────────────────────────────
         // Codex opens ONE WebSocket connection and sends multiple turns
@@ -641,17 +648,20 @@ pub async fn handle_responses_ws(
                 }
             }
 
-            // Cache this request's full effective_request under the new response_id
-            // for future incremental requests. Store the effective_request (after
-            // merge) so the cache always has the complete conversation.
-            response_request_cache.insert(response_id_for_cache.clone(), effective_request.clone());
-            // Limit cache size to prevent unbounded memory growth
-            if response_request_cache.len() > 10 {
-                let key_to_remove = response_request_cache.keys().next().cloned();
-                if let Some(key) = key_to_remove {
-                    response_request_cache.remove(&key);
-                }
-            }
+           // Cache this request's full effective_request under the new response_id
+           // for future incremental requests. Store the effective_request (after
+           // merge) so the cache always has the complete conversation.
+           response_request_cache.insert(response_id_for_cache.clone(), effective_request.clone());
+           cache_insertion_order.push_back(response_id_for_cache.clone());
+           // Limit cache size to prevent unbounded memory growth
+           // Evict the OLDEST entry (FIFO), not a random one — using
+           // HashMap.keys().next() returns an arbitrary key, which risks
+           // evicting the most recently inserted (active) response_id.
+           if response_request_cache.len() > 10 {
+               if let Some(oldest_key) = cache_insertion_order.pop_front() {
+                   response_request_cache.remove(&oldest_key);
+               }
+           }
 
             let mut cc_payload = translate_request::responses_to_chat_completions(
                 &backend_model,
@@ -1223,28 +1233,28 @@ pub async fn handle_compact(
         match chunk_result {
             Ok(chunk) => {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-               while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..pos + 1);
+              while let Some(pos) = buffer.find('\n') {
+                    let line: String = buffer.drain(..pos + 1).collect();
+                    let line = line.trim_end();
                     if let Some(data) = line.strip_prefix("data: ") {
-                       if data.trim() == "[DONE]" { continue; }
-                       if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                            // Extract text delta
-                            if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) {
-                                for choice in choices {
-                                    if let Some(delta) = choice.get("delta") {
-                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                            full_text.push_str(content);
-                                        }
-                                    }
-                                    if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                                        finish_reason = Some(fr.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                      if data.trim() == "[DONE]" { continue; }
+                      if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                           // Extract text delta
+                           if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) {
+                               for choice in choices {
+                                   if let Some(delta) = choice.get("delta") {
+                                       if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                           full_text.push_str(content);
+                                       }
+                                   }
+                                   if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                                       finish_reason = Some(fr.to_string());
+                                   }
+                               }
+                           }
+                       }
+                   }
+               }
             }
             Err(e) => {
                 logger::error("compact", &format!("Stream error: {}", e));

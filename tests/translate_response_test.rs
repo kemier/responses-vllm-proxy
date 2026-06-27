@@ -333,6 +333,199 @@ fn test_regular_function_call_still_streams_deltas() {
     assert!(e2.iter().any(|e| e.contains("response.function_call_arguments.delta")));
 }
 
+// ─── think tag split across chunks (regression) tests ─────────────────────
+// These tests verify that think tags split across streaming chunk boundaries
+// are correctly detected and routed to reasoning, instead of leaking the raw
+// tag text into the output.
+
+#[test]
+fn test_think_open_tag_split_across_chunks() {
+    let mut t = ResponseTranslator::new("resp_split1", None);
+
+    // Chunk 1: text + partial opening tag "<thi"
+    let e1 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"Hello <thi"}}]}"#,
+    );
+    // Should emit "Hello " as text, hold back "<thi"
+    assert!(
+        e1.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Hello")),
+        "text before partial tag should be emitted"
+    );
+    // Should NOT emit "<thi" as text
+    assert!(
+        !e1.iter().any(|e| e.contains("<thi")),
+        "partial opening tag must not leak into text output"
+    );
+
+    // Chunk 2: rest of opening tag + reasoning content + closing tag + answer
+    let e2 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"nk>reasoning here</think>answer"}}]}"#,
+    );
+    // Should route "reasoning here" to reasoning
+    assert!(
+        e2.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("reasoning here")),
+        "think content must be routed to reasoning"
+    );
+    // Should emit "answer" as text
+    assert!(
+        e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("answer")),
+        "text after closing tag should be emitted"
+    );
+    // Should NOT leak any tag fragments
+    assert!(
+        !e2.iter().any(|e| e.contains("<thi") || e.contains("nk>")),
+        "tag fragments must not leak into output"
+    );
+}
+
+#[test]
+fn test_think_close_tag_split_across_chunks() {
+    let mut t = ResponseTranslator::new("resp_split2", None);
+
+    // Opening tag + reasoning + partial closing tag
+    let e1 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"<think>some reasoning</thi"}}]}"#,
+    );
+    // Should route "some reasoning" to reasoning
+    assert!(
+        e1.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("some reasoning")),
+        "think content before partial closing tag should be routed to reasoning"
+    );
+    // Should NOT emit "</thi" as reasoning or text
+    assert!(
+        !e1.iter().any(|e| e.contains("</thi") || e.contains("thi")),
+        "partial closing tag must not leak"
+    );
+
+    // Rest of closing tag + answer
+    let e2 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"nk>the answer"}}]}"#,
+    );
+    // Should emit "the answer" as text
+    assert!(
+        e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("the answer")),
+        "text after closing tag should be emitted as text"
+    );
+    assert!(
+        !e2.iter().any(|e| e.contains("nk>")),
+        "closing tag fragment must not leak"
+    );
+}
+
+#[test]
+fn test_think_tag_split_at_every_boundary() {
+    // Extreme case: tag split one character at a time
+    let mut t = ResponseTranslator::new("resp_split3", None);
+
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"t"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"h"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"i"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"n"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"k"}}]}"#);
+    let e7 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":">brain dump"}}]}"#);
+
+    // After the ">", we should now be inside the think tag
+    assert!(
+        e7.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("brain dump")),
+        "content after fully assembled opening tag should be routed to reasoning"
+    );
+
+    // Now close it, also split
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"/"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"t"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"h"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"i"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"n"}}]}"#);
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"k"}}]}"#);
+    let final_e = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":">final answer"}}]}"#);
+
+    assert!(
+        final_e.iter().any(|e| e.contains("response.output_text.delta") && e.contains("final answer")),
+        "text after fully assembled closing tag should be emitted as text"
+    );
+}
+
+#[test]
+fn test_literal_less_than_not_held_forever() {
+    // A "<" that is NOT part of a think tag should eventually be emitted,
+    // not held back indefinitely.
+    let mut t = ResponseTranslator::new("resp_split4", None);
+
+    // "5 <" — the "<" is held back because it's a prefix of "<think"
+    let e1 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"5 <"}}]}"#);
+    assert!(e1.iter().any(|e| e.contains("response.output_text.delta") && e.contains("5 ")));
+
+    // " 10" — "<" + " 10" = "< 10" which is NOT a prefix of "<think", so all held content is emitted
+    let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":" 10"}}]}"#);
+    // The "<" from the previous chunk should now be emitted along with " 10"
+    let all_text: String = e2
+        .iter()
+        .filter(|e| e.contains("response.output_text.delta"))
+        .cloned()
+        .collect();
+    assert!(
+        all_text.contains("<") && all_text.contains("10"),
+        "held-back '<' must be emitted once it's clear it's not a tag prefix. Got: {}",
+        all_text
+    );
+}
+
+#[test]
+fn test_think_tag_never_closed_flushed_as_reasoning() {
+    // If the stream ends while inside a think tag (never closed),
+    // the pending content should be flushed as reasoning.
+    let mut t = ResponseTranslator::new("resp_split5", None);
+
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>unfinished reasoning"}}]}"#);
+    let done = t.process_line("data: [DONE]");
+
+    // The "unfinished reasoning" should appear in the reasoning summary
+    assert!(
+        done.iter().any(|e| e.contains("reasoning_summary_text.done") && e.contains("unfinished reasoning")),
+        "unclosed think tag content should be flushed as reasoning on [DONE]"
+    );
+}
+
+#[test]
+fn test_partial_tag_at_stream_end_flushed_as_text() {
+    // If the stream ends with a partial tag prefix held in the buffer
+    // (not inside a think tag), it should be flushed as text.
+    let mut t = ResponseTranslator::new("resp_split6", None);
+
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"hello <thi"}}]}"#);
+    let done = t.process_line("data: [DONE]");
+
+    // The "<thi" should appear in the text output (flushed as text since
+    // it was never completed into a full tag)
+    let text_deltas: String = done
+        .iter()
+        .filter(|e| e.contains("response.output_text.delta") || e.contains("response.output_text.done"))
+        .cloned()
+        .collect();
+    assert!(
+        text_deltas.contains("<thi"),
+        "partial tag prefix at stream end should be flushed as text. Got: {}",
+        text_deltas
+    );
+}
+
+#[test]
+fn test_multiple_think_tags_in_sequence() {
+    // Multiple think blocks in the same stream, each properly routed.
+    let mut t = ResponseTranslator::new("resp_split7", None);
+
+    // First think block + text
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>first</think>mid"}}]}"#);
+    // Second think block + text
+    let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>second</think>end"}}]}"#);
+
+    let all: String = e2.iter().cloned().collect();
+    assert!(all.contains("second"), "second think block content should be routed to reasoning");
+    assert!(all.contains("end"), "text after second think block should be emitted as text");
+}
+
 // ─── chat_completion_to_response (non-streaming) tests ──────────────────────
 
 #[test]

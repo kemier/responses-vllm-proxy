@@ -130,11 +130,12 @@ openai-compatibility:
         .build()
         .unwrap();
 
-    let state = AppState {
-        cfg: cfg.clone(),
-        token_mgr,
-        http_client,
-    };
+   let state = AppState {
+       cfg: cfg.clone(),
+       token_mgr,
+       http_client,
+       model_catalog: std::sync::Arc::new(None),
+   };
 
     use axum::routing::post;
     let app = axum::Router::new()
@@ -219,11 +220,12 @@ openai-compatibility:
         .build()
         .unwrap();
 
-    let state = AppState {
-        cfg,
-        token_mgr,
-        http_client,
-    };
+   let state = AppState {
+       cfg,
+       token_mgr,
+       http_client,
+       model_catalog: std::sync::Arc::new(None),
+   };
 
     use axum::routing::post;
     let app = axum::Router::new()
