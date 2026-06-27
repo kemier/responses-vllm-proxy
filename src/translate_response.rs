@@ -824,6 +824,12 @@ impl ResponseTranslator {
     }
 
     fn build_completed_event(&mut self) -> String {
+        // end_turn: false if the model emitted tool calls (codex should execute
+        // them and continue the turn); true if only text was produced (turn is
+        // done). Without this field, codex defaults to None and treats the
+        // turn as complete even when tool calls were emitted.
+        let end_turn = self.func_states.is_empty();
+
         let mut response = json!({
             "id": self.response_id,
             "object": "response",
@@ -831,6 +837,7 @@ impl ResponseTranslator {
             "status": "completed",
             "background": false,
             "error": null,
+            "end_turn": end_turn,
         });
 
         if let Some(req) = &self.request_json {
@@ -948,6 +955,14 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
 
     let created = raw.get("created").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp());
 
+    // end_turn: false if the model emitted tool calls, true otherwise.
+    let has_tool_calls = raw.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("tool_calls"))
+        .is_some();
+
     let mut resp = json!({
         "id": response_id,
         "object": "response",
@@ -955,6 +970,7 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
         "status": "completed",
         "background": false,
         "error": null,
+        "end_turn": !has_tool_calls,
     });
 
     if let Some(req) = request_json {
