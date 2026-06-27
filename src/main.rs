@@ -6,10 +6,7 @@ mod logger;
 
 use axum::{
     body::Body,
-    extract::{
-        ws::{Message, WebSocket},
-        Query, State, WebSocketUpgrade,
-    },
+    extract::{DefaultBodyLimit, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -17,42 +14,14 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use std::time::Duration;
+use tokio::time::{interval, Duration};
 
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<config::Config>,
     token_mgr: Arc<auth::TokenManager>,
     http_client: reqwest::Client,
-    /// Caps the number of concurrent in-flight upstream requests so that
-    /// burst load from many VS Code / Codex CLI clients cannot exhaust the
-    /// connection pool or overwhelm EricAI. 128 is a generous default.
-    upstream_sem: Arc<Semaphore>,
-}
-
-
-/// Extract the JSON payload from an SSE-formatted string.
-///
-/// The translator produces SSE frames like:
-///   event: response.created
-///   data: {"type":"response.created",...}
-///
-/// For HTTP SSE that's correct, but Codex's WebSocket client expects each WS
-/// text frame to be a **raw JSON object** (it does `serde_json::from_str` on
-/// the frame text). This helper strips the SSE envelope and returns just JSON.
-fn sse_to_ws_message(sse: &str) -> Option<String> {
-    for line in sse.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            return Some(data.to_string());
-        }
-        if let Some(data) = line.strip_prefix("data:") {
-            return Some(data.trim().to_string());
-        }
-    }
-    None
 }
 
 #[tokio::main]
@@ -80,35 +49,65 @@ async fn main() {
     let token_mgr = Arc::new(auth::TokenManager::new(&cfg.auth_dir));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
-        .pool_max_idle_per_host(64)
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
         .expect("Failed to create HTTP client");
-
-    let upstream_sem = Arc::new(Semaphore::new(128));
 
     let state = AppState {
         cfg: cfg.clone(),
         token_mgr,
         http_client,
-        upstream_sem,
     };
 
     let app = axum::Router::new()
         .route("/v1/models", get(handle_models))
         .route("/v1/responses", post(handle_responses).get(handle_responses_ws))
         .route("/v1/chat/completions", post(handle_chat_completions))
+        // Codex can send very large request bodies (up to ~30MB for long
+        // conversation contexts with 196K+ tokens). Axum's default body
+        // limit is 2MB, which causes "413 Payload Too Large" errors that
+        // manifest as "stream disconnected before completion" in codex.
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB
+        // Fallback routes for codex's hardcoded ChatGPT-style base URL
+        // (https://chatgpt.com/backend-api/codex). Only used if someone
+        // configures base_url as http://localhost:8317/backend-api/codex
+        // instead of the standard /v1. With base_url=/v1 (default config),
+        // these routes are never hit — codex calls /v1/responses instead.
         .route("/backend-api/codex/responses", post(handle_responses).get(handle_responses_ws))
         .route("/backend-api/codex/responses/compact", post(handle_compact))
+        .route("/v1/responses/compact", post(handle_compact))
         .route("/health", get(handle_health))
         .with_state(state);
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     logger::info("main", &format!("ericai-proxy listening on http://{}", addr));
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind");
+    // Bind with retry — give the old process time to fully release the port
+    let listener = {
+        let mut bound: Option<tokio::net::TcpListener> = None;
+        for attempt in 1..=5u32 {
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => { bound = Some(l); break; }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    logger::warn("main", &format!(
+                        "Port {} in use (attempt {}/5), retrying in 1s…", cfg.port, attempt
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    eprintln!("Failed to bind to {}: {}", addr, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        match bound {
+            Some(l) => l,
+            None => {
+                eprintln!("Failed to bind to {} after 5 retries: port still in use.", addr);
+                eprintln!("Run: ./start.sh --restart   or   fuser -k {}/tcp", cfg.port);
+                std::process::exit(1);
+            }
+        }
+    };
     axum::serve(listener, app).await.expect("Server error");
 }
 
@@ -175,6 +174,112 @@ async fn handle_responses(
     );
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
+    // Context size guard: estimate tokens and warn if exceeds model's context window
+    let context_window = {
+        let catalog_path = std::env::var("HOME")
+            .map(|h| format!("{}/.codex/model_catalog.json", h))
+            .ok();
+        catalog_path
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|c| c.get("models").and_then(|m| m.as_array()).map(|a| a.to_vec()))
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("slug").and_then(|s| s.as_str()) == Some(&model_alias))
+                    .and_then(|m| m.get("context_window")).and_then(|c| c.as_u64())
+            })
+            .unwrap_or(196608u64)
+    };
+    let estimated_tokens = cc_payload.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter().map(|msg| {
+                msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+            }).sum::<usize>()
+        }).unwrap_or(0usize);
+    if estimated_tokens as u64 > context_window {
+        // Progressive trimming: remove older middle messages to fit context window
+        // Keep: first message (system/instructions), last N messages (recent context)
+        // Target: 80% of context window to leave room for output
+        let target_tokens = (context_window as f64 * 0.8) as usize;
+        logger::warn("responses", &format!(
+            "Context size guard: estimated {} tokens > context_window {} for model {} — trimming",
+            estimated_tokens, context_window, model_alias
+        ));
+
+        if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            let total = messages.len();
+            if total > 4 {
+                // Keep first 2 (system + first user) and progressively keep more from the end
+                // until we fit under target_tokens
+                let mut best_keep = 4; // minimum: first 2 + last 2
+                for keep_from_end in (2..=total-2).rev() {
+                    let trimmed: Vec<&Value> = messages.iter().take(2)
+                        .chain(messages.iter().skip(total - keep_from_end))
+                        .collect();
+                    let trimmed_tokens: usize = trimmed.iter().map(|msg| {
+                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                    }).sum();
+                    if trimmed_tokens <= target_tokens {
+                        best_keep = keep_from_end;
+                        break;
+                    }
+                }
+
+                // Build the trimmed messages array
+                let head: Vec<Value> = messages.iter().take(2).cloned().collect();
+                let tail: Vec<Value> = messages.iter().skip(total - best_keep).cloned().collect();
+
+                // Insert a compaction notice where we cut
+                let mut new_messages = head;
+                new_messages.push(json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Context trimmed: {} older messages removed to fit context window. {} of {} messages retained.]",
+                        total - 2 - best_keep, best_keep + 2, total
+                    )
+                }));
+                new_messages.extend(tail);
+
+                let new_tokens: usize = new_messages.iter().map(|msg| {
+                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                }).sum();
+
+                logger::info("responses", &format!(
+                    "Trimmed: {} messages → {} messages, {} → {} tokens",
+                    total, new_messages.len(), estimated_tokens, new_tokens
+                ));
+
+                *messages = new_messages;
+            }
+        }
+
+        // Re-check: if still too large after trimming, return error
+        let new_estimated = cc_payload.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter().map(|msg| {
+                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                }).sum::<usize>()
+            }).unwrap_or(0usize);
+        if new_estimated as u64 > context_window {
+            logger::error("responses", &format!(
+                "Still too large after trimming: {} tokens — returning error",
+                new_estimated
+            ));
+            let err_response = json!({
+                "error": {
+                    "message": format!(
+                        "Context too large: even after trimming, {} tokens exceeds model {} context window ({}). Start a new session.",
+                        new_estimated, model_alias, context_window
+                    ),
+                    "type": "context_length_exceeded",
+                }
+            });
+            return (StatusCode::PAYLOAD_TOO_LARGE, Json(err_response)).into_response();
+        }
+    }
+
     // Get auth token
     let token = match state.token_mgr.get_token().await {
         Ok(t) => t,
@@ -192,21 +297,6 @@ async fn handle_responses(
         "POST {} model={} stream={}", url, backend_model, is_stream
     ));
 
-    // Acquire an upstream concurrency permit so burst load cannot overwhelm
-    // EricAI or exhaust the connection pool. Overload -> 503.
-    let _permit = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        state.upstream_sem.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        _ => {
-            logger::warn("responses", "Upstream concurrency limit reached (503)");
-            return (StatusCode::SERVICE_UNAVAILABLE, "Upstream busy").into_response();
-        }
-    };
-
     let resp = match state.http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
@@ -221,28 +311,6 @@ async fn handle_responses(
             return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
                 .into_response();
         }
-    };
-
-    // On 401, force-refresh the token and retry once.
-    let resp = if resp.status() == StatusCode::UNAUTHORIZED {
-        logger::warn("responses", "Upstream 401 — force-refreshing token and retrying");
-        let token = match state.token_mgr.force_refresh().await {
-            Ok(t) => t,
-            Err(e) => return (StatusCode::UNAUTHORIZED, format!("Auth refresh failed: {}", e)).into_response(),
-        };
-        match state.http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Accept", "text/event-stream")
-            .json(&cc_payload)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response(),
-        }
-    } else {
-        resp
     };
 
     if !resp.status().is_success() {
@@ -261,45 +329,93 @@ async fn handle_responses(
 
         let byte_stream = resp.bytes_stream();
 
-        let translated_stream = async_stream::stream! {
+        // Use a channel so we can detect client disconnects.  When the
+        // client (codex) drops the connection — e.g. when the user clicks
+        // Stop — Axum stops polling the response body.  The channel sender
+        // then fails on the next `send()`, and we abort the upstream stream.
+        use tokio::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let upstream_cancel = cancel_token.clone();
+
+        // Spawn the upstream reader task
+        tokio::spawn(async move {
             let mut stream = byte_stream;
             let mut buffer = String::new();
+            // SSE keepalive: send a comment line every 15 seconds while
+            // waiting for upstream data.  This prevents the HTTP connection
+            // from timing out when EricAI takes a long time to process
+            // large resumed session contexts (60+ seconds).
+            let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
+            sse_keepalive.tick().await; // consume immediate first tick
 
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].to_string();
-                            buffer.drain(..pos + 1);
-
-                            let events = translator.process_line(&line);
-                            for event in events {
-                                yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event.into_bytes()));
+            loop {
+                tokio::select! {
+                    // Poll upstream for next chunk
+                    chunk_result = stream.next() => {
+                        match chunk_result {
+                            Some(Ok(chunk)) => {
+                                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                while let Some(pos) = buffer.find('\n') {
+                                    let line = buffer[..pos].to_string();
+                                    buffer = buffer[pos + 1..].to_string();
+                                    let events = translator.process_line(&line);
+                                    for event in events {
+                                        if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
+                                            // Client disconnected — stop reading upstream
+                                            upstream_cancel.cancel();
+                                            return;
+                                        }
+                                    }
+                                }
                             }
+                            Some(Err(e)) => {
+                                logger::error("responses", &format!("Stream error: {}", e));
+                                break;
+                            }
+                            None => break, // upstream finished
                         }
                     }
-                    Err(e) => {
-                        logger::error("responses", &format!("Stream error: {}", e));
-                        break;
+                    // SSE keepalive: send comment to keep connection alive
+                    _ = sse_keepalive.tick() => {
+                        // SSE comments start with ':' and are ignored by clients
+                        // but keep the TCP connection alive
+                        if tx.send(Ok(axum::body::Bytes::from(": keepalive\n\n".to_string()))).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Client disconnect detected via cancellation
+                    _ = upstream_cancel.cancelled() => {
+                        logger::info("responses", "Client disconnected, aborting upstream stream");
+                        return;
                     }
                 }
             }
 
+            // Flush remaining buffer
             if !buffer.trim().is_empty() {
                 let events = translator.process_line(&buffer);
                 for event in events {
-                    yield Ok(axum::body::Bytes::from(event.into_bytes()));
+                    if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
+                        return;
+                    }
                 }
             }
 
+            // Send [DONE]
             let events = translator.process_line("data: [DONE]");
             for event in events {
-                yield Ok(axum::body::Bytes::from(event.into_bytes()));
+                if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
+                    return;
+                }
             }
-        };
+        });
 
+        // Convert the receiver into a stream for the response body.
+        // When the client disconnects, Axum drops the Body, which drops rx,
+        // which causes the next tx.send() to fail → upstream reader exits.
+        let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let body = Body::from_stream(translated_stream);
 
         Response::builder()
@@ -329,410 +445,335 @@ async fn handle_responses(
 }
 
 // ─── GET /v1/responses (WebSocket) ──────────────────────────────────────────
-//
-// Codex's Responses WebSocket transport is *stateful and connection-reusing*:
-//
-//   1. It opens a connection and sends a "prewarm" request — a `response.create`
-//      with `generate: false`. The server must answer with `response.created` +
-//      `response.completed` (no model output) so the connection is warm.
-//   2. It then reuses the *same* connection for the real turn request, and for
-//      subsequent turns. On reuse Codex sends `previous_response_id` plus only the
-//      *incremental* input items — everything the server already saw (prior input
-//      and prior model output) is omitted.
-//
-// Because our upstream (vLLM /chat/completions) is stateless, we must rebuild the
-// full conversation for every generating request:
-//
-//     full_input = prev.full_input ++ prev.output_items ++ request.input
-//
-// We therefore keep per-connection state mapping each response_id we issue to the
-// full input the model saw plus the output items it produced, and we loop to serve
-// many requests over one socket instead of closing after the first.
 async fn handle_responses_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(_params): Query<Value>,
 ) -> Response {
-    ws.on_upgrade(move |socket| async move {
-        handle_ws_connection(socket, state).await;
-    })
-}
+    ws.on_upgrade(move |mut socket| async move {
+        use futures_util::StreamExt;
+        logger::info("ws", "WebSocket connection opened for /v1/responses");
 
-/// Per-connection conversation state: response_id -> (full input items, output items).
-type WsConversations = HashMap<String, (Vec<Value>, Vec<Value>)>;
-
-/// Idle timeout while waiting for the next request frame on a (possibly reused)
-/// connection. Codex keeps connections alive across turns, so this is generous.
-/// Handshake probes that never send a frame close their TCP side and break us out
-/// immediately via `recv() -> None`, so they do not linger for the full duration.
-const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Drives a single WebSocket connection, serving any number of `response.create`
-/// frames (prewarm + real turns) until the client disconnects or goes idle.
-async fn handle_ws_connection(mut socket: WebSocket, state: AppState) {
-    logger::info("ws", "WebSocket connection opened for /v1/responses");
-    let mut conversations: WsConversations = HashMap::new();
-
-    loop {
-        let msg = match tokio::time::timeout(WS_IDLE_TIMEOUT, socket.recv()).await {
+        // Codex opens "prewarm" WS connections that connect but don't send
+        // a request immediately — they wait and send the first turn later.
+        // Use a 120-second timeout: real requests arrive within seconds;
+        // prewarm connections that never send data get cleaned up.
+        let msg = match tokio::time::timeout(
+            Duration::from_secs(120),
+            socket.recv(),
+        ).await {
             Ok(Some(Ok(m))) => m,
-            Ok(Some(Err(_))) | Ok(None) => break,
+            Ok(Some(Err(_))) | Ok(None) => {
+                logger::warn("ws", "WebSocket closed before receiving request");
+                return;
+            }
             Err(_) => {
-                logger::info("ws", "WebSocket idle timeout, closing");
-                break;
+                logger::info("ws", "WebSocket prewarm connection timed out (120s), closing");
+                let _ = socket.close().await;
+                return;
             }
         };
 
         let text = match msg {
-            Message::Text(t) => t,
-            Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
-            Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) => continue,
+            axum::extract::ws::Message::Text(t) => t,
+            axum::extract::ws::Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+            _ => {
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    "{\"error\":\"Expected text message\"}".to_string()
+                )).await;
+                return;
+            }
         };
 
         let request_json: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => {
                 logger::error("ws", &format!("Invalid JSON: {}", e));
-                let _ = ws_send_json(
-                    &mut socket,
-                    &ws_error_event(400, &format!("Invalid JSON: {}", e)),
-                )
-                .await;
-                continue;
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    format!("{{\"error\":\"Invalid JSON: {}\"}}", e)
+                )).await;
+                return;
             }
         };
 
-        if handle_ws_request(&state, &mut socket, request_json, &mut conversations)
-            .await
-            .is_err()
-        {
-            // Client socket is gone; stop serving this connection.
-            break;
-        }
-    }
+        let model_alias = request_json.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
 
-    let _ = socket.send(Message::Close(None)).await;
-    let _ = socket.close().await;
-    logger::info("ws", "WebSocket connection closed");
-}
-
-/// Build a Codex-compatible wrapped error event (maps to an HTTP error client-side).
-fn ws_error_event(status: u16, message: &str) -> Value {
-    json!({
-        "type": "error",
-        "status": status,
-        "error": { "type": "upstream_error", "message": message }
-    })
-}
-
-async fn ws_send_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
-    socket
-        .send(Message::Text(value.to_string()))
-        .await
-        .map_err(|_| ())
-}
-
-/// Reconstruct the full conversation input for a request, expanding any
-/// `previous_response_id` reference into the stored prior input + output items.
-fn rebuild_full_input(request_json: &Value, conversations: &WsConversations) -> Vec<Value> {
-    let req_input: Vec<Value> = request_json
-        .get("input")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    match request_json
-        .get("previous_response_id")
-        .and_then(|v| v.as_str())
-    {
-        Some(prev_id) => match conversations.get(prev_id) {
-            Some((prev_full, prev_out)) => {
-                let mut v =
-                    Vec::with_capacity(prev_full.len() + prev_out.len() + req_input.len());
-                v.extend(prev_full.iter().cloned());
-                v.extend(prev_out.iter().cloned());
-                v.extend(req_input);
-                v
-            }
-            None => {
-                logger::warn(
-                    "ws",
-                    &format!(
-                        "Unknown previous_response_id {} — using incremental input only",
-                        prev_id
-                    ),
-                );
-                req_input
-            }
-        },
-        None => req_input,
-    }
-}
-
-/// Store conversation state for a response_id. Only the most recent response is
-/// ever referenced via `previous_response_id`, so memory is bounded by clearing
-/// old turns when the map grows large.
-fn store_conversation(
-    conversations: &mut WsConversations,
-    response_id: String,
-    full_input: Vec<Value>,
-    output: Vec<Value>,
-) {
-    if conversations.len() >= 64 {
-        conversations.clear();
-    }
-    conversations.insert(response_id, (full_input, output));
-}
-
-/// If `ws_msg` is a `response.completed` event, capture its output items so the
-/// next reused request can rebuild the full conversation history.
-fn capture_completed_output(ws_msg: &str, out: &mut Vec<Value>) {
-    if let Ok(v) = serde_json::from_str::<Value>(ws_msg) {
-        if v.get("type").and_then(|t| t.as_str()) == Some("response.completed") {
-            if let Some(output) = v
-                .get("response")
-                .and_then(|r| r.get("output"))
-                .and_then(|o| o.as_array())
-            {
-                *out = output.clone();
-            }
-        }
-    }
-}
-
-/// Handle a single `response.create` frame.
-///
-/// Returns `Err(())` only when the client socket is gone (caller should close the
-/// connection). Upstream/model errors are reported as `error` events but keep the
-/// connection open so Codex can retry or fall back.
-async fn handle_ws_request(
-    state: &AppState,
-    socket: &mut WebSocket,
-    request_json: Value,
-    conversations: &mut WsConversations,
-) -> Result<(), ()> {
-    let is_prewarm = request_json.get("generate").and_then(|v| v.as_bool()) == Some(false);
-    let full_input = rebuild_full_input(&request_json, conversations);
-    let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-
-    // ── Prewarm: connection setup only, no model call. ──
-    if is_prewarm {
-        logger::info("ws", &format!("WS prewarm (response_id={})", response_id));
-        let created = json!({
-            "type": "response.created",
-            "response": { "id": response_id, "object": "response", "status": "in_progress" }
-        });
-        let completed = json!({
-            "type": "response.completed",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "status": "completed",
-                "output": [],
-                "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 }
-            }
-        });
-        store_conversation(conversations, response_id, full_input, Vec::new());
-        ws_send_json(socket, &created).await?;
-        ws_send_json(socket, &completed).await?;
-        return Ok(());
-    }
-
-    // ── Real generating request. ──
-    let model_alias = request_json
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let backend_model = state
-        .cfg
-        .all_models()
-        .iter()
-        .find(|(alias, _)| *alias == model_alias)
-        .map(|(_, name)| name.clone())
-        .unwrap_or_else(|| {
-            if let Some(stripped) = model_alias.strip_prefix("ericai/") {
-                stripped.to_string()
-            } else {
-                model_alias.clone()
-            }
-        });
-
-    // Build the upstream request from the *current* request fields but with the
-    // reconstructed full input. WebSocket turns always stream.
-    let mut merged = request_json.clone();
-    merged["input"] = Value::Array(full_input.clone());
-
-    let mut cc_payload =
-        translate_request::responses_to_chat_completions(&backend_model, &merged, true);
-    cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
-
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = ws_send_json(socket, &ws_error_event(401, &format!("Auth failed: {}", e))).await;
-            return Ok(());
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
-    let url = format!("{}/chat/completions", base_url);
-    logger::info(
-        "ws",
-        &format!(
-            "WS POST {} model={} stream=true (response_id={})",
-            url, backend_model, response_id
-        ),
-    );
-
-    // The concurrency permit guards only the upstream call, not idle waits.
-    let _permit = match tokio::time::timeout(
-        Duration::from_secs(5),
-        state.upstream_sem.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        _ => {
-            logger::warn("ws", "Upstream concurrency limit reached");
-            let _ = ws_send_json(socket, &ws_error_event(503, "Upstream busy")).await;
-            return Ok(());
-        }
-    };
-
-    let resp = match state
-        .http_client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "text/event-stream")
-        .json(&cc_payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = ws_send_json(socket, &ws_error_event(502, &format!("Upstream: {}", e))).await;
-            return Ok(());
-        }
-    };
-
-    // On 401, force-refresh the token and retry once.
-    let resp = if resp.status() == StatusCode::UNAUTHORIZED {
-        logger::warn("ws", "Upstream 401 — force-refreshing token and retrying");
-        match state.token_mgr.force_refresh().await {
-            Ok(t) => match state
-                .http_client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", t))
-                .header("Accept", "text/event-stream")
-                .json(&cc_payload)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ =
-                        ws_send_json(socket, &ws_error_event(502, &format!("Upstream: {}", e)))
-                            .await;
-                    return Ok(());
+        let backend_model = state.cfg.all_models().iter()
+            .find(|(alias, _)| *alias == model_alias)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| {
+                if let Some(stripped) = model_alias.strip_prefix("ericai/") {
+                    stripped.to_string()
+                } else {
+                    model_alias.clone()
                 }
-            },
-            Err(e) => {
-                let _ = ws_send_json(
-                    socket,
-                    &ws_error_event(401, &format!("Auth refresh failed: {}", e)),
-                )
-                .await;
-                return Ok(());
+            });
+
+        let is_stream = request_json.get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let mut cc_payload = translate_request::responses_to_chat_completions(
+            &backend_model,
+            &request_json,
+            is_stream,
+        );
+        cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
+
+        // Context size guard: estimate tokens and warn if exceeds model's context window
+        let context_window = {
+            let catalog_path = std::env::var("HOME")
+                .map(|h| format!("{}/.codex/model_catalog.json", h))
+                .ok();
+            catalog_path
+                .and_then(|p| std::fs::read_to_string(&p).ok())
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|c| c.get("models").and_then(|m| m.as_array()).map(|a| a.to_vec()))
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|m| m.get("slug").and_then(|s| s.as_str()) == Some(&model_alias))
+                        .and_then(|m| m.get("context_window")).and_then(|c| c.as_u64())
+                })
+                .unwrap_or(196608u64)
+        };
+        let estimated_tokens = cc_payload.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter().map(|msg| {
+                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                }).sum::<usize>()
+            }).unwrap_or(0usize);
+        if estimated_tokens as u64 > context_window {
+            let target_tokens = (context_window as f64 * 0.8) as usize;
+            logger::warn("ws", &format!(
+                "Context size guard: estimated {} tokens > context_window {} for model {} — trimming",
+                estimated_tokens, context_window, model_alias
+            ));
+
+            if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                let total = messages.len();
+                if total > 4 {
+                    let mut best_keep = 4;
+                    for keep_from_end in (2..=total-2).rev() {
+                        let trimmed: Vec<&Value> = messages.iter().take(2)
+                            .chain(messages.iter().skip(total - keep_from_end))
+                            .collect();
+                        let trimmed_tokens: usize = trimmed.iter().map(|msg| {
+                            msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                        }).sum();
+                        if trimmed_tokens <= target_tokens {
+                            best_keep = keep_from_end;
+                            break;
+                        }
+                    }
+
+                    let head: Vec<Value> = messages.iter().take(2).cloned().collect();
+                    let tail: Vec<Value> = messages.iter().skip(total - best_keep).cloned().collect();
+
+                    let mut new_messages = head;
+                    new_messages.push(json!({
+                        "role": "system",
+                        "content": format!(
+                            "[Context trimmed: {} older messages removed to fit context window. {} of {} messages retained.]",
+                            total - 2 - best_keep, best_keep + 2, total
+                        )
+                    }));
+                    new_messages.extend(tail);
+
+                    let new_tokens: usize = new_messages.iter().map(|msg| {
+                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                    }).sum();
+
+                    logger::info("ws", &format!(
+                        "Trimmed: {} messages → {} messages, {} → {} tokens",
+                        total, new_messages.len(), estimated_tokens, new_tokens
+                    ));
+
+                    *messages = new_messages;
+                }
+            }
+
+            // Re-check: if still too large after trimming, send error via WebSocket
+            let new_estimated = cc_payload.get("messages")
+                .and_then(|m| m.as_array())
+                .map(|arr| {
+                    arr.iter().map(|msg| {
+                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                    }).sum::<usize>()
+                }).unwrap_or(0usize);
+            if new_estimated as u64 > context_window {
+                logger::error("ws", &format!(
+                    "Still too large after trimming: {} tokens — sending error",
+                    new_estimated
+                ));
+                let err_msg = format!(
+                    "{{\"error\":\"Context too large: even after trimming, {} tokens exceeds model {} context window ({}). Start a new session.\"}}",
+                    new_estimated, model_alias, context_window
+                );
+                let _ = socket.send(axum::extract::ws::Message::Text(err_msg)).await;
+                return;
             }
         }
-    } else {
-        resp
-    };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        logger::error(
-            "ws",
-            &format!(
-                "Upstream {}: {}",
-                status,
-                logger::extract_error_summary(&body_text, 300)
-            ),
-        );
-        logger::error_request("ws-responses", &cc_payload.to_string(), &body_text, status.as_u16());
-        let _ = ws_send_json(socket, &ws_error_event(status.as_u16(), &body_text)).await;
-        return Ok(());
-    }
 
-    // Stream upstream SSE → translate → send raw JSON frames, capturing the final
-    // response output so the next reused request can rebuild history.
-    let mut translator =
-        translate_response::ResponseTranslator::new(&response_id, Some(merged));
-    let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
-    let mut captured_output: Vec<Value> = Vec::new();
-    let mut client_alive = true;
+        let token = match state.token_mgr.get_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    format!("{{\"error\":\"Auth failed: {}\"}}", e)
+                )).await;
+                return;
+            }
+        };
 
-    'outer: while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(chunk) => {
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer.drain(..pos + 1);
-                    for event in translator.process_line(&line) {
-                        if let Some(ws_msg) = sse_to_ws_message(&event) {
-                            capture_completed_output(&ws_msg, &mut captured_output);
-                            if socket.send(Message::Text(ws_msg)).await.is_err() {
-                                client_alive = false;
-                                break 'outer;
-                            }
+        let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let url = format!("{}/chat/completions", base_url);
+
+        logger::info("ws", &format!("WS POST {} model={} stream={}", url, backend_model, is_stream));
+
+        // Send the request to EricAI.  While waiting for the upstream
+        // response headers (which can take 60+ seconds for large resumed
+        // sessions), send WebSocket pings every 15 seconds to keep the
+        // connection alive and prevent "Connection reset by peer".
+        let send_fut = state.http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "text/event-stream")
+            .json(&cc_payload)
+            .send();
+
+        let mut ping_during_connect = interval(Duration::from_secs(15));
+        ping_during_connect.tick().await; // consume immediate first tick
+
+        let mut send_fut = Box::pin(send_fut);
+        let resp = loop {
+            tokio::select! {
+                result = &mut send_fut => {
+                    match result {
+                        Ok(r) => break r,
+                        Err(e) => {
+                            let _ = socket.send(axum::extract::ws::Message::Text(
+                                format!("{{\"error\":\"Upstream: {}\"}}", e)
+                            )).await;
+                            return;
                         }
                     }
                 }
+                _ = ping_during_connect.tick() => {
+                    if socket.send(axum::extract::ws::Message::Ping(vec![1, 2, 3, 4])).await.is_err() {
+                        return;
+                    }
+                }
             }
-            Err(e) => {
-                logger::error("ws", &format!("WS stream error: {}", e));
-                break;
-            }
-        }
-    }
+        };
 
-    // Flush any trailing buffered line, then emit the terminal [DONE] translation.
-    if client_alive && !buffer.trim().is_empty() {
-        for event in translator.process_line(&buffer) {
-            if let Some(ws_msg) = sse_to_ws_message(&event) {
-                capture_completed_output(&ws_msg, &mut captured_output);
-                if socket.send(Message::Text(ws_msg)).await.is_err() {
-                    client_alive = false;
-                    break;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            logger::error("ws", &format!("Upstream {}: {}", status, logger::extract_error_summary(&body_text, 300)));
+            logger::error_request("ws-responses", &cc_payload.to_string(), &body_text, status.as_u16());
+            let _ = socket.send(axum::extract::ws::Message::Text(
+                format!("{{\"error\":\"Upstream {}: {}\"}}", status, body_text)
+            )).await;
+            return;
+        }
+
+        let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+        let mut translator = translate_response::ResponseTranslator::new(
+            &response_id,
+            Some(request_json),
+        );
+
+        let byte_stream = resp.bytes_stream();
+        let mut stream = byte_stream;
+        let mut buffer = String::new();
+
+        // Keepalive: send WebSocket Ping every 15 seconds to prevent idle timeout
+        // when the upstream (EricAI) takes a long time to process large contexts
+        // (e.g. session resume with full conversation history).
+        let mut ping_interval = interval(Duration::from_secs(15));
+        ping_interval.tick().await; // consume immediate first tick
+
+        loop {
+            tokio::select! {
+                // Upstream data arrives
+                chunk_result = stream.next() => {
+                    match chunk_result {
+                        Some(Ok(chunk)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                            while let Some(pos) = buffer.find('\n') {
+                                let line = buffer[..pos].to_string();
+                                buffer = buffer[pos + 1..].to_string();
+
+                                let events = translator.process_line(&line);
+                                for event in events {
+                                    // process_line returns SSE format: "event: name\ndata: {...}\n\n"
+                                    // Codex's WS parser expects raw JSON objects, not SSE.
+                                    // Extract the JSON payload from the "data:" line.
+                                    let ws_msg = if event.starts_with("event: ") {
+                                        // Find the data: line and extract JSON
+                                        if let Some(data_start) = event.find("data: ") {
+                                            let json_str = &event[data_start + 6..].trim_end();
+                                            json_str.to_string()
+                                        } else {
+                                            // No data line, skip
+                                            continue;
+                                        }
+                                    } else {
+                                        event
+                                    };
+                                    if socket.send(axum::extract::ws::Message::Text(ws_msg)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            logger::error("ws", &format!("WS stream error: {}", e));
+                            break;
+                        }
+                        None => {
+                            // Upstream stream ended
+                            break;
+                        }
+                    }
+                }
+                // Keepalive ping
+                _ = ping_interval.tick() => {
+                    if socket.send(axum::extract::ws::Message::Ping(vec![1, 2, 3, 4])).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
-    }
-    if client_alive {
-        for event in translator.process_line("data: [DONE]") {
-            if let Some(ws_msg) = sse_to_ws_message(&event) {
-                capture_completed_output(&ws_msg, &mut captured_output);
-                if socket.send(Message::Text(ws_msg)).await.is_err() {
-                    client_alive = false;
-                    break;
-                }
+
+        if !buffer.trim().is_empty() {
+            let events = translator.process_line(&buffer);
+            for event in events {
+                let ws_msg = if event.starts_with("event: ") {
+                    if let Some(data_start) = event.find("data: ") {
+                        event[data_start + 6..].trim_end().to_string()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    event
+                };
+                let _ = socket.send(axum::extract::ws::Message::Text(ws_msg)).await;
             }
         }
-    }
 
-    // Remember this turn so a follow-up reused request can rebuild full history.
-    store_conversation(conversations, response_id, full_input, captured_output);
+        // Send [DONE] as raw JSON for WS (codex expects a JSON object, not SSE)
+        let _ = socket.send(axum::extract::ws::Message::Text(
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#.to_string()
+        )).await;
 
-    if client_alive {
-        Ok(())
-    } else {
-        Err(())
-    }
+        logger::info("ws", "WebSocket connection closed");
+    })
 }
 
 // ─── POST /v1/chat/completions (passthrough) ───────────────────────────────
@@ -775,21 +816,6 @@ async fn handle_chat_completions(
     let url = format!("{}/chat/completions", base_url);
 
     logger::info("chat", &format!("Passthrough POST {} model={}", url, backend_model));
-
-    // Acquire an upstream concurrency permit so burst load cannot overwhelm
-    // EricAI or exhaust the connection pool. Overload -> 503.
-    let _permit = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        state.upstream_sem.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        _ => {
-            logger::warn("chat", "Upstream concurrency limit reached (503)");
-            return (StatusCode::SERVICE_UNAVAILABLE, "Upstream busy").into_response();
-        }
-    };
 
     let resp = state.http_client
         .post(&url)
@@ -888,26 +914,119 @@ async fn handle_compact(
     let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
-    logger::info("compact", &format!("Compact POST {} model={}", url, backend_model));
-
-    // Acquire an upstream concurrency permit so burst load cannot overwhelm
-    // EricAI or exhaust the connection pool. Overload -> 503.
-    let _permit = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        state.upstream_sem.clone().acquire_owned(),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        _ => {
-            logger::warn("compact", "Upstream concurrency limit reached (503)");
-            return (StatusCode::SERVICE_UNAVAILABLE, "Upstream busy").into_response();
-        }
+    // Context size guard: estimate input tokens and reject if exceeds model's context window
+    let context_window = {
+        let catalog_path = std::env::var("HOME")
+            .map(|h| format!("{}/.codex/model_catalog.json", h))
+            .ok();
+        let cw = catalog_path
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|c| c.get("models").and_then(|m| m.as_array()).map(|a| a.to_vec()))
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m.get("slug").and_then(|s| s.as_str()) == Some(&model_alias))
+                    .and_then(|m| m.get("context_window")).and_then(|c| c.as_u64())
+            })
+            .unwrap_or(196608u64);
+        cw
     };
+
+    // Rough estimate: ~4 chars per token
+    let estimated_tokens = cc_payload.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter().map(|msg| {
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                content.len() / 4
+            }).sum::<usize>()
+        }).unwrap_or(0);
+
+    if estimated_tokens as u64 > context_window {
+        // Trim older middle messages to fit, then compact the trimmed version
+        let target_tokens = (context_window as f64 * 0.8) as usize;
+        logger::warn("compact", &format!(
+            "Context size guard: estimated {} tokens > context_window {} — trimming before compact",
+            estimated_tokens, context_window
+        ));
+
+        if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            let total = messages.len();
+            if total > 4 {
+                let mut best_keep = 4;
+                for keep_from_end in (2..=total-2).rev() {
+                    let trimmed: Vec<&Value> = messages.iter().take(2)
+                        .chain(messages.iter().skip(total - keep_from_end))
+                        .collect();
+                    let trimmed_tokens: usize = trimmed.iter().map(|msg| {
+                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                    }).sum();
+                    if trimmed_tokens <= target_tokens {
+                        best_keep = keep_from_end;
+                        break;
+                    }
+                }
+
+                let head: Vec<Value> = messages.iter().take(2).cloned().collect();
+                let tail: Vec<Value> = messages.iter().skip(total - best_keep).cloned().collect();
+                let mut new_messages = head;
+                new_messages.push(json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Context trimmed: {} older messages removed. Summarize the remaining conversation.]",
+                        total - 2 - best_keep
+                    )
+                }));
+                new_messages.extend(tail);
+
+                logger::info("compact", &format!(
+                    "Trimmed for compact: {} → {} messages",
+                    total, new_messages.len()
+                ));
+                *messages = new_messages;
+            }
+        }
+
+        // If still too large, return synthetic compaction
+        let new_estimated = cc_payload.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter().map(|msg| {
+                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
+                }).sum::<usize>()
+            }).unwrap_or(0usize);
+        if new_estimated as u64 > context_window {
+            logger::error("compact", &format!(
+                "Still too large after trimming: {} tokens — returning synthetic compact",
+                new_estimated
+            ));
+            let compaction_item = json!({
+                "type": "compaction",
+                "summary_text": "Previous conversation context was too large to compact. Starting fresh.",
+                "compaction_trigger": "auto",
+            });
+            let response_obj = json!({
+                "id": format!("resp_compact_{}", uuid::Uuid::new_v4().simple()),
+                "object": "response.compaction",
+                "status": "completed",
+                "model": model_alias,
+                "output": [compaction_item],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            });
+            return Json(response_obj).into_response();
+        }
+    }
+
+    // Use streaming to avoid timeouts on large contexts
+    cc_payload["stream"] = json!(true);
+    cc_payload["stream_options"] = json!({"include_usage": true});
+
+    logger::info("compact", &format!("Compact POST (streaming) {} model={} est_tokens={}", url, backend_model, estimated_tokens));
 
     let resp = match state.http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "text/event-stream")
         .json(&cc_payload)
         .send()
         .await
@@ -928,161 +1047,64 @@ async fn handle_compact(
         return (status, body_text).into_response();
     }
 
-    let raw: Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            logger::error("compact", &format!("Parse error: {}", e));
-            return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
-                .into_response();
+    // Collect streamed response into a single text
+    use futures_util::StreamExt;
+    let byte_stream = resp.bytes_stream();
+    let mut stream = byte_stream;
+    let mut buffer = String::new();
+    let mut full_text = String::new();
+    let mut finish_reason: Option<String> = None;
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].to_string();
+                    buffer = buffer[pos + 1..].to_string();
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data.trim() == "[DONE]" { continue; }
+                        if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                            // Extract text delta
+                            if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) {
+                                for choice in choices {
+                                    if let Some(delta) = choice.get("delta") {
+                                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                            full_text.push_str(content);
+                                        }
+                                    }
+                                    if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                                        finish_reason = Some(fr.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                logger::error("compact", &format!("Stream error: {}", e));
+                break;
+            }
         }
-    };
+    }
 
-    let mut response_obj = translate_response::chat_completion_to_response(
-        &raw,
-        Some(&request_json),
-    );
-
-    let output_text = response_obj.get("output")
-        .and_then(|o| o.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|item| item.get("content"))
-        .and_then(|c| c.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|part| part.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    logger::info("compact", &format!("Compact completed: {} chars of summary (finish={:?})", full_text.len(), finish_reason));
 
     let compaction_item = json!({
         "type": "compaction",
-        "summary_text": output_text,
+        "summary_text": if full_text.is_empty() { "Session compacted." } else { &full_text },
         "compaction_trigger": "auto",
     });
 
-    response_obj["object"] = json!("response.compaction");
-    response_obj["output"] = json!([compaction_item]);
+    let response_obj = json!({
+        "id": format!("resp_compact_{}", uuid::Uuid::new_v4().simple()),
+        "object": "response.compaction",
+        "status": "completed",
+        "model": model_alias,
+        "output": [compaction_item],
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    });
 
     Json(response_obj).into_response()
-}
-
-
-#[cfg(test)]
-mod ws_state_tests {
-    use super::*;
-
-    fn item(role: &str, text: &str) -> Value {
-        json!({
-            "type": "message",
-            "role": role,
-            "content": [{ "type": if role == "assistant" { "output_text" } else { "input_text" }, "text": text }]
-        })
-    }
-
-    #[test]
-    fn rebuild_without_previous_id_uses_request_input_only() {
-        let convs: WsConversations = HashMap::new();
-        let req = json!({ "input": [item("user", "hello")] });
-        let full = rebuild_full_input(&req, &convs);
-        assert_eq!(full, vec![item("user", "hello")]);
-    }
-
-    #[test]
-    fn rebuild_with_previous_id_concatenates_prior_input_output_and_increment() {
-        // Prior turn: user asked something, assistant replied (output captured).
-        let prev_full = vec![item("user", "q1")];
-        let prev_out = vec![item("assistant", "a1")];
-        let mut convs: WsConversations = HashMap::new();
-        convs.insert("resp_prev".to_string(), (prev_full.clone(), prev_out.clone()));
-
-        // Reused request: only the new incremental item + previous_response_id.
-        let req = json!({
-            "previous_response_id": "resp_prev",
-            "input": [item("user", "q2")]
-        });
-        let full = rebuild_full_input(&req, &convs);
-
-        // full_input = prev.full ++ prev.output ++ request.input
-        assert_eq!(
-            full,
-            vec![item("user", "q1"), item("assistant", "a1"), item("user", "q2")]
-        );
-    }
-
-    #[test]
-    fn rebuild_with_unknown_previous_id_falls_back_to_increment() {
-        let convs: WsConversations = HashMap::new();
-        let req = json!({
-            "previous_response_id": "resp_missing",
-            "input": [item("user", "q2")]
-        });
-        let full = rebuild_full_input(&req, &convs);
-        assert_eq!(full, vec![item("user", "q2")]);
-    }
-
-    #[test]
-    fn rebuild_chains_across_two_reused_turns() {
-        let mut convs: WsConversations = HashMap::new();
-
-        // Turn 1 (e.g. prewarm or first real request).
-        let t1_input = rebuild_full_input(&json!({ "input": [item("user", "q1")] }), &convs);
-        store_conversation(&mut convs, "resp_1".to_string(), t1_input, vec![item("assistant", "a1")]);
-
-        // Turn 2 reuses resp_1, sends only q2.
-        let t2_req = json!({ "previous_response_id": "resp_1", "input": [item("user", "q2")] });
-        let t2_input = rebuild_full_input(&t2_req, &convs);
-        assert_eq!(
-            t2_input,
-            vec![item("user", "q1"), item("assistant", "a1"), item("user", "q2")]
-        );
-        store_conversation(&mut convs, "resp_2".to_string(), t2_input, vec![item("assistant", "a2")]);
-
-        // Turn 3 reuses resp_2, sends only q3 → full history of all three turns.
-        let t3_req = json!({ "previous_response_id": "resp_2", "input": [item("user", "q3")] });
-        let t3_input = rebuild_full_input(&t3_req, &convs);
-        assert_eq!(
-            t3_input,
-            vec![
-                item("user", "q1"),
-                item("assistant", "a1"),
-                item("user", "q2"),
-                item("assistant", "a2"),
-                item("user", "q3"),
-            ]
-        );
-    }
-
-    #[test]
-    fn capture_completed_output_extracts_output_array() {
-        let mut out = Vec::new();
-        let completed = json!({
-            "type": "response.completed",
-            "response": { "id": "resp_1", "output": [item("assistant", "hi")] }
-        })
-        .to_string();
-        capture_completed_output(&completed, &mut out);
-        assert_eq!(out, vec![item("assistant", "hi")]);
-    }
-
-    #[test]
-    fn capture_completed_output_ignores_other_events() {
-        let mut out = Vec::new();
-        let created = json!({ "type": "response.created", "response": { "id": "resp_1" } }).to_string();
-        capture_completed_output(&created, &mut out);
-        assert!(out.is_empty());
-
-        let delta = json!({ "type": "response.output_text.delta", "delta": "x" }).to_string();
-        capture_completed_output(&delta, &mut out);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn store_conversation_bounds_memory() {
-        let mut convs: WsConversations = HashMap::new();
-        for i in 0..70 {
-            store_conversation(&mut convs, format!("resp_{}", i), vec![item("user", "x")], Vec::new());
-        }
-        // Map is cleared once it reaches 64 entries, so it never grows unbounded.
-        assert!(convs.len() <= 64);
-        // The most recently inserted entry (the only one ever referenced) is present.
-        assert!(convs.contains_key("resp_69"));
-    }
 }

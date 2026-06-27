@@ -285,6 +285,7 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower-http 0.5.2",
  "uuid",
 ]
