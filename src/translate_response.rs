@@ -25,6 +25,26 @@ fn extract_custom_tool_input(arguments: &str) -> String {
     arguments.to_string()
 }
 
+/// Per-choice-index message state, consolidating the former 5 separate HashMaps.
+struct MessageState {
+    text_buf: String,
+    output_ix: usize,
+    item_added: bool,
+    content_added: bool,
+    item_done: bool,
+}
+
+/// Per-tool-call state (keyed by "choice_idx:tool_idx"), consolidating the
+/// former 6 separate HashMaps.
+struct FunctionCallState {
+    args_buf: String,
+    name: String,
+    call_id: String,
+    output_ix: usize,
+    item_done: bool,
+    item_added: bool,
+}
+
 /// State machine for translating Chat Completions SSE -> Responses API SSE.
 /// Ported from Go's oaiToResponsesState.
 pub struct ResponseTranslator {
@@ -40,20 +60,11 @@ pub struct ResponseTranslator {
     reasoning_index: Option<usize>,
     reasoning_buf: String,
 
-    // Message text buffers per choice index
-    msg_text_buf: HashMap<usize, String>,
-    msg_output_ix: HashMap<usize, usize>,
-    msg_item_added: HashMap<usize, bool>,
-    msg_content_added: HashMap<usize, bool>,
-    msg_item_done: HashMap<usize, bool>,
+    // Message state per choice index (single HashMap instead of 5)
+    msg_states: HashMap<usize, MessageState>,
 
-    // Function call state: key = "choice_idx:tool_idx"
-    func_args_buf: HashMap<String, String>,
-    func_names: HashMap<String, String>,
-    func_call_ids: HashMap<String, String>,
-    func_output_ix: HashMap<String, usize>,
-    func_item_done: HashMap<String, bool>,
-    func_item_added: HashMap<String, bool>,
+    // Function call state per "choice_idx:tool_idx" (single HashMap instead of 6)
+    func_states: HashMap<String, FunctionCallState>,
 
     next_output_ix: usize,
 
@@ -68,12 +79,26 @@ pub struct ResponseTranslator {
     // Think tag state
     in_think_tag: bool,
 
+    // When true, emit raw JSON strings (for WebSocket) instead of SSE
+    // `event: ...\ndata: ...` envelopes (for HTTP SSE).
+    raw_json: bool,
+
     // Original request for completed event
     request_json: Option<Value>,
 }
 
 impl ResponseTranslator {
     pub fn new(response_id: &str, request_json: Option<Value>) -> Self {
+        Self::new_impl(response_id, request_json, false)
+    }
+
+    /// Create a translator that emits raw JSON strings (no SSE envelope),
+    /// suitable for WebSocket transport where each frame is a single JSON object.
+    pub fn new_raw_json(response_id: &str, request_json: Option<Value>) -> Self {
+        Self::new_impl(response_id, request_json, true)
+    }
+
+    fn new_impl(response_id: &str, request_json: Option<Value>, raw_json: bool) -> Self {
         Self {
             response_id: response_id.to_string(),
             created: chrono::Utc::now().timestamp(),
@@ -84,17 +109,8 @@ impl ResponseTranslator {
             reasoning_id: None,
             reasoning_index: None,
             reasoning_buf: String::new(),
-            msg_text_buf: HashMap::new(),
-            msg_output_ix: HashMap::new(),
-            msg_item_added: HashMap::new(),
-            msg_content_added: HashMap::new(),
-            msg_item_done: HashMap::new(),
-            func_args_buf: HashMap::new(),
-            func_names: HashMap::new(),
-            func_call_ids: HashMap::new(),
-            func_output_ix: HashMap::new(),
-            func_item_done: HashMap::new(),
-            func_item_added: HashMap::new(),
+            msg_states: HashMap::new(),
+            func_states: HashMap::new(),
             next_output_ix: 0,
             prompt_tokens: 0,
             cached_tokens: 0,
@@ -103,6 +119,7 @@ impl ResponseTranslator {
             reasoning_tokens: 0,
             usage_seen: false,
             in_think_tag: false,
+            raw_json,
             request_json,
         }
     }
@@ -123,7 +140,10 @@ impl ResponseTranslator {
     }
 
     /// Process one SSE `data:` line from chat completions.
-    /// Returns zero or more Responses API SSE event strings.
+    /// Returns zero or more Responses API event strings.
+    /// In SSE mode (default) each string is an SSE frame:
+    ///   event: <event>\ndata: <json>\n\n
+    /// In raw JSON mode each string is just the JSON object.
     pub fn process_line(&mut self, line: &str) -> Vec<String> {
         let line = line.trim();
         if line.is_empty() || line.starts_with(':') {
@@ -166,7 +186,7 @@ impl ResponseTranslator {
                     "error": null,
                 }
             });
-            out.push(self.emit("response.created", &created));
+            out.push(self.emit("response.created", created));
 
             let in_progress = json!({
                 "type": "response.in_progress",
@@ -177,7 +197,7 @@ impl ResponseTranslator {
                     "status": "in_progress",
                 }
             });
-            out.push(self.emit("response.in_progress", &in_progress));
+            out.push(self.emit("response.in_progress", in_progress));
         }
 
         // Check for usage in the chunk
@@ -295,66 +315,75 @@ impl ResponseTranslator {
         out
     }
 
-    fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
-        let mut out = Vec::new();
+   fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
+       let mut out = Vec::new();
 
-        if !self.msg_output_ix.contains_key(&idx) {
+        // Ensure the MessageState entry exists, allocating an output index.
+        if !self.msg_states.contains_key(&idx) {
             let ix = self.alloc_output_index();
-            self.msg_output_ix.insert(idx, ix);
-        }
-        let msg_output_index = self.msg_output_ix[&idx];
-        let item_id = format!("msg_{}_{}", self.response_id, idx);
-
-        if !self.msg_item_added.get(&idx).copied().unwrap_or(false) {
-            let item = json!({
-                "type": "response.output_item.added",
-                "sequence_number": self.next_seq(),
-                "output_index": msg_output_index,
-                "item": {
-                    "id": item_id,
-                    "type": "message",
-                    "status": "in_progress",
-                    "content": [],
-                    "role": "assistant",
-                }
+            self.msg_states.insert(idx, MessageState {
+                text_buf: String::new(),
+                output_ix: ix,
+                item_added: false,
+                content_added: false,
+                item_done: false,
             });
-            out.push(self.emit("response.output_item.added", &item));
-            self.msg_item_added.insert(idx, true);
         }
+        let msg_output_index = self.msg_states[&idx].output_ix;
+       let item_id = format!("msg_{}_{}", self.response_id, idx);
 
-        if !self.msg_content_added.get(&idx).copied().unwrap_or(false) {
-            let part = json!({
-                "type": "response.content_part.added",
-                "sequence_number": self.next_seq(),
-                "item_id": item_id,
-                "output_index": msg_output_index,
-                "content_index": 0,
-                "part": {
-                    "type": "output_text",
-                    "annotations": [],
-                    "logprobs": [],
-                    "text": "",
-                }
-            });
-            out.push(self.emit("response.content_part.added", &part));
-            self.msg_content_added.insert(idx, true);
-        }
+        let need_item_added = !self.msg_states[&idx].item_added;
+        if need_item_added {
+           let item = json!({
+               "type": "response.output_item.added",
+               "sequence_number": self.next_seq(),
+               "output_index": msg_output_index,
+               "item": {
+                   "id": item_id,
+                   "type": "message",
+                   "status": "in_progress",
+                   "content": [],
+                   "role": "assistant",
+               }
+           });
+           out.push(self.emit("response.output_item.added", item));
+            self.msg_states.get_mut(&idx).unwrap().item_added = true;
+       }
 
-        let delta = json!({
-            "type": "response.output_text.delta",
-            "sequence_number": self.next_seq(),
-            "item_id": item_id,
-            "output_index": msg_output_index,
-            "content_index": 0,
-            "delta": content,
-            "logprobs": [],
-        });
-        out.push(self.emit("response.output_text.delta", &delta));
+        let need_content_added = !self.msg_states[&idx].content_added;
+        if need_content_added {
+           let part = json!({
+               "type": "response.content_part.added",
+               "sequence_number": self.next_seq(),
+               "item_id": item_id,
+               "output_index": msg_output_index,
+               "content_index": 0,
+               "part": {
+                   "type": "output_text",
+                   "annotations": [],
+                   "logprobs": [],
+                   "text": "",
+               }
+           });
+           out.push(self.emit("response.content_part.added", part));
+            self.msg_states.get_mut(&idx).unwrap().content_added = true;
+       }
 
-        self.msg_text_buf.entry(idx).or_default().push_str(content);
+       let delta = json!({
+           "type": "response.output_text.delta",
+           "sequence_number": self.next_seq(),
+           "item_id": item_id,
+           "output_index": msg_output_index,
+           "content_index": 0,
+           "delta": content,
+           "logprobs": [],
+       });
+       out.push(self.emit("response.output_text.delta", delta));
 
-        out
-    }
+        self.msg_states.get_mut(&idx).unwrap().text_buf.push_str(content);
+
+       out
+   }
 
     fn handle_reasoning_content(&mut self, idx: usize, rc: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -376,7 +405,7 @@ impl ResponseTranslator {
                     "summary": [],
                 }
             });
-            out.push(self.emit("response.output_item.added", &item));
+            out.push(self.emit("response.output_item.added", item));
 
             let part = json!({
                 "type": "response.reasoning_summary_part.added",
@@ -389,7 +418,7 @@ impl ResponseTranslator {
                     "text": "",
                 }
             });
-            out.push(self.emit("response.reasoning_summary_part.added", &part));
+            out.push(self.emit("response.reasoning_summary_part.added", part));
         }
 
         let rid = self.reasoning_id.as_ref().unwrap().clone();
@@ -403,7 +432,7 @@ impl ResponseTranslator {
             "summary_index": 0,
             "delta": rc,
         });
-        out.push(self.emit("response.reasoning_summary_text.delta", &delta));
+        out.push(self.emit("response.reasoning_summary_text.delta", delta));
 
         self.reasoning_buf.push_str(rc);
 
@@ -423,7 +452,7 @@ impl ResponseTranslator {
                 "summary_index": 0,
                 "text": self.reasoning_buf.clone(),
             });
-            out.push(self.emit("response.reasoning_summary_text.done", &done));
+            out.push(self.emit("response.reasoning_summary_text.done", done));
 
             let part_done = json!({
                 "type": "response.reasoning_summary_part.done",
@@ -436,7 +465,7 @@ impl ResponseTranslator {
                     "text": self.reasoning_buf.clone(),
                 }
             });
-            out.push(self.emit("response.reasoning_summary_part.done", &part_done));
+            out.push(self.emit("response.reasoning_summary_part.done", part_done));
 
             let item_done = json!({
                 "type": "response.output_item.done",
@@ -452,7 +481,7 @@ impl ResponseTranslator {
                     }],
                 }
             });
-            out.push(self.emit("response.output_item.done", &item_done));
+            out.push(self.emit("response.output_item.done", item_done));
 
             self.reasoning_buf.clear();
         }
@@ -466,9 +495,7 @@ impl ResponseTranslator {
             out.extend(self.stop_reasoning());
         }
 
-        if self.msg_item_added.get(&idx).copied().unwrap_or(false)
-            && !self.msg_item_done.get(&idx).copied().unwrap_or(false)
-        {
+        if self.msg_states.get(&idx).map(|s| s.item_added && !s.item_done).unwrap_or(false) {
             out.extend(self.close_message(idx));
         }
 
@@ -479,19 +506,39 @@ impl ResponseTranslator {
             let name_chunk = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
             if !name_chunk.is_empty() {
-                self.func_names.insert(key.clone(), name_chunk);
+                let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
+                    args_buf: String::new(),
+                    name: String::new(),
+                    call_id: String::new(),
+                    output_ix: 0,
+                    item_done: false,
+                    item_added: false,
+                });
+                fs.name = name_chunk;
             }
 
-            let should_emit_item = !self.func_item_added.get(&key).copied().unwrap_or(false)
+            let should_emit_item = self.func_states.get(&key).map(|s| !s.item_added).unwrap_or(true)
                 && !new_call_id.is_empty();
 
-            if should_emit_item {
-                self.func_call_ids.insert(key.clone(), new_call_id.clone());
+           if should_emit_item {
+                // Set up the state entry first, then extract the values we
+                // need so no &mut borrow is held across emit/next_seq calls.
                 let oix = self.alloc_output_index();
-                self.func_output_ix.insert(key.clone(), oix);
-                self.func_item_added.insert(key.clone(), true);
+                let name = self.func_states.get(&key).map(|s| s.name.clone()).unwrap_or_default();
+                {
+                    let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
+                        args_buf: String::new(),
+                        name: String::new(),
+                        call_id: String::new(),
+                        output_ix: 0,
+                        item_done: false,
+                        item_added: false,
+                    });
+                    fs.call_id = new_call_id.clone();
+                    fs.output_ix = oix;
+                    fs.item_added = true;
+                }
 
-                let name = self.func_names.get(&key).cloned().unwrap_or_default();
                 let is_custom = is_custom_tool(&name);
                 let item = if is_custom {
                     json!({
@@ -507,64 +554,67 @@ impl ResponseTranslator {
                             "name": name,
                         }
                     })
-                } else {
-                    json!({
-                        "type": "response.output_item.added",
-                        "sequence_number": self.next_seq(),
+               } else {
+                   json!({
+                       "type": "response.output_item.added",
+                       "sequence_number": self.next_seq(),
                         "output_index": oix,
-                        "item": {
-                            "id": format!("fc_{}", new_call_id),
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "arguments": "",
-                            "call_id": new_call_id,
-                            "name": name,
-                        }
-                    })
+                       "item": {
+                           "id": format!("fc_{}", new_call_id),
+                           "type": "function_call",
+                           "status": "in_progress",
+                           "arguments": "",
+                           "call_id": new_call_id,
+                           "name": name,
+                       }
+                   })
                 };
-                out.push(self.emit("response.output_item.added", &item));
+                out.push(self.emit("response.output_item.added", item));
             }
 
             if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
-                if !args.is_empty() {
-                    let call_id = self.func_call_ids.get(&key).cloned().unwrap_or(new_call_id.clone());
-                    if !call_id.is_empty() {
-                        let oix = self.func_output_ix.get(&key).copied().unwrap_or(0);
-                        let name = self.func_names.get(&key).cloned().unwrap_or_default();
-                        let is_custom = is_custom_tool(&name);
+               if !args.is_empty() {
+                    let (call_id, oix, is_custom) = {
+                       let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
+                           args_buf: String::new(),
+                           name: String::new(),
+                           call_id: new_call_id.clone(),
+                           output_ix: 0,
+                           item_done: false,
+                           item_added: false,
+                       });
+                       fs.args_buf.push_str(args);
+                       let cid = if fs.call_id.is_empty() { new_call_id.clone() } else { fs.call_id.clone() };
+                        (cid, fs.output_ix, is_custom_tool(&fs.name))
+                   };
 
-                        // Always buffer the raw argument fragments so the full
-                        // arguments string is available at close time.
-                        self.func_args_buf.entry(key.clone()).or_default().push_str(args);
-
-                        if !is_custom {
-                            // Regular function calls: stream the raw argument
-                            // fragments as deltas. Codex's function_call handler
-                            // accumulates these into a JSON arguments string.
-                            let event_name = "response.function_call_arguments.delta";
-                            let delta = json!({
-                                "type": event_name,
-                                "sequence_number": self.next_seq(),
-                                "item_id": format!("fc_{}", call_id),
-                                "output_index": oix,
-                                "delta": args,
-                            });
-                            out.push(self.emit(event_name, &delta));
-                        }
-                        // For custom tools (apply_patch): do NOT emit streaming
-                        // deltas here. The model sends arguments as JSON fragments
-                        // like `{"input": "*** Begin Patch\n..."}` split across
-                        // many chunks. Emitting those raw JSON fragments as
-                        // `custom_tool_call_input.delta` events feeds garbage
-                        // into Codex's StreamingPatchParser, which expects patch
-                        // text (starting with `*** Begin Patch`), not JSON. This
-                        // corrupts the parser's state and causes the patch to be
-                        // rejected as malformed.
-                        //
-                        // Instead, we buffer the fragments and emit the extracted
-                        // patch text as a single clean delta in
-                        // `close_function_call`, followed by the `.done` event.
+                    if !call_id.is_empty() && !is_custom {
+                        // Regular function calls: stream the raw argument
+                        // fragments as deltas. Codex's function_call handler
+                        // accumulates these into a JSON arguments string.
+                        let event_name = "response.function_call_arguments.delta";
+                        let delta = json!({
+                            "type": event_name,
+                            "sequence_number": self.next_seq(),
+                            "item_id": format!("fc_{}", call_id),
+                            "output_index": oix,
+                            "delta": args,
+                        });
+                        out.push(self.emit(event_name, delta));
                     }
+                    // For custom tools (apply_patch): do NOT emit streaming
+                    // deltas here. The model sends arguments as JSON fragments
+                    // like `{"input": "*** Begin Patch\n..."}` split across
+                    // many chunks. Emitting those raw JSON fragments as
+                    // `custom_tool_call_input.delta` events feeds garbage
+                    // into Codex's StreamingPatchParser, which expects patch
+                    // text (starting with `*** Begin Patch`), not JSON. This
+                    // corrupts the parser's state and causes the patch to be
+                    // rejected as malformed.
+                    //
+                    // Instead, we buffer the fragments and emit the extracted
+                    // patch text as a single clean delta in
+                    // `close_function_call`, followed by the `.done` event.
                 }
             }
         }
@@ -575,8 +625,10 @@ impl ResponseTranslator {
     fn close_message(&mut self, idx: usize) -> Vec<String> {
         let mut out = Vec::new();
         let item_id = format!("msg_{}_{}", self.response_id, idx);
-        let msg_output_index = self.msg_output_ix.get(&idx).copied().unwrap_or(0);
-        let full_text = self.msg_text_buf.get(&idx).cloned().unwrap_or_default();
+        let (msg_output_index, full_text) = {
+            let ms = self.msg_states.get_mut(&idx).unwrap();
+            (ms.output_ix, ms.text_buf.clone())
+        };
 
         let done = json!({
             "type": "response.output_text.done",
@@ -587,7 +639,7 @@ impl ResponseTranslator {
             "text": full_text,
             "logprobs": [],
         });
-        out.push(self.emit("response.output_text.done", &done));
+        out.push(self.emit("response.output_text.done", done));
 
         let part_done = json!({
             "type": "response.content_part.done",
@@ -602,7 +654,7 @@ impl ResponseTranslator {
                 "text": full_text,
             }
         });
-        out.push(self.emit("response.content_part.done", &part_done));
+        out.push(self.emit("response.content_part.done", part_done));
 
         let item_done = json!({
             "type": "response.output_item.done",
@@ -621,9 +673,9 @@ impl ResponseTranslator {
                 "role": "assistant",
             }
         });
-        out.push(self.emit("response.output_item.done", &item_done));
+        out.push(self.emit("response.output_item.done", item_done));
 
-        self.msg_item_done.insert(idx, true);
+        self.msg_states.get_mut(&idx).unwrap().item_done = true;
         out
     }
 
@@ -634,17 +686,14 @@ impl ResponseTranslator {
             out.extend(self.stop_reasoning());
         }
 
-        if self.msg_item_added.get(&idx).copied().unwrap_or(false)
-            && !self.msg_item_done.get(&idx).copied().unwrap_or(false)
-        {
+        if self.msg_states.get(&idx).map(|s| s.item_added && !s.item_done).unwrap_or(false) {
             out.extend(self.close_message(idx));
         }
 
         let prefix = format!("{}:", idx);
-        let keys_to_close: Vec<String> = self.func_item_added.keys()
-            .filter(|k| k.starts_with(&prefix)
-                && !self.func_item_done.get(*k).copied().unwrap_or(false))
-            .cloned()
+        let keys_to_close: Vec<String> = self.func_states.iter()
+            .filter(|(k, s)| k.starts_with(&prefix) && !s.item_done)
+            .map(|(k, _)| k.clone())
             .collect();
 
         for key in keys_to_close {
@@ -656,13 +705,17 @@ impl ResponseTranslator {
 
     fn close_function_call(&mut self, key: &str) -> Vec<String> {
         let mut out = Vec::new();
-        let call_id = self.func_call_ids.get(key).cloned().unwrap_or_default();
-        if call_id.is_empty() {
-            return out;
-        }
-        let oix = self.func_output_ix.get(key).copied().unwrap_or(0);
-        let args = self.func_args_buf.get(key).cloned().unwrap_or_default();
-        let name = self.func_names.get(key).cloned().unwrap_or_default();
+        let (call_id, oix, args, name) = {
+            let fs = match self.func_states.get(key) {
+                Some(fs) => fs,
+                None => return out,
+            };
+            if fs.call_id.is_empty() {
+                return out;
+            }
+            (fs.call_id.clone(), fs.output_ix, fs.args_buf.clone(), fs.name.clone())
+        };
+
         let is_custom = is_custom_tool(&name);
 
         if is_custom {
@@ -684,7 +737,7 @@ impl ResponseTranslator {
                 "output_index": oix,
                 "delta": input,
             });
-            out.push(self.emit("response.custom_tool_call_input.delta", &final_delta));
+            out.push(self.emit("response.custom_tool_call_input.delta", final_delta));
 
             let done = json!({
                 "type": "response.custom_tool_call_input.done",
@@ -693,7 +746,7 @@ impl ResponseTranslator {
                 "output_index": oix,
                 "input": input,
             });
-            out.push(self.emit("response.custom_tool_call_input.done", &done));
+            out.push(self.emit("response.custom_tool_call_input.done", done));
 
             let item_done = json!({
                 "type": "response.output_item.done",
@@ -708,7 +761,7 @@ impl ResponseTranslator {
                     "name": name,
                 }
             });
-            out.push(self.emit("response.output_item.done", &item_done));
+            out.push(self.emit("response.output_item.done", item_done));
         } else {
             let done = json!({
                 "type": "response.function_call_arguments.done",
@@ -717,7 +770,7 @@ impl ResponseTranslator {
                 "output_index": oix,
                 "arguments": args,
             });
-            out.push(self.emit("response.function_call_arguments.done", &done));
+            out.push(self.emit("response.function_call_arguments.done", done));
 
             let item_done = json!({
                 "type": "response.output_item.done",
@@ -732,10 +785,10 @@ impl ResponseTranslator {
                     "name": name,
                 }
             });
-            out.push(self.emit("response.output_item.done", &item_done));
+            out.push(self.emit("response.output_item.done", item_done));
         }
 
-        self.func_item_done.insert(key.to_string(), true);
+        self.func_states.get_mut(key).unwrap().item_done = true;
         out
     }
 
@@ -746,17 +799,17 @@ impl ResponseTranslator {
             out.extend(self.stop_reasoning());
         }
 
-        let open_msgs: Vec<usize> = self.msg_item_added.keys()
-            .filter(|k| !self.msg_item_done.get(k).copied().unwrap_or(false))
-            .copied()
+        let open_msgs: Vec<usize> = self.msg_states.iter()
+            .filter(|(_, s)| s.item_added && !s.item_done)
+            .map(|(k, _)| *k)
             .collect();
         for idx in open_msgs {
             out.extend(self.close_message(idx));
         }
 
-        let open_funcs: Vec<String> = self.func_item_added.keys()
-            .filter(|k| !self.func_item_done.get(*k).copied().unwrap_or(false))
-            .cloned()
+        let open_funcs: Vec<String> = self.func_states.iter()
+            .filter(|(_, s)| s.item_added && !s.item_done)
+            .map(|(k, _)| k.clone())
             .collect();
         for key in open_funcs {
             out.extend(self.close_function_call(&key));
@@ -794,7 +847,7 @@ impl ResponseTranslator {
 
         let mut output = Vec::new();
 
-        for (idx, text) in &self.msg_text_buf {
+        for (idx, ms) in &self.msg_states {
             let item = json!({
                 "id": format!("msg_{}_{}", self.response_id, idx),
                 "type": "message",
@@ -803,35 +856,33 @@ impl ResponseTranslator {
                     "type": "output_text",
                     "annotations": [],
                     "logprobs": [],
-                    "text": text,
+                    "text": ms.text_buf,
                 }],
                 "role": "assistant",
             });
             output.push(item);
         }
 
-        for (key, call_id) in &self.func_call_ids {
-            let args = self.func_args_buf.get(key).cloned().unwrap_or_default();
-            let name = self.func_names.get(key).cloned().unwrap_or_default();
-            let is_custom = is_custom_tool(&name);
+        for (_, fs) in &self.func_states {
+            let is_custom = is_custom_tool(&fs.name);
             let item = if is_custom {
-                let input = extract_custom_tool_input(&args);
+                let input = extract_custom_tool_input(&fs.args_buf);
                 json!({
-                    "id": format!("fc_{}", call_id),
+                    "id": format!("fc_{}", fs.call_id),
                     "type": "custom_tool_call",
                     "status": "completed",
                     "input": input,
-                    "call_id": call_id,
-                    "name": name,
+                    "call_id": fs.call_id,
+                    "name": fs.name,
                 })
             } else {
                 json!({
-                    "id": format!("fc_{}", call_id),
+                    "id": format!("fc_{}", fs.call_id),
                     "type": "function_call",
                     "status": "completed",
-                    "arguments": args,
-                    "call_id": call_id,
-                    "name": name,
+                    "arguments": fs.args_buf,
+                    "call_id": fs.call_id,
+                    "name": fs.name,
                 })
             };
             output.push(item);
@@ -865,15 +916,21 @@ impl ResponseTranslator {
             "response": response,
         });
 
-        self.emit("response.completed", &completed)
+        self.emit("response.completed", completed)
     }
 
-    fn emit(&mut self, event: &str, payload: &Value) -> String {
-        let mut p = payload.clone();
-        if let Some(obj) = p.as_object_mut() {
+    /// Emit a translated event. Takes ownership of the payload Value (no clone).
+    /// In SSE mode, wraps it in `event: <event>\ndata: <json>\n\n`.
+    /// In raw JSON mode, returns just the JSON string.
+    fn emit(&mut self, event: &str, mut payload: Value) -> String {
+        if let Some(obj) = payload.as_object_mut() {
             obj.insert("type".to_string(), json!(event));
         }
-        format!("event: {}\ndata: {}\n\n", event, p)
+        if self.raw_json {
+            payload.to_string()
+        } else {
+            format!("event: {}\ndata: {}\n\n", event, payload)
+        }
     }
 }
 

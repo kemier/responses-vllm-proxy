@@ -517,3 +517,37 @@ fn test_non_streaming_empty_content() {
     // Empty content should not produce a message item
     assert_eq!(output.len(), 0);
 }
+
+#[test]
+fn test_raw_json_mode_no_sse_envelope() {
+    let mut t = ResponseTranslator::new_raw_json("resp_raw1", None);
+
+    let events = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#);
+
+    // Should have multiple events (created, in_progress, output_item.added, etc.)
+    assert!(events.len() >= 5);
+
+    // In raw JSON mode, each event should be a JSON object (starts with '{')
+    // and NOT contain SSE envelope prefixes like "event:" or "data:"
+    for event in &events {
+        assert!(event.starts_with('{'), "Expected JSON object, got: {}", &event[..20.min(event.len())]);
+        assert!(!event.contains("event: "), "Should not contain SSE envelope");
+        assert!(!event.contains("data: "), "Should not contain SSE data prefix");
+    }
+
+    // First event should be response.created
+    assert!(events[0].contains("\"response.created\""));
+}
+
+#[test]
+fn test_raw_json_mode_completed_event() {
+    let mut t = ResponseTranslator::new_raw_json("resp_raw2", None);
+
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}"#);
+    let done_events = t.process_line("data: [DONE]");
+
+    // The last event should be response.completed
+    let last = done_events.last().unwrap();
+    assert!(last.contains("\"response.completed\""));
+    assert!(last.starts_with('{')); // raw JSON, not SSE
+}

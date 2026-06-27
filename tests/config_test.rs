@@ -154,3 +154,65 @@ openai-compatibility:
     assert_eq!(cfg.log_level, "debug");
     assert_eq!(cfg.log_dir, "/tmp/test-logs");
 }
+
+#[test]
+fn test_resolve_model_known_alias() {
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "ericai"
+    prefix: "ericai"
+    base-url: "https://example.com"
+    models:
+    - name: zai-org/GLM-5.2-FP8
+      alias: glm-5.2
+    - name: deepseek-ai/DeepSeek-V4-Pro
+      alias: deepseek-v4-pro
+"#;
+    let path = "/tmp/test_ericai_resolve1.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    assert_eq!(cfg.resolve_model("glm-5.2"), "zai-org/GLM-5.2-FP8");
+    assert_eq!(cfg.resolve_model("deepseek-v4-pro"), "deepseek-ai/DeepSeek-V4-Pro");
+}
+
+#[test]
+fn test_resolve_model_unknown_alias_no_prefix() {
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "ericai"
+    prefix: "ericai"
+    base-url: "https://example.com"
+    models:
+    - name: m1
+      alias: a1
+"#;
+    let path = "/tmp/test_ericai_resolve2.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    // Unknown alias without prefix returns itself
+    assert_eq!(cfg.resolve_model("some-random-model"), "some-random-model");
+}
+
+#[test]
+fn test_resolve_model_ericai_prefix_stripped() {
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "ericai"
+    prefix: "ericai"
+    base-url: "https://example.com"
+    models:
+    - name: m1
+      alias: a1
+"#;
+    let path = "/tmp/test_ericai_resolve3.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    // ericai/ prefix is stripped for unknown models
+    assert_eq!(cfg.resolve_model("ericai/foo-bar"), "foo-bar");
+}

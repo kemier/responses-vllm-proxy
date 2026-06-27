@@ -1,10 +1,9 @@
 use chrono::Local;
-use once_cell::sync::Lazy;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -18,6 +17,7 @@ struct LogRecord {
 
 /// Log levels
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -56,20 +56,23 @@ struct LoggerState {
     level: LogLevel,
 }
 
-/// Sender to the background writer task. `None` before `init()` has run
-/// (or after the channel has been closed). Producers only ever `try_send`,
-/// so acquiring this lock never blocks on I/O — it is held only long enough
-/// to clone the sender.
-static SENDER: Lazy<Mutex<Option<mpsc::Sender<LogRecord>>>> = Lazy::new(|| Mutex::new(None));
+/// Sender to the background writer task. Set once during `init()`; reads are
+/// a lock-free atomic via `OnceLock::get()`. Producers call `try_send(&self)`,
+/// so no `Sender` clone is needed on the hot path.
+static SENDER: OnceLock<mpsc::Sender<LogRecord>> = OnceLock::new();
+
+/// Current log level, captured at `init()` time. Read via a relaxed atomic
+/// load so producers can cheaply skip filtered records before any allocation.
+static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
 
 static CLEANER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Log directory captured at `init()` time, used by `error_request` to
 /// place per-request error files alongside main.log. Read-only after init.
-static LOG_DIR: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::from("logs")));
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Whether to also emit log lines to stderr. Captured at `init()` time.
-static TO_STDERR: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(true));
+static TO_STDERR: OnceLock<bool> = OnceLock::new();
 
 /// Initialize the logger.
 ///
@@ -92,6 +95,7 @@ pub fn init(log_dir: &str, max_total_size_mb: u64, to_stderr: bool, level_str: &
         .ok();
 
     let level = LogLevel::from_str(level_str);
+    CURRENT_LEVEL.store(level as u8, Ordering::Relaxed);
 
     let mut state = LoggerState {
         log_dir: log_dir.clone(),
@@ -115,9 +119,9 @@ pub fn init(log_dir: &str, max_total_size_mb: u64, to_stderr: bool, level_str: &
         }
     });
 
-    *SENDER.lock().unwrap() = Some(tx);
-    *LOG_DIR.lock().unwrap() = log_dir.clone();
-    *TO_STDERR.lock().unwrap() = to_stderr;
+    let _ = SENDER.set(tx);
+    let _ = LOG_DIR.set(log_dir.clone());
+    let _ = TO_STDERR.set(to_stderr);
 
     // Start background cleaner (OS thread, independent of tokio runtime)
     if !CLEANER_RUNNING.swap(true, Ordering::SeqCst) {
@@ -266,42 +270,38 @@ fn write_record(state: &mut LoggerState, rec: LogRecord) {
 /// initialized, the record is dropped and a one-line stderr warning is
 /// emitted to avoid backpressure stalls.
 fn enqueue(level: LogLevel, module: &str, message: &str) {
-    let sender = {
-        let guard = SENDER.lock().unwrap();
-        guard.as_ref().map(|s| s.clone())
-    };
+    // Cheap atomic check: skip all allocation if the level is filtered.
+    if level as u8 > CURRENT_LEVEL.load(Ordering::Relaxed) {
+        return;
+    }
 
-    let record = LogRecord {
-        level,
-        module: module.to_string(),
-        message: message.to_string(),
-    };
-
-    match sender {
-        Some(tx) => {
-            if tx.try_send(record).is_err() {
-                // Channel full or closed — drop and warn on stderr.
-                let _ = writeln!(
-                    io::stderr(),
-                    "[{}] logger: channel full, dropped {} log from {}",
-                    Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    level.as_str(),
-                    module
-                );
-            }
-        }
-        None => {
-            // Logger not initialized — emit directly to stderr as a fallback.
-            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    if let Some(sender) = SENDER.get() {
+        let record = LogRecord {
+            level,
+            module: module.to_string(),
+            message: message.to_string(),
+        };
+        if sender.try_send(record).is_err() {
+            // Channel full or closed — drop and warn on stderr.
             let _ = writeln!(
                 io::stderr(),
-                "[{}] [--------] [{}] [{}] {}",
-                timestamp,
-                format!("{:<5}", level.as_str()),
-                module,
-                message
+                "[{}] logger: channel full, dropped {} log from {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                level.as_str(),
+                module
             );
         }
+    } else {
+        // Logger not initialized — emit directly to stderr as a fallback.
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(
+            io::stderr(),
+            "[{}] [--------] [{}] [{}] {}",
+            timestamp,
+            format!("{:<5}", level.as_str()),
+            module,
+            message
+        );
     }
 }
 
@@ -338,7 +338,7 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
     let id = &Uuid::new_v4().simple().to_string()[..8];
     let filename = format!("error-{}-{}.log", endpoint.replace('/', "-"), ts);
 
-    let filepath = LOG_DIR.lock().unwrap().join(&filename);
+    let filepath = LOG_DIR.get().map(|d| d.join(&filename)).unwrap_or_else(|| PathBuf::from("logs").join(&filename));
 
     let content = format!(
         "[{}] Error Log — {} (HTTP {})\n\
@@ -360,7 +360,7 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
     );
 
     // Write to stderr
-    if *TO_STDERR.lock().unwrap() {
+    if *TO_STDERR.get().unwrap_or(&true) {
         let _ = io::stderr().write_all(format!(
             "[{}] [error] [request] {} returned {}: see {}\n",
             Local::now().format("%Y-%m-%d %H:%M:%S"),

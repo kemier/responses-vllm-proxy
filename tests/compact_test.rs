@@ -27,6 +27,24 @@ fn sse_stop() -> String {
     r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#.to_string()
 }
 
+/// Monotonic counter for unique temp-dir names. Avoids collisions when
+/// multiple tests start in the same millisecond (parallel test execution).
+static TEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unique_tmp_dir(prefix: &str) -> std::path::PathBuf {
+    let n = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "{}-{}-{}-{}",
+        prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+        n,
+    ))
+}
+
 async fn run_compact_test(
     upstream_sse: Vec<String>,
     request_body: Value,
@@ -34,9 +52,23 @@ async fn run_compact_test(
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = upstream_listener.local_addr().unwrap().port();
 
+    // Keep ownership of the listener outside the spawned task so it stays
+    // alive until the proxy connects (or the timeout fires). The task
+    // accepts one connection, writes the canned SSE response, and exits.
     let upstream = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut socket, _) = upstream_listener.accept().await.unwrap();
+        // Timeout: if the proxy never connects (e.g. reqwest fails before
+        // reaching upstream), don't block the test forever.
+        let accept_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            upstream_listener.accept(),
+        )
+        .await;
+        let (mut socket, _) = match accept_result {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => panic!("upstream accept failed: {e}"),
+            Err(_) => return, // timed out — proxy never connected
+        };
         let mut buf = vec![0u8; 65536];
         let _ = socket.read(&mut buf).await.unwrap();
 
@@ -51,14 +83,7 @@ async fn run_compact_test(
         let _ = socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "ericai-compact-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    ));
+    let tmp_dir = unique_tmp_dir("ericai-compact-test");
     let auth_dir = tmp_dir.join("auth");
     std::fs::create_dir_all(&auth_dir).unwrap();
 
@@ -136,21 +161,21 @@ openai-compatibility:
         json!({"_raw": String::from_utf8_lossy(&body_bytes).to_string()})
     });
 
-    let _ = upstream.await;
+    // Don't block forever if the mock upstream task is still waiting for
+    // a connection that will never arrive. A short timeout is enough —
+    // the proxy either connected (task finished) or failed (still waiting).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        upstream,
+    )
+    .await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     (status, body_json)
 }
 
 async fn build_app() -> (axum::Router, std::path::PathBuf) {
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "ericai-compact-test-noup-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    ));
+    let tmp_dir = unique_tmp_dir("ericai-compact-test-noup");
     let auth_dir = tmp_dir.join("auth");
     std::fs::create_dir_all(&auth_dir).unwrap();
     let token_file = auth_dir.join("ericai-ericai-user.json");

@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -25,6 +26,10 @@ pub struct Config {
     pub log_level: String,
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
+    /// Alias → backend model name map, populated once at load time.
+    /// Used by `resolve_model()` to avoid per-request Vec allocation.
+    #[serde(skip)]
+    pub model_lookup: HashMap<String, String>,
 }
 
 fn default_true() -> bool { true }
@@ -64,6 +69,14 @@ impl Config {
         if cfg.debug {
             cfg.log_level = "debug".to_string();
         }
+        // Build the alias → backend model lookup map once.
+        let model_pairs: Vec<(String, String)> = cfg
+            .ericai_provider()
+            .map(|p| p.models.iter().map(|m| (m.alias.clone(), m.name.clone())).collect())
+            .unwrap_or_default();
+        for (alias, name) in model_pairs {
+            cfg.model_lookup.insert(alias, name);
+        }
         Ok(cfg)
     }
 
@@ -79,6 +92,20 @@ impl Config {
             }
         }
         out
+    }
+
+    /// Resolve a model alias to its backend model ID using the pre-built
+    /// lookup map. Falls back to stripping an `ericai/` prefix, then to
+    /// the alias itself. This replaces the per-request `all_models()` +
+    /// `.find()` pattern on the hot path.
+    pub fn resolve_model(&self, alias: &str) -> String {
+        if let Some(name) = self.model_lookup.get(alias) {
+            return name.clone();
+        }
+        if let Some(stripped) = alias.strip_prefix("ericai/") {
+            return stripped.to_string();
+        }
+        alias.to_string()
     }
 }
 
