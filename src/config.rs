@@ -26,6 +26,11 @@ pub struct Config {
     pub log_level: String,
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
+    /// When true, logs detailed per-turn debug info (instructions length,
+    /// preview, tools count, input items) for every WebSocket request.
+    /// Useful for diagnosing hallucination caused by missing system prompt.
+    #[serde(default)]
+    pub log_turn_debug: bool,
     /// Alias → backend model name map, populated once at load time.
     /// Used by `resolve_model()` to avoid per-request Vec allocation.
     #[serde(skip)]

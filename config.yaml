@@ -12,6 +12,10 @@ logs-max-total-size-mb: 10
 log-level: "debug"
 log-dir: "logs"
 
+# Per-turn debug logging (instructions length, preview, tools count, input items)
+# Set to true to diagnose hallucination caused by missing system prompt on incremental requests.
+log-turn-debug: false
+
 openai-compatibility:
   - name: "ericai"
     prefix: "ericai"

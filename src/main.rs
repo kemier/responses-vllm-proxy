@@ -756,26 +756,29 @@ pub async fn handle_responses_ws(
             let url = format!("{}/chat/completions", base_url);
 
             // Debug: log what system message (instructions) is being sent to the LLM this turn.
+            // Controlled by the `log-turn-debug` config option (default: false).
             // This helps diagnose hallucination caused by missing system prompt on incremental requests.
-            let instructions = effective_request.get("instructions")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let instructions_len = instructions.len();
-            let instructions_preview: String = instructions.chars().take(200).collect();
-            let has_tools = effective_request.get("tools").is_some();
-            let tools_count = effective_request.get("tools")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            let input_count = effective_request.get("input")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            let is_incremental = request_json.get("previous_response_id").is_some();
-            logger::info("ws", &format!(
-                "[{}] Turn debug: incremental={} instructions_len={} instructions_preview=\"{}\" has_tools={} tools_count={} input_items={}",
-                conn_short, is_incremental, instructions_len, instructions_preview, has_tools, tools_count, input_count
-            ));
+            if state.cfg.log_turn_debug {
+                let instructions = effective_request.get("instructions")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let instructions_len = instructions.len();
+                let instructions_preview: String = instructions.chars().take(200).collect();
+                let has_tools = effective_request.get("tools").is_some();
+                let tools_count = effective_request.get("tools")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let input_count = effective_request.get("input")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let is_incremental = request_json.get("previous_response_id").is_some();
+                logger::info("ws", &format!(
+                    "[{}] Turn debug: incremental={} instructions_len={} instructions_preview=\"{}\" has_tools={} tools_count={} input_items={}",
+                    conn_short, is_incremental, instructions_len, instructions_preview, has_tools, tools_count, input_count
+                ));
+            }
             logger::info("ws", &format!("[{}] WS POST {} model={} stream={}", conn_short, url, backend_model, is_stream));
 
             // Send the request to EricAI.  While waiting for the upstream
