@@ -444,7 +444,11 @@ pub async fn handle_responses_ws(
 ) -> Response {
     ws.on_upgrade(move |mut socket| async move {
         use futures_util::StreamExt;
-        logger::info("ws", "WebSocket connection opened for /v1/responses");
+        // Per-connection UUID for log tracing — distinguishes multiple codex
+        // instances using the proxy simultaneously.
+        let conn_id = uuid::Uuid::new_v4().simple().to_string();
+        let conn_short = &conn_id[..8];
+        logger::info("ws", &format!("[{}] WebSocket connection opened for /v1/responses", conn_short));
 
         // ── Connection-reuse state ─────────────────────────────────────
         // Codex reuses a single WebSocket connection across multiple turns.
@@ -480,11 +484,11 @@ pub async fn handle_responses_ws(
             ).await {
                 Ok(Some(Ok(m))) => m,
                 Ok(Some(Err(_))) | Ok(None) => {
-                    logger::info("ws", "WebSocket closed by client");
+                    logger::info("ws", &format!("[{}] WebSocket closed by client", conn_short));
                     break 'connection;
                 }
                 Err(_) => {
-                    logger::info("ws", "WebSocket idle timeout (300s between turns), closing");
+                    logger::info("ws", &format!("[{}] WebSocket idle timeout (300s between turns), closing", conn_short));
                     let _ = socket.close().await;
                     break 'connection;
                 }
@@ -500,7 +504,7 @@ pub async fn handle_responses_ws(
                 }
                 axum::extract::ws::Message::Pong(_) => continue 'connection,
                 axum::extract::ws::Message::Close(_) => {
-                    logger::info("ws", "WebSocket close frame received");
+                    logger::info("ws", &format!("[{}] WebSocket close frame received", conn_short));
                     break 'connection;
                 }
             };
@@ -508,7 +512,7 @@ pub async fn handle_responses_ws(
             let request_json: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(e) => {
-                    logger::error("ws", &format!("Invalid JSON: {}", e));
+                    logger::error("ws", &format!("[{}] Invalid JSON: {}", conn_short, e));
                     let _ = socket.send(axum::extract::ws::Message::Text(
                         format!("{{\"error\":\"Invalid JSON: {}\"}}", e)
                     )).await;
@@ -533,7 +537,7 @@ pub async fn handle_responses_ws(
                 // will see `last_response.response_id.is_empty()` and fall back to
                 // sending the full input (ResponseCreate without previous_response_id).
                 // This ensures the first real request includes the complete conversation.
-                logger::info("ws", "Prewarm request (generate=false), acknowledging with empty response_id");
+                logger::info("ws", &format!("[{}] Prewarm request (generate=false), acknowledging with empty response_id", conn_short));
                 let _ = socket.send(axum::extract::ws::Message::Text(
                     r#"{"type":"response.completed","response":{"id":"","status":"completed"}}"#.to_string()
                 )).await;
@@ -573,15 +577,15 @@ pub async fn handle_responses_ws(
 
                         effective_request["input"] = json!(merged_input);
                         logger::info("ws", &format!(
-                            "Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
-                            prev_id, cached_input.len(),
+                            "[{}] Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
+                            conn_short, prev_id, cached_input.len(),
                             request_json.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
                             merged_input.len()
                         ));
                     } else {
                         logger::warn("ws", &format!(
-                            "previous_response_id={} not found in cache — using full input as-is",
-                            prev_id
+                            "[{}] previous_response_id={} not found in cache — using full input as-is",
+                            conn_short, prev_id
                         ));
                     }
                 }
@@ -633,8 +637,8 @@ pub async fn handle_responses_ws(
             if estimated_tokens as u64 > context_window {
                 let target_tokens = (context_window as f64 * 0.8) as usize;
                 logger::warn("ws", &format!(
-                    "Context size guard: estimated {} tokens > context_window {} for model {} — trimming",
-                    estimated_tokens, context_window, model_alias
+                    "[{}] Context size guard: estimated {} tokens > context_window {} for model {} — trimming",
+                    conn_short, estimated_tokens, context_window, model_alias
                 ));
 
                 if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
@@ -672,8 +676,8 @@ pub async fn handle_responses_ws(
                         }).sum();
 
                         logger::info("ws", &format!(
-                            "Trimmed: {} messages → {} messages, {} → {} tokens",
-                            total, new_messages.len(), estimated_tokens, new_tokens
+                            "[{}] Trimmed: {} messages → {} messages, {} → {} tokens",
+                            conn_short, total, new_messages.len(), estimated_tokens, new_tokens
                         ));
 
                         *messages = new_messages;
@@ -690,8 +694,8 @@ pub async fn handle_responses_ws(
                     }).unwrap_or(0usize);
                 if new_estimated as u64 > context_window {
                     logger::error("ws", &format!(
-                        "Still too large after trimming: {} tokens — sending error",
-                        new_estimated
+                        "[{}] Still too large after trimming: {} tokens — sending error",
+                        conn_short, new_estimated
                     ));
                     let err_msg = format!(
                         "{{\"error\":\"Context too large: even after trimming, {} tokens exceeds model {} context window ({}). Start a new session.\"}}",
@@ -716,7 +720,7 @@ pub async fn handle_responses_ws(
             let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
             let url = format!("{}/chat/completions", base_url);
 
-            logger::info("ws", &format!("WS POST {} model={} stream={}", url, backend_model, is_stream));
+            logger::info("ws", &format!("[{}] WS POST {} model={} stream={}", conn_short, url, backend_model, is_stream));
 
             // Send the request to EricAI.  While waiting for the upstream
             // response headers (which can take 60+ seconds for large resumed
@@ -757,7 +761,7 @@ pub async fn handle_responses_ws(
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body_text = resp.text().await.unwrap_or_default();
-                logger::error("ws", &format!("Upstream {}: {}", status, logger::extract_error_summary(&body_text, 300)));
+                logger::error("ws", &format!("[{}] Upstream {}: {}", conn_short, status, logger::extract_error_summary(&body_text, 300)));
                 logger::error_request("ws-responses", &cc_payload.to_string(), &body_text, status.as_u16());
                 // Send error in the format codex's parse_wrapped_websocket_error_event expects:
                 //   {"type":"error","status":<code>,"error":{"message":"..."}}
@@ -819,7 +823,7 @@ pub async fn handle_responses_ws(
                                 }
                             }
                             Some(Err(e)) => {
-                                logger::error("ws", &format!("WS stream error: {}", e));
+                                logger::error("ws", &format!("[{}] WS stream error: {}", conn_short, e));
                                 stream_errored = true;
                                 break 'stream;
                             }
@@ -871,7 +875,7 @@ pub async fn handle_responses_ws(
             // treat the turn as successful with no output, leading to degenerate
             // model behavior (pwd/ls commands, 30-token responses, etc.).
             if stream_event_count == 0 {
-                logger::error("ws", "Upstream stream ended with no content events — sending error instead of response.completed");
+                logger::error("ws", &format!("[{}] Upstream stream ended with no content events — sending error instead of response.completed", conn_short));
                 let err_payload = json!({
                     "type": "error",
                     "status": 502,
@@ -900,7 +904,7 @@ pub async fn handle_responses_ws(
             // SAME connection.  No log spam; only log on actual close.
         }
 
-        logger::info("ws", "WebSocket connection closed");
+        logger::info("ws", &format!("[{}] WebSocket connection closed", conn_short));
     })
 }
 
