@@ -1,8 +1,8 @@
-mod config;
-mod auth;
-mod translate_request;
-mod translate_response;
-mod logger;
+pub mod config;
+pub mod auth;
+pub mod translate_request;
+pub mod translate_response;
+pub mod logger;
 
 use axum::{
     body::Body,
@@ -18,10 +18,10 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 #[derive(Clone)]
-struct AppState {
-    cfg: Arc<config::Config>,
-    token_mgr: Arc<auth::TokenManager>,
-    http_client: reqwest::Client,
+pub struct AppState {
+    pub cfg: Arc<config::Config>,
+    pub token_mgr: Arc<auth::TokenManager>,
+    pub http_client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -112,7 +112,7 @@ async fn main() {
 }
 
 // ─── GET /v1/models ─────────────────────────────────────────────────────────
-async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     let models: Vec<Value> = state.cfg.all_models().iter().map(|(alias, name)| {
         json!({
             "id": alias,
@@ -127,12 +127,12 @@ async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 // ─── GET /health ────────────────────────────────────────────────────────────
-async fn handle_health() -> impl IntoResponse {
+pub async fn handle_health() -> impl IntoResponse {
     Json(json!({"status": "ok", "service": "ericai-proxy"}))
 }
 
 // ─── POST /v1/responses ────────────────────────────────────────────────────
-async fn handle_responses(
+pub async fn handle_responses(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -445,7 +445,7 @@ async fn handle_responses(
 }
 
 // ─── GET /v1/responses (WebSocket) ──────────────────────────────────────────
-async fn handle_responses_ws(
+pub async fn handle_responses_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(_params): Query<Value>,
@@ -777,7 +777,7 @@ async fn handle_responses_ws(
 }
 
 // ─── POST /v1/chat/completions (passthrough) ───────────────────────────────
-async fn handle_chat_completions(
+pub async fn handle_chat_completions(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -861,7 +861,7 @@ async fn handle_chat_completions(
 }
 
 // ─── POST /backend-api/codex/responses/compact ─────────────────────────────
-async fn handle_compact(
+pub async fn handle_compact(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
