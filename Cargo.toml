@@ -19,6 +19,7 @@ async-stream = "0.3"
 log = "0.4"
 once_cell = "1"
 tokio-util = "0.7"
+socket2 = "0.5"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

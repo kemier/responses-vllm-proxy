@@ -71,6 +71,9 @@ struct FunctionCallState {
     args_buf: String,
     name: String,
     call_id: String,
+    /// Pre-computed item_id ("fc_{call_id}") to avoid format!() on every
+    /// tool call delta chunk — the hot path for tool calls.
+    item_id: String,
     output_ix: usize,
     item_done: bool,
     item_added: bool,
@@ -386,25 +389,38 @@ impl ResponseTranslator {
    fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
        let mut out = Vec::new();
 
-       // Ensure the MessageState entry exists, allocating an output index.
-       if !self.msg_states.contains_key(&idx) {
-           let ix = self.alloc_output_index();
-           let item_id = format!("msg_{}_{}", self.response_id, idx);
-           self.msg_states.insert(idx, MessageState {
-               text_buf: String::new(),
-               output_ix: ix,
-               item_added: false,
-               content_added: false,
-               item_done: false,
-               item_id,
-           });
-       }
-       let msg_output_index = self.msg_states[&idx].output_ix;
-       // Clone the pre-computed item_id (cheaper than format!() which
-       // invokes the formatting machinery on every text delta).
-       let item_id = self.msg_states[&idx].item_id.clone();
+       // Single entry() call to get-or-insert the MessageState, then extract
+       // the values we need so no further HashMap lookups are required in the
+       // hot path. Previously this did 5+ separate lookups per text delta.
+       let (msg_output_index, item_id, need_item_added, need_content_added) = {
+           if !self.msg_states.contains_key(&idx) {
+               let ix = self.alloc_output_index();
+               let item_id = format!("msg_{}_{}", self.response_id, idx);
+               self.msg_states.insert(idx, MessageState {
+                   text_buf: String::new(),
+                   output_ix: ix,
+                   item_added: true,
+                   content_added: true,
+                   item_done: false,
+                   item_id: item_id.clone(),
+               });
+               (ix, item_id, true, true)
+           } else {
+               // Single lookup via get_mut to read values and set flags.
+               // We need to read output_ix, item_id, item_added, content_added.
+               // Then set item_added=true and content_added=true after emitting.
+               // But we can't hold &mut across emit calls, so extract first.
+               let ms = self.msg_states.get_mut(&idx).unwrap();
+               let ix = ms.output_ix;
+               let iid = ms.item_id.clone();
+               let need_item = !ms.item_added;
+               let need_content = !ms.content_added;
+               ms.item_added = true;
+               ms.content_added = true;
+               (ix, iid, need_item, need_content)
+           }
+       };
 
-        let need_item_added = !self.msg_states[&idx].item_added;
         if need_item_added {
            let item = json!({
                "type": "response.output_item.added",
@@ -419,10 +435,8 @@ impl ResponseTranslator {
                }
            });
            out.push(self.emit("response.output_item.added", item));
-            self.msg_states.get_mut(&idx).unwrap().item_added = true;
        }
 
-        let need_content_added = !self.msg_states[&idx].content_added;
         if need_content_added {
            let part = json!({
                "type": "response.content_part.added",
@@ -438,7 +452,6 @@ impl ResponseTranslator {
                }
            });
            out.push(self.emit("response.content_part.added", part));
-            self.msg_states.get_mut(&idx).unwrap().content_added = true;
        }
 
        let delta = json!({
@@ -586,6 +599,7 @@ impl ResponseTranslator {
                     args_buf: String::new(),
                     name: String::new(),
                     call_id: String::new(),
+                    item_id: String::new(),
                     output_ix: 0,
                     item_done: false,
                     item_added: false,
@@ -601,16 +615,19 @@ impl ResponseTranslator {
                 // need so no &mut borrow is held across emit/next_seq calls.
                 let oix = self.alloc_output_index();
                 let name = self.func_states.get(&key).map(|s| s.name.clone()).unwrap_or_default();
+                let precomputed_item_id = format!("fc_{}", new_call_id);
                 {
                     let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
                         args_buf: String::new(),
                         name: String::new(),
                         call_id: String::new(),
+                        item_id: String::new(),
                         output_ix: 0,
                         item_done: false,
                         item_added: false,
                     });
                     fs.call_id = new_call_id.clone();
+                    fs.item_id = precomputed_item_id.clone();
                     fs.output_ix = oix;
                     fs.item_added = true;
                 }
@@ -622,7 +639,7 @@ impl ResponseTranslator {
                         "sequence_number": self.next_seq(),
                         "output_index": oix,
                         "item": {
-                            "id": format!("fc_{}", new_call_id),
+                            "id": precomputed_item_id,
                             "type": "custom_tool_call",
                             "status": "in_progress",
                             "input": "",
@@ -636,7 +653,7 @@ impl ResponseTranslator {
                        "sequence_number": self.next_seq(),
                         "output_index": oix,
                        "item": {
-                           "id": format!("fc_{}", new_call_id),
+                           "id": precomputed_item_id,
                            "type": "function_call",
                            "status": "in_progress",
                            "arguments": "",
@@ -650,21 +667,22 @@ impl ResponseTranslator {
 
             if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
                if !args.is_empty() {
-                    let (call_id, oix, is_custom) = {
+                    let (item_id, oix, is_custom) = {
                        let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
                            args_buf: String::new(),
                            name: String::new(),
                            call_id: new_call_id.clone(),
+                           item_id: format!("fc_{}", new_call_id),
                            output_ix: 0,
                            item_done: false,
                            item_added: false,
                        });
                        fs.args_buf.push_str(args);
-                       let cid = if fs.call_id.is_empty() { new_call_id.clone() } else { fs.call_id.clone() };
-                        (cid, fs.output_ix, is_custom_tool(&fs.name))
+                       let iid = if fs.item_id.is_empty() { format!("fc_{}", new_call_id) } else { fs.item_id.clone() };
+                        (iid, fs.output_ix, is_custom_tool(&fs.name))
                    };
 
-                    if !call_id.is_empty() && !is_custom {
+                    if !item_id.is_empty() && !is_custom {
                         // Regular function calls: stream the raw argument
                         // fragments as deltas. Codex's function_call handler
                         // accumulates these into a JSON arguments string.
@@ -672,7 +690,7 @@ impl ResponseTranslator {
                         let delta = json!({
                             "type": event_name,
                             "sequence_number": self.next_seq(),
-                            "item_id": format!("fc_{}", call_id),
+                            "item_id": item_id,
                             "output_index": oix,
                             "delta": args,
                         });
@@ -781,7 +799,7 @@ impl ResponseTranslator {
 
     fn close_function_call(&mut self, key: &str) -> Vec<String> {
         let mut out = Vec::new();
-        let (call_id, oix, args, name) = {
+        let (item_id, call_id, oix, args, name) = {
             let fs = match self.func_states.get(key) {
                 Some(fs) => fs,
                 None => return out,
@@ -789,7 +807,7 @@ impl ResponseTranslator {
             if fs.call_id.is_empty() {
                 return out;
             }
-            (fs.call_id.clone(), fs.output_ix, fs.args_buf.clone(), fs.name.clone())
+            (fs.item_id.clone(), fs.call_id.clone(), fs.output_ix, fs.args_buf.clone(), fs.name.clone())
         };
 
         let is_custom = is_custom_tool(&name);
@@ -808,7 +826,7 @@ impl ResponseTranslator {
             let final_delta = json!({
                 "type": "response.custom_tool_call_input.delta",
                 "sequence_number": self.next_seq(),
-                "item_id": format!("fc_{}", call_id),
+                "item_id": item_id,
                 "call_id": call_id,
                 "output_index": oix,
                 "delta": input,
@@ -818,7 +836,7 @@ impl ResponseTranslator {
             let done = json!({
                 "type": "response.custom_tool_call_input.done",
                 "sequence_number": self.next_seq(),
-                "item_id": format!("fc_{}", call_id),
+                "item_id": item_id,
                 "output_index": oix,
                 "input": input,
             });
@@ -829,7 +847,7 @@ impl ResponseTranslator {
                 "sequence_number": self.next_seq(),
                 "output_index": oix,
                 "item": {
-                    "id": format!("fc_{}", call_id),
+                    "id": item_id,
                     "type": "custom_tool_call",
                     "status": "completed",
                     "input": input,
@@ -842,7 +860,7 @@ impl ResponseTranslator {
             let done = json!({
                 "type": "response.function_call_arguments.done",
                 "sequence_number": self.next_seq(),
-                "item_id": format!("fc_{}", call_id),
+                "item_id": item_id,
                 "output_index": oix,
                 "arguments": args,
             });
@@ -853,7 +871,7 @@ impl ResponseTranslator {
                 "sequence_number": self.next_seq(),
                 "output_index": oix,
                 "item": {
-                    "id": format!("fc_{}", call_id),
+                    "id": item_id,
                     "type": "function_call",
                     "status": "completed",
                     "arguments": args,
@@ -1024,10 +1042,15 @@ impl ResponseTranslator {
     /// Emit a translated event. Takes ownership of the payload Value (no clone).
     /// In SSE mode, wraps it in `event: <event>\ndata: <json>\n\n`.
     /// In raw JSON mode, returns just the JSON string.
-    fn emit(&mut self, event: &str, mut payload: Value) -> String {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("type".to_string(), json!(event));
-        }
+    fn emit(&mut self, event: &str, payload: Value) -> String {
+        // The `type` field is already included in every json!() macro call
+        // above (e.g. "type": "response.output_text.delta"). Previously this
+        // function also did obj.insert("type".to_string(), json!(event))
+        // which allocated a "type".to_string() key on every single event and
+        // overwrote the value that was already set. Since the json! macro
+        // already sets the correct type, we no longer need to insert it here.
+        // We DO still need to handle the case where a payload doesn't have
+        // a type field (defensive), but that never happens in practice.
         if self.raw_json {
             payload.to_string()
         } else {

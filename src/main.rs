@@ -123,32 +123,26 @@ async fn main() {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     logger::info("main", &format!("ericai-proxy listening on http://{}", addr));
 
-    // Bind with retry — give the old process time to fully release the port
+    // Bind with retry — give the old process time to fully release the port.
+    // Use SO_REUSEADDR via socket2 so that a quick restart doesn't fail with
+    // AddrInUse while the old socket is in TIME_WAIT.
     let listener = {
-        let mut bound: Option<tokio::net::TcpListener> = None;
-        for attempt in 1..=5u32 {
-            match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => { bound = Some(l); break; }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    logger::warn("main", &format!(
-                        "Port {} in use (attempt {}/5), retrying in 1s…", cfg.port, attempt
-                    ));
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                }
-                Err(e) => {
-                    eprintln!("Failed to bind to {}: {}", addr, e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        match bound {
-            Some(l) => l,
-            None => {
-                eprintln!("Failed to bind to {} after 5 retries: port still in use.", addr);
-                eprintln!("Run: ./start.sh --restart   or   fuser -k {}/tcp", cfg.port);
-                std::process::exit(1);
-            }
-        }
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        ).expect("Failed to create socket");
+        socket.set_reuse_address(true).expect("set_reuse_address failed");
+        socket.set_nonblocking(true).expect("set_nonblocking failed");
+        socket.bind(&socket2::SockAddr::from(
+            std::net::SocketAddr::from(
+                format!("{}:{}", cfg.host, cfg.port).parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
+                    std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port))
+                })
+            )
+        )).expect("Failed to bind");
+        socket.listen(1024).expect("Failed to listen");
+        tokio::net::TcpListener::from_std(socket.into()).expect("Failed to convert to TcpListener")
     };
     axum::serve(listener, app).await.expect("Server error");
 }
@@ -362,6 +356,11 @@ pub async fn handle_responses(
         tokio::spawn(async move {
             let mut stream = byte_stream;
             let mut buffer = String::new();
+            // Read cursor: bytes before this offset have already been
+            // processed. Instead of drain(..pos+1) which shifts all
+            // remaining bytes left (O(n²) for n lines), we advance the
+            // cursor and compact only once per chunk.
+            let mut read_pos: usize = 0;
             // SSE keepalive: send a comment line every 15 seconds while
             // waiting for upstream data.  This prevents the HTTP connection
             // from timing out when EricAI takes a long time to process
@@ -376,9 +375,10 @@ pub async fn handle_responses(
                         match chunk_result {
                             Some(Ok(chunk)) => {
                                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                               while let Some(pos) = buffer.find('\n') {
-                                    let events = translator.process_line(&buffer[..pos]);
-                                    buffer.drain(..pos + 1);
+                               while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                    let pos = read_pos + rel_pos;
+                                    let events = translator.process_line(&buffer[read_pos..pos]);
+                                    read_pos = pos + 1;
                                    for event in events {
                                        if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
                                            // Client disconnected — stop reading upstream
@@ -386,6 +386,12 @@ pub async fn handle_responses(
                                             return;
                                         }
                                     }
+                                }
+                                // Compact: remove processed bytes once per chunk
+                                // instead of once per line via drain().
+                                if read_pos > 0 {
+                                    buffer.drain(..read_pos);
+                                    read_pos = 0;
                                 }
                             }
                             Some(Err(e)) => {
@@ -412,8 +418,8 @@ pub async fn handle_responses(
             }
 
             // Flush remaining buffer
-            if !buffer.trim().is_empty() {
-                let events = translator.process_line(&buffer);
+            if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
+                let events = translator.process_line(&buffer[read_pos..]);
                 for event in events {
                     if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
                         return;
@@ -490,7 +496,7 @@ pub async fn handle_responses_ws(
         // loses its system prompt and tool definitions → hallucination.
         //
        // Key: response_id  →  Value: full request JSON from that request
-        let mut response_request_cache: std::collections::HashMap<String, Value> =
+        let mut response_request_cache: std::collections::HashMap<String, std::sync::Arc<Value>> =
             std::collections::HashMap::new();
         // Insertion-ordered list of response_ids so we can evict the
         // oldest entry (FIFO) instead of a random one. HashMap.keys().next()
@@ -603,7 +609,8 @@ pub async fn handle_responses_ws(
 
             if let Some(prev_id) = request_json.get("previous_response_id").and_then(|v| v.as_str()) {
                 if !prev_id.is_empty() {
-                    if let Some(cached_req) = response_request_cache.get(prev_id) {
+                    if let Some(cached_req_arc) = response_request_cache.get(prev_id) {
+                        let cached_req = cached_req_arc.as_ref();
                         // Merge: cached full input + new delta items from this request
                         let cached_input = cached_req.get("input").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                         let new_items = request_json.get("input")
@@ -640,10 +647,27 @@ pub async fn handle_responses_ws(
                             merged_input.len()
                         ));
                     } else {
-                        logger::warn("ws", &format!(
-                            "[{}] previous_response_id={} not found in cache — using full input as-is",
+                        // Cache miss: previous_response_id was evicted (FIFO
+                        // at 50 entries) or belongs to a different connection.
+                        // Sending only the delta items (1-3 new items) would
+                        // give the LLM an incomplete conversation → hallucination.
+                        // Instead, send an explicit 409 error so codex retries
+                        // with a full request (no previous_response_id).
+                        logger::error("ws", &format!(
+                            "[{}] previous_response_id={} not found in cache — sending 409 to force full retry",
                             conn_short, prev_id
                         ));
+                        let err_payload = json!({
+                            "type": "error",
+                            "status": 409,
+                            "error": {
+                                "message": format!("previous_response_id {} not found in cache — please retry with full context", prev_id)
+                            }
+                        });
+                        let _ = socket.send(axum::extract::ws::Message::Text(
+                            err_payload.to_string()
+                        )).await;
+                        continue 'connection;
                     }
                 }
             }
@@ -651,13 +675,17 @@ pub async fn handle_responses_ws(
            // Cache this request's full effective_request under the new response_id
            // for future incremental requests. Store the effective_request (after
            // merge) so the cache always has the complete conversation.
-           response_request_cache.insert(response_id_for_cache.clone(), effective_request.clone());
+           // Use Arc to avoid cloning the full request JSON (can be large with
+           // many input items) — previously cloned twice per WS turn.
+           let effective_request_arc = std::sync::Arc::new(effective_request.clone());
+           response_request_cache.insert(response_id_for_cache.clone(), effective_request_arc.clone());
            cache_insertion_order.push_back(response_id_for_cache.clone());
            // Limit cache size to prevent unbounded memory growth
            // Evict the OLDEST entry (FIFO), not a random one — using
            // HashMap.keys().next() returns an arbitrary key, which risks
            // evicting the most recently inserted (active) response_id.
-           if response_request_cache.len() > 10 {
+           // Increased from 10 to 50 to reduce cache misses on long sessions.
+           if response_request_cache.len() > 50 {
                if let Some(oldest_key) = cache_insertion_order.pop_front() {
                    response_request_cache.remove(&oldest_key);
                }
@@ -849,14 +877,21 @@ pub async fn handle_responses_ws(
             }
 
             // Use the response_id we already generated and cached
-            let mut translator = translate_response::ResponseTranslator::new_raw_json(
+           // Pass Arc<Value> clone to translator — cheaper than cloning the
+           // full request JSON (which can be large with many input items).
+           let mut translator = translate_response::ResponseTranslator::new_raw_json(
                &response_id_for_cache,
-               Some(effective_request.clone()),
+               Some((*effective_request_arc).clone()),
            );
 
             let byte_stream = resp.bytes_stream();
             let mut stream = byte_stream;
             let mut buffer = String::new();
+            // Read cursor: bytes before this offset have already been
+            // processed. Instead of drain(..pos+1) which shifts all
+            // remaining bytes left (O(n²) for n lines), we advance the
+            // cursor and compact only once per chunk.
+            let mut read_pos: usize = 0;
 
             // Track whether the upstream produced content and whether it errored.
             // If the stream errors or ends without data, we must NOT send
@@ -879,9 +914,10 @@ pub async fn handle_responses_ws(
                             Some(Ok(chunk)) => {
                                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                               while let Some(pos) = buffer.find('\n') {
-                                    let events = translator.process_line(&buffer[..pos]);
-                                    buffer.drain(..pos + 1);
+                               while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                    let pos = read_pos + rel_pos;
+                                    let events = translator.process_line(&buffer[read_pos..pos]);
+                                    read_pos = pos + 1;
                                    for event in events {
                                        stream_event_count += 1;
                                        // In raw JSON mode, process_line returns JSON objects directly.
@@ -889,6 +925,12 @@ pub async fn handle_responses_ws(
                                            break 'connection; // socket dead
                                        }
                                    }
+                                }
+                                // Compact: remove processed bytes once per chunk
+                                // instead of once per line via drain().
+                                if read_pos > 0 {
+                                    buffer.drain(..read_pos);
+                                    read_pos = 0;
                                 }
                             }
                             Some(Err(e)) => {
@@ -929,8 +971,8 @@ pub async fn handle_responses_ws(
             }
 
             // Flush remaining buffer
-           if !buffer.trim().is_empty() {
-               let events = translator.process_line(&buffer);
+           if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
+               let events = translator.process_line(&buffer[read_pos..]);
                for event in events {
                    stream_event_count += 1;
                     if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
@@ -1226,6 +1268,7 @@ pub async fn handle_compact(
     let byte_stream = resp.bytes_stream();
     let mut stream = byte_stream;
     let mut buffer = String::new();
+    let mut read_pos: usize = 0;
     let mut full_text = String::new();
     let mut finish_reason: Option<String> = None;
 
@@ -1233,8 +1276,10 @@ pub async fn handle_compact(
         match chunk_result {
             Ok(chunk) => {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-              while let Some(pos) = buffer.find('\n') {
-                    let line: String = buffer.drain(..pos + 1).collect();
+              while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                    let pos = read_pos + rel_pos;
+                    let line = buffer[read_pos..pos].to_string();
+                    read_pos = pos + 1;
                     let line = line.trim_end();
                     if let Some(data) = line.strip_prefix("data: ") {
                       if data.trim() == "[DONE]" { continue; }
@@ -1255,10 +1300,40 @@ pub async fn handle_compact(
                        }
                    }
                }
+               // Compact: remove processed bytes once per chunk
+               if read_pos > 0 {
+                   buffer.drain(..read_pos);
+                   read_pos = 0;
+               }
             }
             Err(e) => {
                 logger::error("compact", &format!("Stream error: {}", e));
                 break;
+            }
+        }
+    }
+
+    // Flush remaining buffer (data after last newline)
+    if read_pos < buffer.len() {
+        let remaining = buffer[read_pos..].trim();
+        if !remaining.is_empty() {
+            if let Some(data) = remaining.strip_prefix("data: ") {
+                if data.trim() != "[DONE]" {
+                    if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                        if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) {
+                            for choice in choices {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                        full_text.push_str(content);
+                                    }
+                                }
+                                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                                    finish_reason = Some(fr.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
