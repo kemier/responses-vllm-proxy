@@ -480,12 +480,17 @@ pub async fn handle_responses_ws(
         // Codex reuses a single WebSocket connection across multiple turns.
         // When codex sends an incremental request (previous_response_id set),
         // it only includes the NEW input items — not the full conversation.
-        // We must cache the full input from each response so we can merge
+        // We must cache the full request from each response so we can merge
         // the delta with the cached baseline before translating to Chat
         // Completions format.
         //
-        // Key: response_id  →  Value: full input array from that request
-        let mut response_input_cache: std::collections::HashMap<String, Vec<Value>> =
+        // We cache the ENTIRE request (not just the input array) because
+        // codex does NOT resend `instructions`, `tools`, `reasoning`, etc.
+        // on incremental requests. Without restoring these fields, the LLM
+        // loses its system prompt and tool definitions → hallucination.
+        //
+        // Key: response_id  →  Value: full request JSON from that request
+        let mut response_request_cache: std::collections::HashMap<String, Value> =
             std::collections::HashMap::new();
 
         // ── Connection-reuse loop ──────────────────────────────────────
@@ -591,8 +596,9 @@ pub async fn handle_responses_ws(
 
             if let Some(prev_id) = request_json.get("previous_response_id").and_then(|v| v.as_str()) {
                 if !prev_id.is_empty() {
-                    if let Some(cached_input) = response_input_cache.get(prev_id) {
+                    if let Some(cached_req) = response_request_cache.get(prev_id) {
                         // Merge: cached full input + new delta items from this request
+                        let cached_input = cached_req.get("input").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                         let new_items = request_json.get("input")
                             .and_then(|v| v.as_array())
                             .cloned()
@@ -602,6 +608,24 @@ pub async fn handle_responses_ws(
                         merged_input.extend(new_items);
 
                         effective_request["input"] = json!(merged_input);
+
+                        // Restore fields that codex does NOT resend on incremental
+                        // requests: instructions (system prompt), tools, reasoning,
+                        // tool_choice, parallel_tool_calls, etc.
+                        // Without these, the LLM has no system prompt or tool
+                        // definitions → hallucination.
+                        for field in ["instructions", "tools", "reasoning", "tool_choice",
+                            "parallel_tool_calls", "max_output_tokens", "max_tool_calls",
+                            "temperature", "top_p", "truncation", "text",
+                            "safety_identifier", "service_tier", "store",
+                            "prompt_cache_key", "metadata"] {
+                            if effective_request.get(field).is_none() {
+                                if let Some(v) = cached_req.get(field) {
+                                    effective_request[field] = v.clone();
+                                }
+                            }
+                        }
+
                         logger::info("ws", &format!(
                             "[{}] Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
                             conn_short, prev_id, cached_input.len(),
@@ -617,16 +641,15 @@ pub async fn handle_responses_ws(
                 }
             }
 
-            // Cache this request's full input under the new response_id for future incremental requests
-            if let Some(full_input) = effective_request.get("input").and_then(|v| v.as_array()) {
-                response_input_cache.insert(response_id_for_cache.clone(), full_input.clone());
-                // Limit cache size to prevent unbounded memory growth
-                if response_input_cache.len() > 10 {
-                    // Remove oldest entries (HashMap has no order, so just remove arbitrary)
-                    let key_to_remove = response_input_cache.keys().next().cloned();
-                    if let Some(key) = key_to_remove {
-                        response_input_cache.remove(&key);
-                    }
+            // Cache this request's full effective_request under the new response_id
+            // for future incremental requests. Store the effective_request (after
+            // merge) so the cache always has the complete conversation.
+            response_request_cache.insert(response_id_for_cache.clone(), effective_request.clone());
+            // Limit cache size to prevent unbounded memory growth
+            if response_request_cache.len() > 10 {
+                let key_to_remove = response_request_cache.keys().next().cloned();
+                if let Some(key) = key_to_remove {
+                    response_request_cache.remove(&key);
                 }
             }
 
