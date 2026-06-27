@@ -446,6 +446,18 @@ pub async fn handle_responses_ws(
         use futures_util::StreamExt;
         logger::info("ws", "WebSocket connection opened for /v1/responses");
 
+        // ── Connection-reuse state ─────────────────────────────────────
+        // Codex reuses a single WebSocket connection across multiple turns.
+        // When codex sends an incremental request (previous_response_id set),
+        // it only includes the NEW input items — not the full conversation.
+        // We must cache the full input from each response so we can merge
+        // the delta with the cached baseline before translating to Chat
+        // Completions format.
+        //
+        // Key: response_id  →  Value: full input array from that request
+        let mut response_input_cache: std::collections::HashMap<String, Vec<Value>> =
+            std::collections::HashMap::new();
+
         // ── Connection-reuse loop ──────────────────────────────────────
         // Codex opens ONE WebSocket connection and sends multiple turns
         // over it (prewarm + first turn + subsequent turns).  After each
@@ -514,9 +526,16 @@ pub async fn handle_responses_ws(
                 .unwrap_or(false);
 
             if is_prewarm {
-                logger::info("ws", "Prewarm request (generate=false), acknowledging");
+                // Prewarm: codex sends generate=false to establish the connection.
+                // We must return response.completed with an EMPTY response_id ("").
+                // Codex stores this id and uses it as previous_response_id for the
+                // next request. With an empty id, codex's prepare_websocket_request()
+                // will see `last_response.response_id.is_empty()` and fall back to
+                // sending the full input (ResponseCreate without previous_response_id).
+                // This ensures the first real request includes the complete conversation.
+                logger::info("ws", "Prewarm request (generate=false), acknowledging with empty response_id");
                 let _ = socket.send(axum::extract::ws::Message::Text(
-                    format!(r#"{{"type":"response.completed","response":{{"id":"{}","status":"completed"}}}}"#, format!("resp_{}", uuid::Uuid::new_v4().simple()))
+                    r#"{"type":"response.completed","response":{"id":"","status":"completed"}}"#.to_string()
                 )).await;
                 continue 'connection;
             }
@@ -532,9 +551,58 @@ pub async fn handle_responses_ws(
                .and_then(|v| v.as_bool())
                .unwrap_or(true);
 
+            // ── previous_response_id handling ──────────────────────────
+            // When codex sends an incremental request (previous_response_id set),
+            // the input array contains ONLY the new items since the last response.
+            // We need to merge the cached full input with the new delta items to
+            // reconstruct the complete conversation for the Chat Completions API.
+            let mut effective_request = request_json.clone();
+            let response_id_for_cache = format!("resp_{}", uuid::Uuid::new_v4().simple());
+
+            if let Some(prev_id) = request_json.get("previous_response_id").and_then(|v| v.as_str()) {
+                if !prev_id.is_empty() {
+                    if let Some(cached_input) = response_input_cache.get(prev_id) {
+                        // Merge: cached full input + new delta items from this request
+                        let new_items = request_json.get("input")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        let mut merged_input = cached_input.clone();
+                        merged_input.extend(new_items);
+
+                        effective_request["input"] = json!(merged_input);
+                        logger::info("ws", &format!(
+                            "Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
+                            prev_id, cached_input.len(),
+                            request_json.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                            merged_input.len()
+                        ));
+                    } else {
+                        logger::warn("ws", &format!(
+                            "previous_response_id={} not found in cache — using full input as-is",
+                            prev_id
+                        ));
+                    }
+                }
+            }
+
+            // Cache this request's full input under the new response_id for future incremental requests
+            if let Some(full_input) = effective_request.get("input").and_then(|v| v.as_array()) {
+                response_input_cache.insert(response_id_for_cache.clone(), full_input.clone());
+                // Limit cache size to prevent unbounded memory growth
+                if response_input_cache.len() > 10 {
+                    // Remove oldest entries (HashMap has no order, so just remove arbitrary)
+                    let key_to_remove = response_input_cache.keys().next().cloned();
+                    if let Some(key) = key_to_remove {
+                        response_input_cache.remove(&key);
+                    }
+                }
+            }
+
             let mut cc_payload = translate_request::responses_to_chat_completions(
                 &backend_model,
-                &request_json,
+                &effective_request,
                 is_stream,
             );
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
@@ -707,10 +775,10 @@ pub async fn handle_responses_ws(
                 continue 'connection; // keep connection alive for retry
             }
 
-           let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+            // Use the response_id we already generated and cached
             let mut translator = translate_response::ResponseTranslator::new_raw_json(
-               &response_id,
-               Some(request_json),
+               &response_id_for_cache,
+               Some(effective_request.clone()),
            );
 
             let byte_stream = resp.bytes_stream();
