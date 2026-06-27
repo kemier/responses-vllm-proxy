@@ -169,6 +169,170 @@ fn test_multiple_tool_calls_same_choice() {
     assert!(e2.iter().any(|e| e.contains("response.output_item.added") && e.contains("tool_b")));
 }
 
+// ─── apply_patch (custom tool) streaming tests ─────────────────────────────
+// Regression tests for the double-emission bug: apply_patch argument fragments
+// must NOT be emitted as streaming custom_tool_call_input.delta events (they
+// are raw JSON fragments like `{"in` / `put": "*** ` which corrupt Codex's
+// StreamingPatchParser). Instead, the full extracted patch text must be emitted
+// as a single clean delta at close time.
+
+#[test]
+fn test_apply_patch_no_streaming_deltas_for_arguments() {
+    let mut t = ResponseTranslator::new("resp_patch1", None);
+
+    // First chunk: apply_patch tool call with id and name
+    let e1 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch1","function":{"name":"apply_patch","arguments":""}}]}}]}"#,
+    );
+    // Should emit the output_item.added as custom_tool_call
+    assert!(e1.iter().any(|e| e.contains("response.output_item.added") && e.contains("custom_tool_call")));
+    assert!(e1.iter().any(|e| e.contains("apply_patch")));
+
+    // Second chunk: argument fragment (raw JSON, incomplete)
+    let e2 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"in"}}]}}]}"#,
+    );
+    // CRITICAL: must NOT emit any custom_tool_call_input.delta for this fragment
+    assert!(
+        !e2.iter().any(|e| e.contains("response.custom_tool_call_input.delta")),
+        "apply_patch argument fragments must not be streamed as deltas"
+    );
+
+    // Third chunk: more argument fragments
+    let e3 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"put\": \"*** Begin Patch\\n"}}]}}]}"#,
+    );
+    assert!(
+        !e3.iter().any(|e| e.contains("response.custom_tool_call_input.delta")),
+        "apply_patch argument fragments must not be streamed as deltas"
+    );
+
+    // Fourth chunk: rest of the patch
+    let e4 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"*** End Patch\"}"}}]}}]}"#,
+    );
+    assert!(
+        !e4.iter().any(|e| e.contains("response.custom_tool_call_input.delta")),
+        "apply_patch argument fragments must not be streamed as deltas"
+    );
+}
+
+#[test]
+fn test_apply_patch_emits_clean_delta_on_done() {
+    let mut t = ResponseTranslator::new("resp_patch2", None);
+
+    // Stream an apply_patch call with JSON-wrapped arguments split across chunks
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch2","function":{"name":"apply_patch","arguments":""}}]}}]}"#,
+    );
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"input\": \"*** Begin Patch\\n"}}]}}]}"#,
+    );
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"*** Update File: foo.txt\\n@@\\n+hello\\n*** End Patch\"}"}}]}}]}"#,
+    );
+
+    // Trigger close via [DONE]
+    let done = t.process_line("data: [DONE]");
+
+    // Should emit exactly ONE custom_tool_call_input.delta with the clean patch text
+    let deltas: Vec<&String> = done
+        .iter()
+        .filter(|e| e.contains("response.custom_tool_call_input.delta"))
+        .collect();
+    assert_eq!(
+        deltas.len(),
+        1,
+        "expected exactly one clean delta at close time, got {}",
+        deltas.len()
+    );
+
+    // The delta should contain the extracted patch text, NOT raw JSON
+    let delta = deltas[0];
+    assert!(delta.contains("*** Begin Patch"));
+    assert!(delta.contains("*** Update File: foo.txt"));
+    assert!(delta.contains("*** End Patch"));
+    // Should NOT contain JSON wrapper artifacts
+    assert!(!delta.contains("\"input\""));
+    assert!(!delta.contains("{\\\""));
+
+    // Should emit the done event with the clean input
+    assert!(done.iter().any(|e| e.contains("response.custom_tool_call_input.done")));
+    let done_evt = done
+        .iter()
+        .find(|e| e.contains("response.custom_tool_call_input.done"))
+        .unwrap();
+    assert!(done_evt.contains("*** Begin Patch"));
+    assert!(done_evt.contains("*** End Patch"));
+
+    // Should emit output_item.done with custom_tool_call type
+    assert!(done.iter().any(|e| e.contains("response.output_item.done") && e.contains("custom_tool_call")));
+
+    // Should emit response.completed
+    assert!(done.iter().any(|e| e.contains("response.completed")));
+}
+
+#[test]
+fn test_apply_patch_finish_reason_closes_cleanly() {
+    let mut t = ResponseTranslator::new("resp_patch3", None);
+
+    // Stream apply_patch with finish_reason instead of [DONE]
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch3","function":{"name":"apply_patch","arguments":"{\"input\": \"*** Begin Patch\\n*** End Patch\"}"}}]}}]}"#,
+    );
+    let finish_events = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+    );
+
+    // finish_reason should trigger close_function_call
+    assert!(finish_events.iter().any(|e| e.contains("response.custom_tool_call_input.delta")));
+    assert!(finish_events.iter().any(|e| e.contains("response.custom_tool_call_input.done")));
+    assert!(finish_events.iter().any(|e| e.contains("response.output_item.done") && e.contains("custom_tool_call")));
+
+    // The done event should contain the extracted patch text
+    let done_evt = finish_events
+        .iter()
+        .find(|e| e.contains("response.custom_tool_call_input.done"))
+        .unwrap();
+    assert!(done_evt.contains("*** Begin Patch"));
+    assert!(done_evt.contains("*** End Patch"));
+}
+
+#[test]
+fn test_apply_patch_non_json_fallback() {
+    // If the model sends apply_patch arguments that are NOT valid JSON
+    // (e.g. raw patch text without JSON wrapper), the fallback in
+    // extract_custom_tool_input should use the raw string as input.
+    let mut t = ResponseTranslator::new("resp_patch4", None);
+
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch4","function":{"name":"apply_patch","arguments":"*** Begin Patch\\n*** End Patch"}}]}}]}"#,
+    );
+    let done = t.process_line("data: [DONE]");
+
+    let done_evt = done
+        .iter()
+        .find(|e| e.contains("response.custom_tool_call_input.done"))
+        .unwrap();
+    assert!(done_evt.contains("*** Begin Patch"));
+    assert!(done_evt.contains("*** End Patch"));
+}
+
+#[test]
+fn test_regular_function_call_still_streams_deltas() {
+    // Ensure the fix doesn't break regular function calls — they should still
+    // stream argument deltas as before.
+    let mut t = ResponseTranslator::new("resp_fn1", None);
+
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_fn1","function":{"name":"get_weather","arguments":""}}]}}]}"#,
+    );
+    let e2 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#,
+    );
+    assert!(e2.iter().any(|e| e.contains("response.function_call_arguments.delta")));
+}
+
 // ─── chat_completion_to_response (non-streaming) tests ──────────────────────
 
 #[test]

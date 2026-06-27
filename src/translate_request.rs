@@ -135,6 +135,30 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                     pending_tool_call_ids.push(call_id.to_string());
                 }
 
+                "custom_tool_call" => {
+                    // Codex sends apply_patch calls as custom_tool_call items
+                    // with an "input" field (raw patch text) instead of "arguments"
+                    // (JSON). The Chat Completions tool schema we advertise for
+                    // apply_patch declares a single `input` string parameter, so
+                    // the model expects arguments to be JSON: {"input": "..."}.
+                    //
+                    // If we pass the raw patch text as `arguments` directly, the
+                    // model sees a malformed (non-JSON) arguments string in its
+                    // conversation history on follow-up turns and returns an
+                    // empty response (0 output tokens). Wrap the input as JSON
+                    // so the assistant tool_calls entry matches the schema.
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = json!({"input": input}).to_string();
+                    pending_tool_calls.push(json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }));
+                    pending_tool_call_ids.push(call_id.to_string());
+                }
+
                 "function_call_output" | "custom_tool_call_output" => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                     let output = item.get("output").map(|v| {

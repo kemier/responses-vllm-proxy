@@ -2,7 +2,7 @@ use crate::logger;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6b87953f/oauth2/v2.0/token";
 const CLIENT_ID: &str = "b46aa582-485a-4a7d-b30e-552dbd790b16";
@@ -17,7 +17,11 @@ pub struct TokenData {
 
 pub struct TokenManager {
     auth_dir: PathBuf,
-    token: RwLock<Option<TokenData>>,
+    /// Held for the entire check-or-refresh path in `get_token()`, so that
+    /// only one task at a time can call the Microsoft token endpoint. This
+    /// deduplicates concurrent refreshes when many clients hit the proxy
+    /// simultaneously after the cached token expires.
+    token: Mutex<Option<TokenData>>,
     client: reqwest::Client,
 }
 
@@ -30,36 +34,52 @@ impl TokenManager {
             .and_then(|s| serde_json::from_str(&s).ok());
         Self {
             auth_dir: PathBuf::from(auth_dir),
-            token: RwLock::new(token),
+            token: Mutex::new(token),
             client: reqwest::Client::new(),
         }
     }
 
+    /// Forces an immediate token refresh regardless of expiry (call on upstream 401).
+    pub async fn force_refresh(&self) -> Result<String, String> {
+        let mut guard = self.token.lock().await;
+        self.refresh_locked(&mut guard).await?;
+        guard
+            .as_ref()
+            .map(|t| t.access_token.clone())
+            .ok_or_else(|| "No token available after force-refresh".to_string())
+    }
+
+    /// Returns a valid access token, refreshing it if necessary.
+    ///
+    /// The mutex is held across the whole check-or-refresh path so that
+    /// concurrent callers serialize on a single refresh: the first task to
+    /// discover an expired token performs the HTTP refresh while the rest
+    /// simply pick up the freshly-cached result.
     pub async fn get_token(&self) -> Result<String, String> {
-        {
-            let guard = self.token.read().await;
-            if let Some(t) = &*guard {
-                if !is_expired(&t.expires_at) {
-                    return Ok(t.access_token.clone());
-                }
+        let mut guard = self.token.lock().await;
+
+        // Fast path: cached token still valid.
+        if let Some(t) = guard.as_ref() {
+            if !is_expired(&t.expires_at) {
+                return Ok(t.access_token.clone());
             }
         }
-        self.refresh().await?;
-        let guard = self.token.read().await;
+
+        // Slow path: refresh under the lock so concurrent callers dedupe.
+        self.refresh_locked(&mut guard).await?;
+
         guard
             .as_ref()
             .map(|t| t.access_token.clone())
             .ok_or_else(|| "No token available".to_string())
     }
 
-    async fn refresh(&self) -> Result<(), String> {
-        let refresh_token = {
-            let guard = self.token.read().await;
-            guard
-                .as_ref()
-                .and_then(|t| t.refresh_token.clone())
-                .ok_or_else(|| "No refresh token".to_string())?
-        };
+    /// Performs the token refresh. The caller already holds the lock.
+    async fn refresh_locked(&self, guard: &mut Option<TokenData>) -> Result<(), String> {
+        let refresh_token = guard
+            .as_ref()
+            .and_then(|t| t.refresh_token.clone())
+            .ok_or_else(|| "No refresh token".to_string())?;
 
         logger::info("auth", "Refreshing EricAI access token...");
         let scope = format!("api://{}/API offline_access", CLIENT_ID);
@@ -116,7 +136,6 @@ impl TokenManager {
             }
         }
 
-        let mut guard = self.token.write().await;
         *guard = Some(new_token);
         logger::info("auth", &format!("EricAI token refreshed (expires_at={})", expires_at));
         Ok(())

@@ -56,5 +56,5 @@ See `config.yaml` — minimal config with only EricAI provider settings.
 - **Thinking injection**: DeepSeek (`thinking: true, reasoning_effort`), GLM (`enable_thinking`)
 - **Token management**: MSAL OAuth refresh, auto-refresh 5min before expiry
 - **Remote compaction**: Wraps chat completion as `response.compaction` object
-- **WebSocket support**: Full WS upgrade for Codex WebSocket transport
+- **WebSocket support**: Stateful Responses WS transport for Codex — `generate=false` prewarm handshake, connection reuse across turns, and `previous_response_id` incremental-input expansion (rebuilds full history for the stateless vLLM backend)
 - **Model aliasing**: Config aliases (e.g. `glm-5.2` → `zai-org/GLM-5.2-FP8`)

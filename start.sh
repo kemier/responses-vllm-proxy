@@ -47,7 +47,7 @@ fi
 if [ "$RESTART" = true ]; then
     echo "Restarting ericai-proxy..."
 
-    # Kill via PID file
+    # Kill via PID file first
     if [ -f "$PIDFILE" ]; then
         OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
         if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
@@ -68,13 +68,34 @@ if [ "$RESTART" = true ]; then
         rm -f "$PIDFILE"
     fi
 
-    # Also kill any stray processes on the port
-    STRAY_PID=$(lsof -ti :$PORT 2>/dev/null)
-    if [ -n "$STRAY_PID" ]; then
-        echo "Killing stray process on port $PORT (PID $STRAY_PID)..."
-        kill "$STRAY_PID" 2>/dev/null
+    # Kill ANY process still holding the port (stray orphans, multiple PIDs)
+    STRAY_PIDS=$(lsof -ti :$PORT 2>/dev/null | sort -u | tr '
+' ' ')
+    if [ -n "$STRAY_PIDS" ]; then
+        echo "Killing stray processes on port $PORT (PIDs: $STRAY_PIDS)..."
+        for pid in $STRAY_PIDS; do
+            kill "$pid" 2>/dev/null
+        done
+        sleep 2
+        # Force kill survivors
+        for pid in $STRAY_PIDS; do
+            kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+        done
         sleep 1
-        kill -9 "$STRAY_PID" 2>/dev/null
+    fi
+
+    # Wait for port to be fully released (max 10s)
+    for i in $(seq 1 20); do
+        lsof -ti :$PORT 2>/dev/null | head -1 | grep -q . || break
+        sleep 0.5
+    done
+
+    # Final check
+    if lsof -ti :$PORT 2>/dev/null | head -1 | grep -q .; then
+        echo "WARNING: Port $PORT still in use after kill attempts!"
+        echo "  Processes: $(lsof -ti :$PORT 2>/dev/null | tr '
+' ' ')"
+        echo "  Manual fix: fuser -k $PORT/tcp"
     fi
 
     echo "Stopped."
@@ -113,6 +134,7 @@ echo "Refreshing EricAI token..."
 (cd /workspace/git/ezennin/lab && OPENAI_API_KEY="" OPENAI_BASE_URL="" uv run python3 -c "
 import json, os, time
 from ericai.sso_auth import get_token
+from ericai.eri_mix import _get_rt
 token = get_token(failOnInteractiveLogin=True)
 path = os.path.expanduser('~/.cli-proxy-api/ericai-ericai-user.json')
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -122,12 +144,33 @@ try:
 except:
     data = {}
 data['access_token'] = token
-data['expires_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(time.time() + 3600))
-data['last_refresh'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+import base64, json as _json
+payload = token.split('.')[1]
+payload += '=' * (-len(payload) % 4)
+exp = _json.loads(base64.urlsafe_b64decode(payload)).get('exp', int(time.time()) + 3600)
+data['expires_at'] = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(exp))
+data['last_refresh'] = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime())
+# Extract refresh_token from MSAL cache for proxy auto-refresh
+rt = _get_rt()
+if rt and 'secret' in rt:
+    data['refresh_token'] = rt['secret']
 with open(path, 'w') as f:
     json.dump(data, f, indent=2)
-print(f'Token refreshed (len={len(token)})')
-" 2>/dev/null) && echo "Token synced" || echo "Warning: token refresh failed, may need --ericai-login"
+print(f'Token refreshed (len={len(token)}, rt={\"yes\" if rt else \"no\"})')
+" 2>&1) 
+TOKEN_RC=$?
+if [ $TOKEN_RC -eq 0 ]; then
+    echo "Token synced"
+else
+    echo ""
+    echo "❌ Token refresh failed — MSAL refresh token likely expired (7-day max)."
+    echo "   Re-authenticate with:"
+    echo ""
+    echo "     cd /workspace/git/ezennin/lab && uv run ericai login"
+    echo ""
+    echo "   Then re-run: ./start.sh"
+    exit 1
+fi
 
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"

@@ -100,7 +100,7 @@ else:
 # Fields codex auto-fills — we don't need to set these in our catalog
 AUTO_FILLED_FIELDS = {
     "additional_speed_tiers", "availability_nux", "default_verbosity",
-    "effective_context_window_percent", "service_tiers", "upgrade",
+    "service_tiers", "upgrade",
     "use_responses_lite",
 }
 
@@ -112,6 +112,64 @@ try:
 except Exception as e:
     print(f"Warning: could not fetch proxy models: {e}")
     proxy_ids = []
+
+# ── Base instructions: teach LLM to emit clickable link formats ─────────────
+BASE_INSTRUCTIONS = """When referencing code locations, use clickable links so the user can jump directly to source:
+
+1. Symbol name link (PREFERRED — uses LSP to find the exact definition):
+   [nats_msgbus_create](@symbol:nats_msgbus_create)
+   [ResponseTranslator](@symbol:ResponseTranslator)
+   [process_line](@symbol:process_line)
+   The link text should be the symbol/function name. For methods, use the bare method name only.
+   The LSP (clangd/rust-analyzer) will resolve the symbol to its exact file:line definition.
+   BENEFIT: The user can click the link to jump directly to the source definition. LSP resolves
+   the exact file and line, so you never need to guess line numbers. This works across all
+   languages (C, C++, Rust, Go, etc.) and even resolves header declarations to their .c/.cpp
+   implementation.
+
+2. File path with line number (fallback when LSP is not available or for non-symbol locations):
+   [main()](up/epg/cl/src/cl_main.c:519)
+   src/translate_response.rs:130
+   BENEFIT: The user can click to open the file at the exact line. The path is resolved relative
+   to the workspace root, and parent directories (../) are supported for sibling repos.
+   IMPORTANT: Always include the :line number. A bare file path without :line renders as a
+   non-clickable reference (the user can see it but cannot click to jump).
+
+Rules:
+- Use format 1 (@symbol link) ONLY for symbols WITHIN the current workspace repo. LSP (clangd/rust-analyzer) resolves the exact definition, so you never guess line numbers.
+- Use format 2 (path:line) for everything OUTSIDE the current workspace repo. Sibling repos (../ssr, ../other-repo) are NOT indexed by LSP, so @symbol: will fail. Always give the exact relative path with ../ and :line number so the user can click and jump directly.
+  Example: [fen_adapter_init](up/../ssr/pkt/sw/src/fen/fen_adapter.c:142)
+- Use format 2 (path:line) for non-symbol locations (headers, labels, sections, macros).
+- Use format 2 (path:line) for ambiguous or generic names (Library, Config, Manager) where LSP returns too many matches.
+- The link text MUST be the symbol name or file name, not "line 161" or a description.
+- NEVER use Type::method syntax in links. Use the bare method name: [process_line](@symbol:process_line)
+- ALWAYS include :line number in format 2. A path without :line is non-clickable (user can see it but cannot jump).
+- Do not wrap plain file paths in markdown links; the auto-linkifier handles them.
+- IMPORTANT: When listing API functions or symbols from a header file, ALWAYS use clickable links — NEVER write them as bare backtick code (e.g. NEVER write `icrlib_client_send_client_msg()`). Instead write [icrlib_client_send_client_msg()](up/../ssr/.../icrlib_api.h:142). Backtick code is NOT clickable; the user cannot jump to source from it.
+- For functions in sibling repos (../ssr), ALWAYS use format 2 with the exact path and :line:
+  Example: [icrlib_client_send_client_msg()](up/../ssr/pkt/sw/include/icrlib/icrlib_api.h:142)
+  Example: [fen_adapter_init()](up/../ssr/pkt/sw/src/fen/fen_adapter.c:142)
+  The path must start with the relative path from the workspace root (e.g. up/../ssr/...) and include :line.
+
+── Code fence discipline ────────────────────────────────────────────────────
+Code fences (```...```) are for code and diagrams ONLY.
+- NEVER put prose, explanations, or narrative text inside a code fence. If it is not executable code, a shell command, a data structure, or an ASCII/PlantUML diagram, it does not belong in a code fence.
+- When drawing ASCII art diagrams, close the fence immediately after the diagram ends. Do NOT continue writing explanations inside the same fence.
+- If you need to explain a diagram, close the code fence first, then write the explanation as normal markdown.
+
+── apply_patch tool usage ───────────────────────────────────────────────────
+When using the apply_patch tool to edit files:
+1. ALWAYS read the file first (using exec_command to cat or sed the file) so you know the exact current content.
+2. Your patch context lines MUST match the file exactly, including all indentation (spaces and tabs).
+3. Every line in the patch body starts with a single prefix character:
+   - A single space ' ' followed by the exact line content = unchanged context line (must match the file exactly)
+   - A minus '-' followed by the exact line content = line to remove (must match the file exactly)
+   - A plus '+' followed by the new line content = line to add
+4. Do NOT strip or modify indentation when writing context/removed lines — they must match the file byte-for-byte.
+5. Use at least 1-2 unchanged context lines before and after each change to anchor the patch.
+6. The patch text MUST start with '*** Begin Patch' and end with '*** End Patch'.
+7. ALWAYS use apply_patch for file edits. NEVER use sed, python, or other shell commands to modify files. If apply_patch fails, re-read the file to get exact context lines (including indentation) and try again.
+8. When apply_patch fails with "Failed to find context", the cause is ALWAYS that your context lines don't match the file byte-for-byte. Read the file with exec_command (cat or sed -n), copy the exact lines including leading whitespace, and retry."""
 
 # ── Step 3: Map proxy alias → ericai backend model ID ───────────────────────
 alias_map = {}
@@ -143,16 +201,25 @@ try:
             mid = m.get("id", "")
             if mid not in backend_ids:
                 continue
-            if m.get("deployment_status", {}).get("status") != "HEALTHY":
+            status = m.get("deployment_status", {}).get("status", "")
+            demand = m.get("rayllm_metadata", {}).get("demand_status", {})
+            running = m.get("deployment_status", {}).get("running_replicas", 0)
+            loaded = demand.get("loaded", False)
+            # Only include models that are actually loaded and have running replicas.
+            # Models that are UPSCALING/DOWNSCALING with 0 replicas will hang on request.
+            if status != "HEALTHY" or not loaded or running < 1:
                 continue
             engine = m.get("rayllm_metadata", {}).get("engine_config", {})
+            # Architecture can be at engine_config level OR top-level model
+            arch = engine.get("architecture") or m.get("architecture") or {}
             ericai_meta[mid] = {
                 "max_total_tokens": engine.get("max_total_tokens", 200000),
                 "lifecycle": engine.get("lifecycle", ""),
                 "gpu_type": m.get("rayllm_metadata", {}).get("gpu_type", ""),
                 "num_gpus": m.get("rayllm_metadata", {}).get("num_gpus", 0),
                 "engine_type": engine.get("type", ""),
-                "input_modalities": (engine.get("architecture") or {}).get("input_modalities", ["text"]),
+                "input_modalities": arch.get("input_modalities", ["text"]),
+                "status": status,
             }
         except json.JSONDecodeError:
             pass
@@ -175,6 +242,20 @@ reasoning_profiles = {
         "levels": [
             {"effort": "low", "description": "Disable deep thinking (enable_thinking: false)"},
             {"effort": "high", "description": "Deep thinking enabled (default)"},
+        ],
+        "default": "high",
+    },
+    "kimi": {
+        "levels": [
+            {"effort": "low", "description": "Disable thinking (thinking: false)"},
+            {"effort": "high", "description": "Enable thinking (default)"},
+        ],
+        "default": "high",
+    },
+    "mimo": {
+        "levels": [
+            {"effort": "low", "description": "Disable thinking (enable_thinking: false)"},
+            {"effort": "high", "description": "Enable thinking (default)"},
         ],
         "default": "high",
     },
@@ -215,7 +296,7 @@ for i, slug in enumerate(proxy_ids):
     backend_id = alias_map.get(slug, slug)
 
     if slug in alias_map and backend_id not in ericai_meta:
-        print(f"  Skipping {slug} (backend {backend_id} not HEALTHY)")
+        print(f"  Skipping {slug} (backend {backend_id} not loaded/healthy)")
         continue
 
     meta = ericai_meta.get(backend_id, {})
@@ -232,16 +313,19 @@ for i, slug in enumerate(proxy_ids):
         "visibility": "list",
         "supported_in_api": True,
         "priority": i,
-        "base_instructions": "",
+        "base_instructions": BASE_INSTRUCTIONS,
         "supports_reasoning_summaries": bool(levels),
         "support_verbosity": False,
         "default_reasoning_summary": "auto",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
         "supports_parallel_tool_calls": True,
         "supports_image_detail_original": False,
-        "input_modalities": meta.get("input_modalities", ["text"]),
-        "context_window": context_window,
-        "experimental_supported_tools": [],
+       "input_modalities": meta.get("input_modalities", ["text"]),
+       "context_window": context_window,
+        # Use the full context window (no 5% headroom reserved by default).
+        # Codex default auto-compaction (90% of context_window) is sufficient.
+        "effective_context_window_percent": 100,
+       "experimental_supported_tools": [],
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
         "supports_search_tool": False,
@@ -281,9 +365,10 @@ except Exception:
 print(f"\nModel catalog updated: {len(models)} models → {CATALOG}")
 for m in models:
     cw = m["context_window"]
+    acl = cw * 9 // 10  # Codex default: 90% of context_window
     efforts = [e["effort"] for e in m.get("supported_reasoning_levels", [])]
     effort_str = f"efforts={','.join(efforts)}" if efforts else "no-effort"
-    print(f"  {m['slug']:25s} context_window={cw:>7d} {effort_str}")
+    print(f"  {m['slug']:25s} context_window={cw:>7d} compact_at={acl:>7d} {effort_str}")
 
 # ── Step 7: Validate — run `codex debug models` and verify ──────────────────
 try:

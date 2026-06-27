@@ -1,6 +1,30 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+/// Check if a tool name corresponds to a freeform/custom tool (apply_patch).
+/// These tools must be emitted as `custom_tool_call` items in the Responses API,
+/// not as `function_call` items, because Codex dispatches them via the
+/// `ApplyPatchHandler` which only accepts `ToolPayload::Custom`.
+fn is_custom_tool(name: &str) -> bool {
+    name == "apply_patch"
+}
+
+/// Extract the `input` field from a JSON arguments string.
+///
+/// The model sends apply_patch arguments as JSON: {"input": "*** Begin Patch\n..."}
+/// The Responses API `custom_tool_call` item expects a plain `input` string,
+/// not a JSON `arguments` string.
+fn extract_custom_tool_input(arguments: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(arguments) {
+        if let Some(input) = v.get("input").and_then(|v| v.as_str()) {
+            return input.to_string();
+        }
+    }
+    // Fallback: if arguments is not valid JSON or does not have "input",
+    // use the raw arguments string as the tool input.
+    arguments.to_string()
+}
+
 /// State machine for translating Chat Completions SSE -> Responses API SSE.
 /// Ported from Go's oaiToResponsesState.
 pub struct ResponseTranslator {
@@ -468,19 +492,36 @@ impl ResponseTranslator {
                 self.func_item_added.insert(key.clone(), true);
 
                 let name = self.func_names.get(&key).cloned().unwrap_or_default();
-                let item = json!({
-                    "type": "response.output_item.added",
-                    "sequence_number": self.next_seq(),
-                    "output_index": oix,
-                    "item": {
-                        "id": format!("fc_{}", new_call_id),
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "arguments": "",
-                        "call_id": new_call_id,
-                        "name": name,
-                    }
-                });
+                let is_custom = is_custom_tool(&name);
+                let item = if is_custom {
+                    json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": self.next_seq(),
+                        "output_index": oix,
+                        "item": {
+                            "id": format!("fc_{}", new_call_id),
+                            "type": "custom_tool_call",
+                            "status": "in_progress",
+                            "input": "",
+                            "call_id": new_call_id,
+                            "name": name,
+                        }
+                    })
+                } else {
+                    json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": self.next_seq(),
+                        "output_index": oix,
+                        "item": {
+                            "id": format!("fc_{}", new_call_id),
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "arguments": "",
+                            "call_id": new_call_id,
+                            "name": name,
+                        }
+                    })
+                };
                 out.push(self.emit("response.output_item.added", &item));
             }
 
@@ -489,17 +530,40 @@ impl ResponseTranslator {
                     let call_id = self.func_call_ids.get(&key).cloned().unwrap_or(new_call_id.clone());
                     if !call_id.is_empty() {
                         let oix = self.func_output_ix.get(&key).copied().unwrap_or(0);
+                        let name = self.func_names.get(&key).cloned().unwrap_or_default();
+                        let is_custom = is_custom_tool(&name);
 
-                        let delta = json!({
-                            "type": "response.function_call_arguments.delta",
-                            "sequence_number": self.next_seq(),
-                            "item_id": format!("fc_{}", call_id),
-                            "output_index": oix,
-                            "delta": args,
-                        });
-                        out.push(self.emit("response.function_call_arguments.delta", &delta));
-
+                        // Always buffer the raw argument fragments so the full
+                        // arguments string is available at close time.
                         self.func_args_buf.entry(key.clone()).or_default().push_str(args);
+
+                        if !is_custom {
+                            // Regular function calls: stream the raw argument
+                            // fragments as deltas. Codex's function_call handler
+                            // accumulates these into a JSON arguments string.
+                            let event_name = "response.function_call_arguments.delta";
+                            let delta = json!({
+                                "type": event_name,
+                                "sequence_number": self.next_seq(),
+                                "item_id": format!("fc_{}", call_id),
+                                "output_index": oix,
+                                "delta": args,
+                            });
+                            out.push(self.emit(event_name, &delta));
+                        }
+                        // For custom tools (apply_patch): do NOT emit streaming
+                        // deltas here. The model sends arguments as JSON fragments
+                        // like `{"input": "*** Begin Patch\n..."}` split across
+                        // many chunks. Emitting those raw JSON fragments as
+                        // `custom_tool_call_input.delta` events feeds garbage
+                        // into Codex's StreamingPatchParser, which expects patch
+                        // text (starting with `*** Begin Patch`), not JSON. This
+                        // corrupts the parser's state and causes the patch to be
+                        // rejected as malformed.
+                        //
+                        // Instead, we buffer the fragments and emit the extracted
+                        // patch text as a single clean delta in
+                        // `close_function_call`, followed by the `.done` event.
                     }
                 }
             }
@@ -599,30 +663,77 @@ impl ResponseTranslator {
         let oix = self.func_output_ix.get(key).copied().unwrap_or(0);
         let args = self.func_args_buf.get(key).cloned().unwrap_or_default();
         let name = self.func_names.get(key).cloned().unwrap_or_default();
+        let is_custom = is_custom_tool(&name);
 
-        let done = json!({
-            "type": "response.function_call_arguments.done",
-            "sequence_number": self.next_seq(),
-            "item_id": format!("fc_{}", call_id),
-            "output_index": oix,
-            "arguments": args,
-        });
-        out.push(self.emit("response.function_call_arguments.done", &done));
+        if is_custom {
+            // apply_patch uses custom_tool_call format: input field, not arguments
+            let input = extract_custom_tool_input(&args);
 
-        let item_done = json!({
-            "type": "response.output_item.done",
-            "sequence_number": self.next_seq(),
-            "output_index": oix,
-            "item": {
-                "id": format!("fc_{}", call_id),
-                "type": "function_call",
-                "status": "completed",
-                "arguments": args,
+            // Emit the complete extracted input as a single delta so Codex's
+            // streaming patch parser (StreamingPatchParser) receives the full
+            // patch text in one clean chunk. We suppressed streaming deltas in
+            // `handle_tool_calls` (they would have been raw JSON fragments like
+            // `{"in` / `put": "*** ` / `Begin Patch...` which the parser cannot
+            // understand — it expects patch text starting with `*** Begin Patch`).
+            // This single delta provides the complete, clean patch text.
+            let final_delta = json!({
+                "type": "response.custom_tool_call_input.delta",
+                "sequence_number": self.next_seq(),
+                "item_id": format!("fc_{}", call_id),
                 "call_id": call_id,
-                "name": name,
-            }
-        });
-        out.push(self.emit("response.output_item.done", &item_done));
+                "output_index": oix,
+                "delta": input,
+            });
+            out.push(self.emit("response.custom_tool_call_input.delta", &final_delta));
+
+            let done = json!({
+                "type": "response.custom_tool_call_input.done",
+                "sequence_number": self.next_seq(),
+                "item_id": format!("fc_{}", call_id),
+                "output_index": oix,
+                "input": input,
+            });
+            out.push(self.emit("response.custom_tool_call_input.done", &done));
+
+            let item_done = json!({
+                "type": "response.output_item.done",
+                "sequence_number": self.next_seq(),
+                "output_index": oix,
+                "item": {
+                    "id": format!("fc_{}", call_id),
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "input": input,
+                    "call_id": call_id,
+                    "name": name,
+                }
+            });
+            out.push(self.emit("response.output_item.done", &item_done));
+        } else {
+            let done = json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": self.next_seq(),
+                "item_id": format!("fc_{}", call_id),
+                "output_index": oix,
+                "arguments": args,
+            });
+            out.push(self.emit("response.function_call_arguments.done", &done));
+
+            let item_done = json!({
+                "type": "response.output_item.done",
+                "sequence_number": self.next_seq(),
+                "output_index": oix,
+                "item": {
+                    "id": format!("fc_{}", call_id),
+                    "type": "function_call",
+                    "status": "completed",
+                    "arguments": args,
+                    "call_id": call_id,
+                    "name": name,
+                }
+            });
+            out.push(self.emit("response.output_item.done", &item_done));
+        }
 
         self.func_item_done.insert(key.to_string(), true);
         out
@@ -702,14 +813,27 @@ impl ResponseTranslator {
         for (key, call_id) in &self.func_call_ids {
             let args = self.func_args_buf.get(key).cloned().unwrap_or_default();
             let name = self.func_names.get(key).cloned().unwrap_or_default();
-            let item = json!({
-                "id": format!("fc_{}", call_id),
-                "type": "function_call",
-                "status": "completed",
-                "arguments": args,
-                "call_id": call_id,
-                "name": name,
-            });
+            let is_custom = is_custom_tool(&name);
+            let item = if is_custom {
+                let input = extract_custom_tool_input(&args);
+                json!({
+                    "id": format!("fc_{}", call_id),
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "input": input,
+                    "call_id": call_id,
+                    "name": name,
+                })
+            } else {
+                json!({
+                    "id": format!("fc_{}", call_id),
+                    "type": "function_call",
+                    "status": "completed",
+                    "arguments": args,
+                    "call_id": call_id,
+                    "name": name,
+                })
+            };
             output.push(item);
         }
 
@@ -850,14 +974,27 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
                         let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let item = json!({
-                            "id": format!("fc_{}", call_id),
-                            "type": "function_call",
-                            "status": "completed",
-                            "arguments": args,
-                            "call_id": call_id,
-                            "name": name,
-                        });
+                        let is_custom = is_custom_tool(&name);
+                        let item = if is_custom {
+                            let input = extract_custom_tool_input(&args);
+                            json!({
+                                "id": format!("fc_{}", call_id),
+                                "type": "custom_tool_call",
+                                "status": "completed",
+                                "input": input,
+                                "call_id": call_id,
+                                "name": name,
+                            })
+                        } else {
+                            json!({
+                                "id": format!("fc_{}", call_id),
+                                "type": "function_call",
+                                "status": "completed",
+                                "arguments": args,
+                                "call_id": call_id,
+                                "name": name,
+                            })
+                        };
                         output.push(item);
                     }
                 }

@@ -1,0 +1,1 @@
+check known-issue.md and troubleshooting-guide.md in ~ if you want to investigate something and also ./start.sh and config in ~/.codex is good start point, and log is in ./logs folder, and ../codex repo is source code for codex, and this repo is proxy for codex cli tool

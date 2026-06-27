@@ -1,6 +1,6 @@
 use ericai_proxy::translate_request::responses_to_chat_completions;
 use ericai_proxy::translate_request::inject_thinking;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[test]
 fn test_simple_text_input() {
@@ -222,7 +222,59 @@ fn test_tool_choice_passed() {
     assert_eq!(out["tool_choice"], "auto");
 }
 
-// ─── inject_thinking tests ──────────────────────────────────────────────────
+// ─── apply_patch round-trip tests ───────────────────────────────────────────
+
+#[test]
+fn test_custom_tool_call_input_wrapped_as_json_arguments() {
+    // When codex replays a prior apply_patch custom_tool_call in conversation
+    // history, the proxy must wrap the raw patch text as JSON {"input": "..."}
+    // in the assistant tool_calls.arguments field. Passing raw patch text as
+    // arguments causes GLM-5.2 to return an empty response on follow-up turns.
+    let patch = "*** Begin Patch\n*** Add File: /tmp/test.txt\n+hello\n*** End Patch";
+    let req = json!({
+        "model": "glm-5.2",
+        "input": [
+            {"type": "message", "role": "user", "content": "create a file"},
+            {"type": "custom_tool_call", "call_id": "call_abc", "name": "apply_patch", "input": patch},
+            {"type": "custom_tool_call_output", "call_id": "call_abc", "output": "patch applied"}
+        ]
+    });
+    let out = responses_to_chat_completions("zai-org/GLM-5.2-FP8", &req, true);
+    let messages = out["messages"].as_array().unwrap();
+    // user + assistant(tool_calls) + tool
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "assistant");
+    let tool_calls = messages[1]["tool_calls"].as_array().unwrap();
+    assert_eq!(tool_calls[0]["function"]["name"], "apply_patch");
+    assert_eq!(tool_calls[0]["id"], "call_abc");
+    // arguments MUST be valid JSON with an "input" field containing the patch
+    let args_str = tool_calls[0]["function"]["arguments"].as_str().unwrap();
+    let args: Value = serde_json::from_str(args_str).expect("arguments must be valid JSON");
+    assert_eq!(args["input"], patch);
+    // The tool result is emitted as a role=tool message
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_abc");
+    assert_eq!(messages[2]["content"], "patch applied");
+}
+
+#[test]
+fn test_custom_tool_call_empty_input_still_valid_json() {
+    // Edge case: empty input should still produce valid JSON {"input": ""}
+    let req = json!({
+        "model": "glm-5.2",
+        "input": [
+            {"type": "custom_tool_call", "call_id": "call_x", "name": "apply_patch", "input": ""},
+            {"type": "custom_tool_call_output", "call_id": "call_x", "output": ""}
+        ]
+    });
+    let out = responses_to_chat_completions("glm", &req, true);
+    let messages = out["messages"].as_array().unwrap();
+    let args_str = messages[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+    let args: Value = serde_json::from_str(args_str).expect("arguments must be valid JSON");
+    assert_eq!(args["input"], "");
+}
+
+
 
 #[test]
 fn test_inject_thinking_deepseek() {
