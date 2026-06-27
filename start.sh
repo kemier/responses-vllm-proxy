@@ -172,6 +172,25 @@ else
     exit 1
 fi
 
+# ─── Warn if stale trace logs in RAM (/dev/shm) are too large ───────────────
+SHM_DIR="/dev/shm/.session-cache"
+if [ -d "$SHM_DIR" ]; then
+    SHM_SIZE=$(du -sk "$SHM_DIR" 2>/dev/null | cut -f1)
+    # 200 MB threshold (204800 KB)
+    if [ -n "$SHM_SIZE" ] && [ "$SHM_SIZE" -gt 204800 ]; then
+        SHM_MB=$((SHM_SIZE / 1024))
+        echo ""
+        echo "⚠️  WARNING: Stale trace logs in RAM (${SHM_DIR}) are using ${SHM_MB} MB"
+        echo "   This grows when codex sessions accumulate without cleanup."
+        echo "   Files:"
+        ls -lh "$SHM_DIR" 2>/dev/null | awk 'NR>1 {printf "     %s  %s\n", $5, $9}'
+        echo ""
+        echo "   To free RAM, kill stale codex processes and clean up:"
+        echo "     pkill -x codex 2>/dev/null; rm -f ${SHM_DIR}/logs_2.sqlite* ${SHM_DIR}/codex-tui.log"
+        echo ""
+    fi
+fi
+
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"
 "$DIR/target/release/ericai-proxy" &

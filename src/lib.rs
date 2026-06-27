@@ -5,4 +5,5 @@ pub mod translate_response;
 pub mod logger;
 
 #[path = "main.rs"]
+#[allow(dead_code)]
 pub mod main;

@@ -123,22 +123,29 @@ pub struct ResponseTranslator {
     // `event: ...\ndata: ...` envelopes (for HTTP SSE).
     raw_json: bool,
 
-    // Original request for completed event
-    request_json: Option<Value>,
+   // Original request for completed event
+    request_json: Option<std::sync::Arc<Value>>,
 }
 
 impl ResponseTranslator {
-    pub fn new(response_id: &str, request_json: Option<Value>) -> Self {
-        Self::new_impl(response_id, request_json, false)
+   pub fn new(response_id: &str, request_json: Option<Value>) -> Self {
+        Self::new_impl(response_id, request_json.map(std::sync::Arc::new), false)
+   }
+
+   /// Create a translator that emits raw JSON strings (no SSE envelope),
+   /// suitable for WebSocket transport where each frame is a single JSON object.
+   pub fn new_raw_json(response_id: &str, request_json: Option<Value>) -> Self {
+        Self::new_impl(response_id, request_json.map(std::sync::Arc::new), true)
     }
 
-    /// Create a translator that emits raw JSON strings (no SSE envelope),
-    /// suitable for WebSocket transport where each frame is a single JSON object.
-    pub fn new_raw_json(response_id: &str, request_json: Option<Value>) -> Self {
+    /// Create a translator that emits raw JSON strings, accepting an Arc<Value>
+    /// to avoid cloning the full request JSON (which can be large with many
+    /// input items on long sessions).
+    pub fn new_raw_json_arc(response_id: &str, request_json: Option<std::sync::Arc<Value>>) -> Self {
         Self::new_impl(response_id, request_json, true)
-    }
+   }
 
-    fn new_impl(response_id: &str, request_json: Option<Value>, raw_json: bool) -> Self {
+    fn new_impl(response_id: &str, request_json: Option<std::sync::Arc<Value>>, raw_json: bool) -> Self {
         Self {
             response_id: response_id.to_string(),
             created: chrono::Utc::now().timestamp(),
@@ -523,19 +530,20 @@ impl ResponseTranslator {
                 }
             });
             out.push(self.emit("response.reasoning_summary_part.added", part));
-        }
+       }
 
-        let rid = self.reasoning_id.as_ref().unwrap().clone();
-        let rix = self.reasoning_index.unwrap();
+       let rix = self.reasoning_index.unwrap();
+        let seq = self.next_seq();
+        let rid = self.reasoning_id.as_ref().unwrap();
 
-        let delta = json!({
-            "type": "response.reasoning_summary_text.delta",
-            "sequence_number": self.next_seq(),
-            "item_id": rid,
-            "output_index": rix,
-            "summary_index": 0,
-            "delta": rc,
-        });
+      let delta = json!({
+           "type": "response.reasoning_summary_text.delta",
+            "sequence_number": seq,
+           "item_id": rid,
+           "output_index": rix,
+           "summary_index": 0,
+           "delta": rc,
+       });
         out.push(self.emit("response.reasoning_summary_text.delta", delta));
 
         self.reasoning_buf.push_str(rc);
@@ -551,30 +559,30 @@ impl ResponseTranslator {
            // Take ownership of the buffer instead of cloning it 3×.
            // After this point reasoning_buf is empty, so the explicit
            // .clear() below is no longer needed.
-           let full_reasoning = std::mem::take(&mut self.reasoning_buf);
+          let full_reasoning = std::mem::take(&mut self.reasoning_buf);
 
-           let done = json!({
-               "type": "response.reasoning_summary_text.done",
-               "sequence_number": self.next_seq(),
-               "item_id": rid,
-               "output_index": rix,
-               "summary_index": 0,
-               "text": full_reasoning.clone(),
-           });
-           out.push(self.emit("response.reasoning_summary_text.done", done));
+          let done = json!({
+              "type": "response.reasoning_summary_text.done",
+              "sequence_number": self.next_seq(),
+              "item_id": rid,
+              "output_index": rix,
+              "summary_index": 0,
+               "text": &full_reasoning,
+          });
+          out.push(self.emit("response.reasoning_summary_text.done", done));
 
-           let part_done = json!({
-               "type": "response.reasoning_summary_part.done",
-               "sequence_number": self.next_seq(),
-               "item_id": rid,
-               "output_index": rix,
-               "summary_index": 0,
-               "part": {
-                   "type": "summary_text",
-                   "text": full_reasoning.clone(),
-               }
-           });
-           out.push(self.emit("response.reasoning_summary_part.done", part_done));
+          let part_done = json!({
+              "type": "response.reasoning_summary_part.done",
+              "sequence_number": self.next_seq(),
+              "item_id": rid,
+              "output_index": rix,
+              "summary_index": 0,
+              "part": {
+                  "type": "summary_text",
+                   "text": &full_reasoning,
+              }
+          });
+          out.push(self.emit("response.reasoning_summary_part.done", part_done));
 
            let item_done = json!({
                "type": "response.output_item.done",

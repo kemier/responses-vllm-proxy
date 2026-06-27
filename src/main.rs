@@ -31,6 +31,11 @@ pub struct AppState {
     pub model_catalog: ModelCatalog,
 }
 
+/// Pre-allocated SSE keepalive comment bytes — avoids allocating a new
+/// String on every 15-second keepalive tick.
+static KEEPALIVE_BYTES: axum::body::Bytes =
+    axum::body::Bytes::from_static(b": keepalive\n\n");
+
 /// Look up a model's context_window from the cached catalog.
 /// Falls back to 196608 (192K) if the catalog isn't loaded or the model
 /// isn't found.
@@ -395,14 +400,14 @@ pub async fn handle_responses(
                             None => break, // upstream finished
                         }
                     }
-                    // SSE keepalive: send comment to keep connection alive
-                    _ = sse_keepalive.tick() => {
-                        // SSE comments start with ':' and are ignored by clients
-                        // but keep the TCP connection alive
-                        if tx.send(Ok(axum::body::Bytes::from(": keepalive\n\n".to_string()))).await.is_err() {
-                            return;
-                        }
-                    }
+                   // SSE keepalive: send comment to keep connection alive
+                   _ = sse_keepalive.tick() => {
+                       // SSE comments start with ':' and are ignored by clients
+                       // but keep the TCP connection alive
+                        if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
+                           return;
+                       }
+                   }
                     // Client disconnect detected via cancellation
                     _ = upstream_cancel.cancelled() => {
                         logger::info("responses", "Client disconnected, aborting upstream stream");
@@ -804,13 +809,13 @@ pub async fn handle_responses_ws(
                 continue 'connection; // keep connection alive for retry
             }
 
-            // Use the response_id we already generated and cached
-           // Pass Arc<Value> clone to translator — cheaper than cloning the
-           // full request JSON (which can be large with many input items).
-           let mut translator = translate_response::ResponseTranslator::new_raw_json(
-               &response_id_for_cache,
-               Some((*effective_request_arc).clone()),
-           );
+           // Use the response_id we already generated and cached
+          // Pass Arc<Value> clone to translator — cheaper than cloning the
+          // full request JSON (which can be large with many input items).
+           let mut translator = translate_response::ResponseTranslator::new_raw_json_arc(
+              &response_id_for_cache,
+               Some(std::sync::Arc::clone(&effective_request_arc)),
+          );
 
             let byte_stream = resp.bytes_stream();
             let mut stream = byte_stream;
