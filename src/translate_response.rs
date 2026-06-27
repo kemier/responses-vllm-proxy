@@ -920,17 +920,20 @@ impl ResponseTranslator {
         // think tag that was never closed, treat the remaining content as
         // reasoning.
         if !self.think_pending.is_empty() {
+            // Use mem::take to avoid cloning the buffer — we clear it
+            // immediately after, so taking ownership is safe and free.
+            let pending = std::mem::take(&mut self.think_pending);
             if self.in_think_tag {
-                if self.reasoning_id.is_some() || !self.think_pending.is_empty() {
-                    out.extend(self.handle_reasoning_content(0, &self.think_pending.clone()));
-                }
+                // Unclosed think tag: treat remaining content as reasoning.
+                out.extend(self.handle_reasoning_content(0, &pending));
             } else {
+                // Not in a think tag: this is text that was held back
+                // because it might have been a partial tag prefix.
                 if self.reasoning_id.is_some() {
                     out.extend(self.stop_reasoning());
                 }
-                out.extend(self.emit_text_delta(0, &self.think_pending.clone()));
+                out.extend(self.emit_text_delta(0, &pending));
             }
-            self.think_pending.clear();
         }
 
         if self.reasoning_id.is_some() {
