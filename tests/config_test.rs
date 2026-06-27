@@ -68,7 +68,7 @@ openai-compatibility:
     let path = "/tmp/test_ericai_config3.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
-    assert_eq!(cfg.logging_to_file, true);
+    assert!(cfg.logging_to_file);
     assert_eq!(cfg.logs_max_total_size_mb, 10);
     assert_eq!(cfg.log_level, "info");
     assert_eq!(cfg.log_dir, "logs");
@@ -96,7 +96,7 @@ openai-compatibility:
 
 #[test]
 fn test_tilde_expansion() {
-    let yaml = format!(r#"
+    let yaml = r#"
 port: 8317
 auth-dir: "~/.cli-proxy-api"
 log_dir: "logs"
@@ -107,9 +107,9 @@ openai-compatibility:
     models:
       - name: m1
         alias: a1
-"#);
+"#;
     let path = "/tmp/test_ericai_config5.yaml";
-    std::fs::write(path, &yaml).unwrap();
+    std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     let home = std::env::var("HOME").unwrap_or("/home/user".to_string());
     assert_eq!(cfg.auth_dir, format!("{}/.cli-proxy-api", home));
@@ -149,7 +149,7 @@ openai-compatibility:
     let path = "/tmp/test_ericai_config7.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
-    assert_eq!(cfg.logging_to_file, false);
+    assert!(!cfg.logging_to_file);
     assert_eq!(cfg.logs_max_total_size_mb, 50);
     assert_eq!(cfg.log_level, "debug");
     assert_eq!(cfg.log_dir, "/tmp/test-logs");

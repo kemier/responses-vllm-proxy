@@ -80,7 +80,7 @@ async fn run_compact_test(
             response.push('\n');
         }
         response.push_str("data: [DONE]\n");
-        let _ = socket.write_all(response.as_bytes()).await.unwrap();
+        socket.write_all(response.as_bytes()).await.unwrap();
     });
 
     let tmp_dir = unique_tmp_dir("ericai-compact-test");

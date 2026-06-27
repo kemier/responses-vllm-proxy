@@ -298,7 +298,7 @@ fn enqueue(level: LogLevel, module: &str, message: &str) {
             io::stderr(),
             "[{}] [--------] [{}] [{}] {}",
             timestamp,
-            format!("{:<5}", level.as_str()),
+            format_args!("{:<5}", level.as_str()),
             module,
             message
         );

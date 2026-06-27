@@ -1,7 +1,12 @@
+#[allow(clippy::duplicate_mod)]
 pub mod config;
+#[allow(clippy::duplicate_mod)]
 pub mod auth;
+#[allow(clippy::duplicate_mod)]
 pub mod translate_request;
+#[allow(clippy::duplicate_mod)]
 pub mod translate_response;
+#[allow(clippy::duplicate_mod)]
 pub mod logger;
 
 use axum::{
@@ -140,11 +145,9 @@ async fn main() {
         socket.set_reuse_address(true).expect("set_reuse_address failed");
         socket.set_nonblocking(true).expect("set_nonblocking failed");
         socket.bind(&socket2::SockAddr::from(
-            std::net::SocketAddr::from(
-                format!("{}:{}", cfg.host, cfg.port).parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-                    std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port))
-                })
-            )
+            format!("{}:{}", cfg.host, cfg.port).parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
+                std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port))
+            })
         )).expect("Failed to bind");
         socket.listen(1024).expect("Failed to listen");
         tokio::net::TcpListener::from_std(socket.into()).expect("Failed to convert to TcpListener")

@@ -117,7 +117,7 @@ impl Config {
 // Minimal shellexpand
 mod shellexpand {
     pub fn tilde(s: &str) -> String {
-        if let Some(home) = std::env::var("HOME").ok() {
+        if let Ok(home) = std::env::var("HOME") {
             if s == "~" {
                 return home;
             }

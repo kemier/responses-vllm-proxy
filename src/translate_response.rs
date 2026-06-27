@@ -1019,7 +1019,7 @@ impl ResponseTranslator {
             output.push(item);
         }
 
-        for (_, fs) in &self.func_states {
+        for fs in self.func_states.values() {
             let is_custom = is_custom_tool(&fs.name);
             let item = if is_custom {
                 let input = extract_custom_tool_input(&fs.args_buf);
@@ -1121,7 +1121,7 @@ impl ResponseTranslator {
         }
 
         // Function call items
-        for (_, fs) in &self.func_states {
+        for fs in self.func_states.values() {
             let is_custom = is_custom_tool(&fs.name);
             let item = if is_custom {
                 let input = extract_custom_tool_input(&fs.args_buf);
@@ -1173,10 +1173,10 @@ impl ResponseTranslator {
 /// Used for compact and non-streaming /v1/responses.
 pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) -> Value {
     let id = raw.get("id").and_then(|v| v.as_str()).unwrap_or("resp_unknown").to_string();
-    let response_id = if id.starts_with("chatcmpl_") {
-        format!("resp_{}", &id[9..])
-    } else if id.starts_with("resp_") {
-        id.clone()
+    let response_id = if let Some(rest) = id.strip_prefix("chatcmpl_") {
+        format!("resp_{}", rest)
+    } else if let Some(rest) = id.strip_prefix("resp_") {
+        rest.to_string()
     } else {
         format!("resp_{}", id)
     };
@@ -1228,8 +1228,8 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
         || request_json.and_then(|r| r.get("reasoning")).is_some();
 
     if include_reasoning {
-        let rid = if response_id.starts_with("resp_") {
-            response_id[5..].to_string()
+        let rid = if let Some(rest) = response_id.strip_prefix("resp_") {
+            rest.to_string()
         } else {
             response_id.clone()
         };
