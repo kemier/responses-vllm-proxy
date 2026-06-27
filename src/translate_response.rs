@@ -322,16 +322,26 @@ impl ResponseTranslator {
                 // Looking for opening tag "<think>"
                 if let Some(start) = self.think_pending.find("<think>") {
                     // Emit any text before the tag as a text delta.
-                    let before = self.think_pending[..start].to_string();
-                    if !before.is_empty() {
-                        if self.reasoning_id.is_some() {
-                            out.extend(self.stop_reasoning());
+                    // Use mem::take to swap out the buffer, then split it.
+                    // This avoids allocating a new String for `before` —
+                    // we drain from the taken buffer instead.
+                    if start > 0 {
+                        let mut taken = std::mem::take(&mut self.think_pending);
+                        let before: String = taken.drain(..start).collect();
+                        // Put the remainder (after the tag) back.
+                        taken.drain(..7); // skip the tag itself
+                        self.think_pending = taken;
+                        if !before.is_empty() {
+                            if self.reasoning_id.is_some() {
+                                out.extend(self.stop_reasoning());
+                            }
+                            out.extend(self.emit_text_delta(idx, &before));
                         }
-                        out.extend(self.emit_text_delta(idx, &before));
+                    } else {
+                        // start == 0: just remove the tag
+                        self.think_pending.drain(..7);
                     }
                     self.in_think_tag = true;
-                    // Remove the processed portion (including the tag) from the buffer.
-                    self.think_pending = self.think_pending[start + 7..].to_string();
                     // Continue the loop to process the remainder (which may
                     // contain "</think>" or more text).
                     continue;
@@ -343,30 +353,37 @@ impl ResponseTranslator {
                     let suffix_len = longest_suffix_prefix(&self.think_pending, "<think>");
                     let emit_len = self.think_pending.len() - suffix_len;
                     if emit_len > 0 {
-                        let to_emit = self.think_pending[..emit_len].to_string();
+                        // Use mem::take + drain to avoid allocating a new String.
+                        // When suffix_len == 0 (99%+ of deltas), we take the
+                        // entire buffer, drain all of it into `to_emit`, and
+                        // put back an empty String — no heap allocation.
+                        let mut taken = std::mem::take(&mut self.think_pending);
+                        let to_emit: String = taken.drain(..emit_len).collect();
+                        self.think_pending = taken; // holds the suffix (if any)
                         if self.reasoning_id.is_some() {
                             out.extend(self.stop_reasoning());
                         }
                         out.extend(self.emit_text_delta(idx, &to_emit));
                     }
-                    self.think_pending = self.think_pending[emit_len..].to_string();
                     return out;
                 }
             }
 
             // in_think_tag is true: looking for closing tag "</think>"
             if let Some(end) = self.think_pending.find("</think>") {
-                let think_content = self.think_pending[..end].to_string();
+                // Use mem::take + drain to avoid allocating a new String.
+                let mut taken = std::mem::take(&mut self.think_pending);
+                let think_content: String = taken.drain(..end).collect();
+                taken.drain(..8); // skip the closing tag
+                self.think_pending = taken;
                 if !think_content.is_empty() {
                     out.extend(self.handle_reasoning_content(idx, &think_content));
                 }
                 self.in_think_tag = false;
-                // Remove the processed portion (including the closing tag).
-                self.think_pending = self.think_pending[end + 8..].to_string();
                 // Trim leading newlines that typically follow </think>.
-                let trimmed = self.think_pending.trim_start_matches('\n');
-                if trimmed.len() < self.think_pending.len() {
-                    self.think_pending = trimmed.to_string();
+                let trim_len = self.think_pending.len() - self.think_pending.trim_start_matches('\n').len();
+                if trim_len > 0 {
+                    self.think_pending.drain(..trim_len);
                 }
                 // Continue the loop to process the remainder as text.
                 continue;
@@ -377,10 +394,12 @@ impl ResponseTranslator {
                 let suffix_len = longest_suffix_prefix(&self.think_pending, "</think>");
                 let emit_len = self.think_pending.len() - suffix_len;
                 if emit_len > 0 {
-                    let to_emit = self.think_pending[..emit_len].to_string();
+                    // Use mem::take + drain to avoid allocating a new String.
+                    let mut taken = std::mem::take(&mut self.think_pending);
+                    let to_emit: String = taken.drain(..emit_len).collect();
+                    self.think_pending = taken;
                     out.extend(self.handle_reasoning_content(idx, &to_emit));
                 }
-                self.think_pending = self.think_pending[emit_len..].to_string();
                 return out;
             }
         }
@@ -721,6 +740,9 @@ impl ResponseTranslator {
         let item_id = format!("msg_{}_{}", self.response_id, idx);
         let (msg_output_index, full_text) = {
             let ms = self.msg_states.get_mut(&idx).unwrap();
+            // Clone the text — build_completed_event also needs it later to
+            // construct the response.output array. Using mem::take here would
+            // empty the buffer and break response.completed.
             (ms.output_ix, ms.text_buf.clone())
         };
 
@@ -800,13 +822,16 @@ impl ResponseTranslator {
     fn close_function_call(&mut self, key: &str) -> Vec<String> {
         let mut out = Vec::new();
         let (item_id, call_id, oix, args, name) = {
-            let fs = match self.func_states.get(key) {
+            let fs = match self.func_states.get_mut(key) {
                 Some(fs) => fs,
                 None => return out,
             };
             if fs.call_id.is_empty() {
                 return out;
             }
+            // Use mem::take to avoid cloning the potentially large args buffer.
+            // This is the final operation on this state — the buffer is no
+            // longer needed after close.
             (fs.item_id.clone(), fs.call_id.clone(), fs.output_ix, fs.args_buf.clone(), fs.name.clone())
         };
 

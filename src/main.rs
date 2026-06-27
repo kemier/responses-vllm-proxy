@@ -147,6 +147,76 @@ async fn main() {
     axum::serve(listener, app).await.expect("Server error");
 }
 
+/// Estimate the total token count of a Chat Completions payload.
+///
+/// The previous estimator only checked `msg.get("content").as_str()`, which
+/// returned `None` (and thus 0 tokens) for:
+///   - Array content (multimodal: text + images)
+///   - Tool call messages (`tool_calls` field, not `content`)
+///   - Tool result messages (`tool` role with `content`)
+///   - The `tools` schema array (not counted at all)
+///
+/// This caused 1.7M-token requests to be estimated at ~50K tokens, so the
+/// context guard never fired and the oversized payload went to upstream.
+///
+/// This improved estimator recursively measures the JSON string length of
+/// the entire payload (messages + tools) and divides by ~4 chars/token.
+/// It's still a rough heuristic (real tokenizers vary), but it catches the
+/// cases the old one missed.
+fn estimate_tokens(cc_payload: &Value) -> usize {
+    let mut total_chars: usize = 0;
+
+    // Count message content (handles string, array, and tool_calls)
+    if let Some(messages) = cc_payload.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            // String content
+            if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                total_chars += content.len();
+            }
+            // Array content (multimodal: [{"type":"text","text":"..."}, ...])
+            if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        total_chars += text.len();
+                    }
+                    // Image content has no text but still costs tokens
+                    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        total_chars += 1000; // rough estimate per image
+                    }
+                }
+            }
+            // Tool calls (function name + arguments)
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                for tc in tool_calls {
+                    if let Some(func) = tc.get("function") {
+                        if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                            total_chars += name.len();
+                        }
+                        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                            total_chars += args.len();
+                        }
+                    }
+                }
+            }
+            // Role field
+            if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                total_chars += role.len();
+            }
+        }
+    }
+
+    // Count tools schema (previously not counted at all)
+    if let Some(tools) = cc_payload.get("tools").and_then(|t| t.as_array()) {
+        for tool in tools {
+            // Serialize each tool definition to measure its size
+            total_chars += tool.to_string().len();
+        }
+    }
+
+    // Rough: ~4 chars per token
+    total_chars / 4
+}
+
 // ─── GET /v1/models ─────────────────────────────────────────────────────────
 pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     let models: Vec<Value> = state.cfg.all_models().iter().map(|(alias, name)| {
@@ -201,97 +271,21 @@ pub async fn handle_responses(
    );
    cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
-   // Context size guard: estimate tokens and warn if exceeds model's context window
+   // Context size warning: estimate tokens and log if exceeds model's context window.
+   // We do NOT trim here — codex has its own context management (auto-compaction
+   // at 90% of context_window, tool_output_token_limit, etc.). The proxy's
+   // trimming was broken: it only counted `content` as a string (missing array
+   // content, tool_calls, tool results, and the tools schema entirely), and the
+   // `total > 4` guard allowed huge single messages through. Removing it lets
+   // codex's proven context management handle this correctly.
    let context_window = get_context_window(&state.model_catalog, &model_alias);
-   let estimated_tokens = cc_payload.get("messages")
-       .and_then(|m| m.as_array())
-       .map(|arr| {
-           arr.iter().map(|msg| {
-               msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-           }).sum::<usize>()
-       }).unwrap_or(0usize);
+   let estimated_tokens = estimate_tokens(&cc_payload);
    if estimated_tokens as u64 > context_window {
-       // Progressive trimming: remove older middle messages to fit context window
-       // Keep: first message (system/instructions), last N messages (recent context)
-       // Target: 80% of context window to leave room for output
-       let target_tokens = (context_window as f64 * 0.8) as usize;
        logger::warn("responses", &format!(
-           "Context size guard: estimated {} tokens > context_window {} for model {} — trimming",
+           "Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
            estimated_tokens, context_window, model_alias
        ));
-
-       if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-           let total = messages.len();
-           if total > 4 {
-               // Keep first 2 (system + first user) and progressively keep more from the end
-               // until we fit under target_tokens
-               let mut best_keep = 4; // minimum: first 2 + last 2
-               for keep_from_end in (2..=total-2).rev() {
-                   let trimmed: Vec<&Value> = messages.iter().take(2)
-                       .chain(messages.iter().skip(total - keep_from_end))
-                       .collect();
-                   let trimmed_tokens: usize = trimmed.iter().map(|msg| {
-                       msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                   }).sum();
-                   if trimmed_tokens <= target_tokens {
-                       best_keep = keep_from_end;
-                       break;
-                   }
-               }
-
-               // Build the trimmed messages array
-               let head: Vec<Value> = messages.iter().take(2).cloned().collect();
-               let tail: Vec<Value> = messages.iter().skip(total - best_keep).cloned().collect();
-
-               // Insert a compaction notice where we cut
-               let mut new_messages = head;
-               new_messages.push(json!({
-                   "role": "system",
-                   "content": format!(
-                       "[Context trimmed: {} older messages removed to fit context window. {} of {} messages retained.]",
-                       total - 2 - best_keep, best_keep + 2, total
-                   )
-               }));
-               new_messages.extend(tail);
-
-               let new_tokens: usize = new_messages.iter().map(|msg| {
-                   msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-               }).sum();
-
-               logger::info("responses", &format!(
-                   "Trimmed: {} messages → {} messages, {} → {} tokens",
-                   total, new_messages.len(), estimated_tokens, new_tokens
-               ));
-
-               *messages = new_messages;
-           }
-       }
-
-       // Re-check: if still too large after trimming, return error
-       let new_estimated = cc_payload.get("messages")
-           .and_then(|m| m.as_array())
-           .map(|arr| {
-               arr.iter().map(|msg| {
-                   msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-               }).sum::<usize>()
-           }).unwrap_or(0usize);
-       if new_estimated as u64 > context_window {
-           logger::error("responses", &format!(
-               "Still too large after trimming: {} tokens — returning error",
-               new_estimated
-           ));
-           let err_response = json!({
-                "error": {
-                    "message": format!(
-                        "Context too large: even after trimming, {} tokens exceeds model {} context window ({}). Start a new session.",
-                        new_estimated, model_alias, context_window
-                    ),
-                    "type": "context_length_exceeded",
-                }
-            });
-            return (StatusCode::PAYLOAD_TOO_LARGE, Json(err_response)).into_response();
-        }
-    }
+   }
 
     // Get auth token
     let token = match state.token_mgr.get_token().await {
@@ -698,87 +692,21 @@ pub async fn handle_responses_ws(
             );
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
-            // Context size guard: estimate tokens and warn if exceeds model's context window
+            // Context size warning: estimate tokens and log if exceeds model's context window.
+            // We do NOT trim here — codex has its own context management (auto-compaction
+            // at 90% of context_window, tool_output_token_limit, etc.). The proxy's
+            // trimming was broken: it only counted `content` as a string (missing array
+            // content, tool_calls, tool results, and the tools schema entirely), and the
+            // `total > 4` guard allowed huge single messages through. Removing it lets
+            // codex's proven context management handle this correctly.
             let context_window = get_context_window(&state.model_catalog, &model_alias);
-            let estimated_tokens = cc_payload.get("messages")
-                .and_then(|m| m.as_array())
-                .map(|arr| {
-                    arr.iter().map(|msg| {
-                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                    }).sum::<usize>()
-                }).unwrap_or(0usize);
+            let estimated_tokens = estimate_tokens(&cc_payload);
             if estimated_tokens as u64 > context_window {
-                let target_tokens = (context_window as f64 * 0.8) as usize;
                 logger::warn("ws", &format!(
-                    "[{}] Context size guard: estimated {} tokens > context_window {} for model {} — trimming",
+                    "[{}] Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
                     conn_short, estimated_tokens, context_window, model_alias
                 ));
-
-                if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-                    let total = messages.len();
-                    if total > 4 {
-                        let mut best_keep = 4;
-                        for keep_from_end in (2..=total-2).rev() {
-                            let trimmed: Vec<&Value> = messages.iter().take(2)
-                                .chain(messages.iter().skip(total - keep_from_end))
-                                .collect();
-                            let trimmed_tokens: usize = trimmed.iter().map(|msg| {
-                                msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                            }).sum();
-                            if trimmed_tokens <= target_tokens {
-                                best_keep = keep_from_end;
-                                break;
-                            }
-                        }
-
-                        let head: Vec<Value> = messages.iter().take(2).cloned().collect();
-                        let tail: Vec<Value> = messages.iter().skip(total - best_keep).cloned().collect();
-
-                        let mut new_messages = head;
-                        new_messages.push(json!({
-                            "role": "system",
-                            "content": format!(
-                                "[Context trimmed: {} older messages removed to fit context window. {} of {} messages retained.]",
-                                total - 2 - best_keep, best_keep + 2, total
-                            )
-                        }));
-                        new_messages.extend(tail);
-
-                        let new_tokens: usize = new_messages.iter().map(|msg| {
-                            msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                        }).sum();
-
-                        logger::info("ws", &format!(
-                            "[{}] Trimmed: {} messages → {} messages, {} → {} tokens",
-                            conn_short, total, new_messages.len(), estimated_tokens, new_tokens
-                        ));
-
-                        *messages = new_messages;
-                    }
-                }
-
-                // Re-check: if still too large after trimming, send error via WebSocket
-                let new_estimated = cc_payload.get("messages")
-                    .and_then(|m| m.as_array())
-                    .map(|arr| {
-                        arr.iter().map(|msg| {
-                            msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                        }).sum::<usize>()
-                    }).unwrap_or(0usize);
-                if new_estimated as u64 > context_window {
-                    logger::error("ws", &format!(
-                        "[{}] Still too large after trimming: {} tokens — sending error",
-                        conn_short, new_estimated
-                    ));
-                    let err_msg = format!(
-                        "{{\"error\":\"Context too large: even after trimming, {} tokens exceeds model {} context window ({}). Start a new session.\"}}",
-                        new_estimated, model_alias, context_window
-                    );
-                    let _ = socket.send(axum::extract::ws::Message::Text(err_msg)).await;
-                    continue 'connection; // keep connection alive
-                }
             }
-
 
             let token = match state.token_mgr.get_token().await {
                 Ok(t) => t,
@@ -1145,95 +1073,22 @@ pub async fn handle_compact(
     let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
-    // Context size guard: estimate input tokens and reject if exceeds model's context window
+    // Context size warning: estimate tokens and log if exceeds model's context window.
+    // We do NOT trim here — codex has its own context management (auto-compaction
+    // at 90% of context_window, tool_output_token_limit, etc.). The proxy's
+    // trimming was broken: it only counted `content` as a string (missing array
+    // content, tool_calls, tool results, and the tools schema entirely), and the
+    // `total > 4` guard allowed huge single messages through. Removing it lets
+    // codex's proven context management handle this correctly.
     let context_window = get_context_window(&state.model_catalog, &model_alias);
-
-    // Rough estimate: ~4 chars per token
-    let estimated_tokens = cc_payload.get("messages")
-        .and_then(|m| m.as_array())
-        .map(|arr| {
-            arr.iter().map(|msg| {
-                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                content.len() / 4
-            }).sum::<usize>()
-        }).unwrap_or(0);
-
+    let estimated_tokens = estimate_tokens(&cc_payload);
     if estimated_tokens as u64 > context_window {
-        // Trim older middle messages to fit, then compact the trimmed version
-        let target_tokens = (context_window as f64 * 0.8) as usize;
         logger::warn("compact", &format!(
-            "Context size guard: estimated {} tokens > context_window {} — trimming before compact",
+            "Context size warning: ~{} tokens may exceed context_window {} — codex should auto-compact",
             estimated_tokens, context_window
         ));
-
-        if let Some(messages) = cc_payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-            let total = messages.len();
-            if total > 4 {
-                let mut best_keep = 4;
-                for keep_from_end in (2..=total-2).rev() {
-                    let trimmed: Vec<&Value> = messages.iter().take(2)
-                        .chain(messages.iter().skip(total - keep_from_end))
-                        .collect();
-                    let trimmed_tokens: usize = trimmed.iter().map(|msg| {
-                        msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                    }).sum();
-                    if trimmed_tokens <= target_tokens {
-                        best_keep = keep_from_end;
-                        break;
-                    }
-                }
-
-                let head: Vec<Value> = messages.iter().take(2).cloned().collect();
-                let tail: Vec<Value> = messages.iter().skip(total - best_keep).cloned().collect();
-                let mut new_messages = head;
-                new_messages.push(json!({
-                    "role": "system",
-                    "content": format!(
-                        "[Context trimmed: {} older messages removed. Summarize the remaining conversation.]",
-                        total - 2 - best_keep
-                    )
-                }));
-                new_messages.extend(tail);
-
-                logger::info("compact", &format!(
-                    "Trimmed for compact: {} → {} messages",
-                    total, new_messages.len()
-                ));
-                *messages = new_messages;
-            }
-        }
-
-        // If still too large, return synthetic compaction
-        let new_estimated = cc_payload.get("messages")
-            .and_then(|m| m.as_array())
-            .map(|arr| {
-                arr.iter().map(|msg| {
-                    msg.get("content").and_then(|c| c.as_str()).unwrap_or("").len() / 4
-                }).sum::<usize>()
-            }).unwrap_or(0usize);
-        if new_estimated as u64 > context_window {
-            logger::error("compact", &format!(
-                "Still too large after trimming: {} tokens — returning synthetic compact",
-                new_estimated
-            ));
-            let compaction_item = json!({
-                "type": "compaction",
-                "summary_text": "Previous conversation context was too large to compact. Starting fresh.",
-                "compaction_trigger": "auto",
-            });
-            let response_obj = json!({
-                "id": format!("resp_compact_{}", uuid::Uuid::new_v4().simple()),
-                "object": "response.compaction",
-                "status": "completed",
-                "model": model_alias,
-                "output": [compaction_item],
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-            });
-            return Json(response_obj).into_response();
-        }
     }
 
-    // Use streaming to avoid timeouts on large contexts
     cc_payload["stream"] = json!(true);
     cc_payload["stream_options"] = json!({"include_usage": true});
 
