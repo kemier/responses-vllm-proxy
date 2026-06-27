@@ -17,11 +17,36 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
+/// Cached model catalog loaded once at startup from ~/.codex/model_catalog.json.
+/// Previously this file was read from disk on EVERY request (HTTP, WebSocket,
+/// and compact), causing 13+ disk reads per WebSocket connection with
+/// incremental requests. Now it's loaded once and shared via Arc.
+pub type ModelCatalog = Arc<Option<Value>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<config::Config>,
     pub token_mgr: Arc<auth::TokenManager>,
     pub http_client: reqwest::Client,
+    pub model_catalog: ModelCatalog,
+}
+
+/// Look up a model's context_window from the cached catalog.
+/// Falls back to 196608 (192K) if the catalog isn't loaded or the model
+/// isn't found.
+pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
+    if let Some(c) = catalog.as_ref() {
+        if let Some(arr) = c.get("models").and_then(|m| m.as_array()) {
+            for m in arr {
+                if m.get("slug").and_then(|s| s.as_str()) == Some(model_alias) {
+                    if let Some(cw) = m.get("context_window").and_then(|c| c.as_u64()) {
+                        return cw;
+                    }
+                }
+            }
+        }
+    }
+    196608
 }
 
 #[tokio::main]
@@ -54,10 +79,25 @@ async fn main() {
         .build()
         .expect("Failed to create HTTP client");
 
+    // Load model catalog once at startup — avoids per-request disk reads.
+    let model_catalog: ModelCatalog = Arc::new(
+        std::env::var("HOME")
+            .ok()
+            .map(|h| format!("{}/.codex/model_catalog.json", h))
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    );
+    if model_catalog.is_some() {
+        logger::info("main", "Model catalog loaded from ~/.codex/model_catalog.json");
+    } else {
+        logger::warn("main", "Model catalog not found — using default context_window=196608");
+    }
+
     let state = AppState {
         cfg: cfg.clone(),
         token_mgr,
         http_client,
+        model_catalog,
     };
 
     let app = axum::Router::new()
@@ -168,21 +208,7 @@ pub async fn handle_responses(
    cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
    // Context size guard: estimate tokens and warn if exceeds model's context window
-   let context_window = {
-       let catalog_path = std::env::var("HOME")
-           .map(|h| format!("{}/.codex/model_catalog.json", h))
-           .ok();
-       catalog_path
-           .and_then(|p| std::fs::read_to_string(&p).ok())
-           .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-           .and_then(|c| c.get("models").and_then(|m| m.as_array()).map(|a| a.to_vec()))
-           .and_then(|arr| {
-               arr.iter()
-                   .find(|m| m.get("slug").and_then(|s| s.as_str()) == Some(&model_alias))
-                   .and_then(|m| m.get("context_window")).and_then(|c| c.as_u64())
-           })
-           .unwrap_or(196608u64)
-   };
+   let context_window = get_context_window(&state.model_catalog, &model_alias);
    let estimated_tokens = cc_payload.get("messages")
        .and_then(|m| m.as_array())
        .map(|arr| {
@@ -612,21 +638,7 @@ pub async fn handle_responses_ws(
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
             // Context size guard: estimate tokens and warn if exceeds model's context window
-            let context_window = {
-                let catalog_path = std::env::var("HOME")
-                    .map(|h| format!("{}/.codex/model_catalog.json", h))
-                    .ok();
-                catalog_path
-                    .and_then(|p| std::fs::read_to_string(&p).ok())
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|c| c.get("models").and_then(|m| m.as_array()).map(|a| a.to_vec()))
-                    .and_then(|arr| {
-                        arr.iter()
-                            .find(|m| m.get("slug").and_then(|s| s.as_str()) == Some(&model_alias))
-                            .and_then(|m| m.get("context_window")).and_then(|c| c.as_u64())
-                    })
-                    .unwrap_or(196608u64)
-            };
+            let context_window = get_context_window(&state.model_catalog, &model_alias);
             let estimated_tokens = cc_payload.get("messages")
                 .and_then(|m| m.as_array())
                 .map(|arr| {
@@ -1035,22 +1047,7 @@ pub async fn handle_compact(
     let url = format!("{}/chat/completions", base_url);
 
     // Context size guard: estimate input tokens and reject if exceeds model's context window
-    let context_window = {
-        let catalog_path = std::env::var("HOME")
-            .map(|h| format!("{}/.codex/model_catalog.json", h))
-            .ok();
-        let cw = catalog_path
-            .and_then(|p| std::fs::read_to_string(&p).ok())
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|c| c.get("models").and_then(|m| m.as_array()).map(|a| a.to_vec()))
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|m| m.get("slug").and_then(|s| s.as_str()) == Some(&model_alias))
-                    .and_then(|m| m.get("context_window")).and_then(|c| c.as_u64())
-            })
-            .unwrap_or(196608u64);
-        cw
-    };
+    let context_window = get_context_window(&state.model_catalog, &model_alias);
 
     // Rough estimate: ~4 chars per token
     let estimated_tokens = cc_payload.get("messages")
