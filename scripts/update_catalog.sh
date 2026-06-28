@@ -114,63 +114,55 @@ except Exception as e:
     proxy_ids = []
 
 # ── Base instructions: teach LLM to emit clickable link formats ─────────────
-BASE_INSTRUCTIONS = """When referencing code locations, use clickable links so the user can jump directly to source:
+BASE_INSTRUCTIONS = """When referencing code locations, use clickable links so the user can jump directly to source. Links must work in BOTH Zed and VS Code.
 
-1. Symbol name link (PREFERRED — uses LSP to find the exact definition):
-   [nats_msgbus_create](@symbol:nats_msgbus_create)
-   [ResponseTranslator](@symbol:ResponseTranslator)
-   [process_line](@symbol:process_line)
-   The link text should be the symbol/function name. For methods, use the bare method name only.
-   The LSP (clangd/rust-analyzer) will resolve the symbol to its exact file:line definition.
-   BENEFIT: The user can click the link to jump directly to the source definition. LSP resolves
-   the exact file and line, so you never need to guess line numbers. This works across all
-   languages (C, C++, Rust, Go, etc.) and even resolves header declarations to their .c/.cpp
-   implementation.
+## Link Format (MANDATORY — read carefully, Zed has NO line correction)
 
-2. File path with line number (fallback when LSP is not available or for non-symbol locations):
-   [main()](up/epg/cl/src/cl_main.c:519)
-   src/translate_response.rs:130
-   BENEFIT: The user can click to open the file at the exact line. The path is resolved relative
-   to the workspace root, and parent directories (../) are supported for sibling repos.
-   IMPORTANT: Always include the :line number. A bare file path without :line renders as a
-   non-clickable reference (the user can see it but cannot click to jump).
+Zed jumps to the exact #L line you provide. It does NOT use LSP or text search to correct wrong lines. VS Code corrects ±200 lines using ?symbol=. Therefore you MUST:
+1. Run grep -n to find the exact line BEFORE writing any link
+2. ALWAYS include ?symbol= (even one missing ?symbol= breaks that link in Zed)
 
-Rules:
-- Use format 1 (@symbol link) ONLY for symbols WITHIN the current workspace repo. LSP (clangd/rust-analyzer) resolves the exact definition, so you never guess line numbers.
-- Use format 2 (path:line) for everything OUTSIDE the current workspace repo. Sibling repos (../ssr, ../other-repo) are NOT indexed by LSP, so @symbol: will fail. Always give the exact relative path with ../ and :line number so the user can click and jump directly.
-  Example: [fen_adapter_init](up/../ssr/pkt/sw/src/fen/fen_adapter.c:142)
-- Use format 2 (path:line) for non-symbol locations (headers, labels, sections, macros).
-- Use format 2 (path:line) for ambiguous or generic names (Library, Config, Manager) where LSP returns too many matches.
-- The link text MUST be the symbol name or file name, not "line 161" or a description.
-- NEVER use Type::method syntax in links. Use the bare method name: [process_line](@symbol:process_line)
-- ALWAYS include :line number in format 2. A path without :line is non-clickable (user can see it but cannot jump).
-- Do not wrap plain file paths in markdown links; the auto-linkifier handles them.
-- IMPORTANT: When listing API functions or symbols from a header file, ALWAYS use clickable links — NEVER write them as bare backtick code (e.g. NEVER write `icrlib_client_send_client_msg()`). Instead write [icrlib_client_send_client_msg()](up/../ssr/.../icrlib_api.h:142). Backtick code is NOT clickable; the user cannot jump to source from it.
-- For functions in sibling repos (../ssr), ALWAYS use format 2 with the exact path and :line:
-  Example: [icrlib_client_send_client_msg()](up/../ssr/pkt/sw/include/icrlib/icrlib_api.h:142)
-  Example: [fen_adapter_init()](up/../ssr/pkt/sw/src/fen/fen_adapter.c:142)
-  The path must start with the relative path from the workspace root (e.g. up/../ssr/...) and include :line.
-- CRITICAL: Backtick code spans (e.g. `function_name()` or `type_name_t`) are NEVER clickable.
-  If you write a symbol name inside backticks, the user CANNOT jump to its definition.
-  Every function name, struct/typedef name, and API symbol that you reference MUST be a clickable link.
-  WRONG: `icrlib_client_get_icr_context()` — not clickable
-  RIGHT: [icrlib_client_get_icr_context()](up/../ssr/pkt/sw/include/icrlib/icrlib_api.h:525)
-  WRONG: `icr_gen_state_msg_t` — not clickable
-  RIGHT: [icr_gen_state_msg_t](up/../ssr/pkt/sw/include/icrlib/icrlib_api.h:148)
-  This applies to ALL symbols, whether in the workspace repo or sibling repos.
-  Backticks are for keywords, variable names, enum values, and short snippets — NOT for symbols with definitions the user should jump to.
-- ACCURACY IS CRITICAL: The :line number MUST point to the actual definition/declaration line, not a nearby comment or documentation line.
-  If you are not 100% certain of the exact line number, use the @symbol: format (format 1) for workspace-repo symbols — LSP will resolve the exact line.
-  For sibling-repo symbols where you must use path:line, you MUST verify the line number by running grep -n 'symbol_name' file.h with exec_command before writing the link. A wrong line number is worse than no link.
-  Do NOT point to the line above a function (comment/doc block) — point to the line where the function name actually appears.
-  Common mistake: in C headers, the function name is often on the line AFTER "extern return_type". Always point to the line containing the function name itself, not the return type line above it.
+### URL structure (STRICT ORDER — RFC 3986):
+file:///{absolute_path}?symbol={symbol_name}#L{line_number}
+
+The ?symbol= MUST come before #L. If reversed, Zed swallows the query into the fragment and every link jumps to line 1.
+
+### Examples:
+[responses_to_chat_completions](file:///workspace/git/ezennin/ericai-proxy/src/translate_request.rs?symbol=responses_to_chat_completions#L5)
+[handle_content](file:///workspace/git/ezennin/ericai-proxy/src/translate_response.rs?symbol=handle_content#L316)
+[fen_adapter_init](file:///workspace/git/ezennin/ssr/pkt/sw/src/fen/fen_adapter.c?symbol=fen_adapter_init#L142)
+
+### Self-check before emitting ANY link:
+- Does the URL have ?symbol= BEFORE #L? If not, fix it.
+- Did you run grep -n to verify the line number? If not, run it now.
+- Is ?symbol= present on EVERY file:// link? Not just some — ALL of them.
+
+### For sibling/cross-workspace repos:
+Same format. MUST verify the line with: grep -n 'symbol_name' file
+[icrlib_client_send_client_msg()](file:///workspace/git/ezennin/ssr/pkt/sw/include/icrlib/icrlib_api.h?symbol=icrlib_client_send_client_msg#L525)
+
+### Last resort — @symbol: (VS Code only):
+[nats_msgbus_create](@symbol:nats_msgbus_create)
+Only use when you cannot determine the file path. Zed users see plain text.
+
+## Rules
+
+1. EVERY file:// link MUST have ?symbol=symbol_name BEFORE #L: file:///path?symbol=name#L42
+2. NEVER emit a file:// link without ?symbol= — not even one. Zed cannot correct it.
+3. NEVER put #L before ?symbol=: file:///path#L42?symbol=name is BROKEN.
+4. ALWAYS verify line numbers with grep -n. Zed jumps to exact #L with zero correction.
+5. ALWAYS use file:// URLs in markdown links. NEVER use relative paths like [symbol](src/file.rs:42).
+6. Link text = bare symbol name WITHOUT backticks: [process_line](file:///...) NOT [`process_line`](file:///...)
+7. NEVER use Type::method syntax. Use the bare method name in both link text and ?symbol=.
+8. ALWAYS use ABSOLUTE paths from the workspace cwd.
+9. In C headers, function name is often on line AFTER "extern return_type". Point to the function name line.
+10. For file references (not symbols), still include ?symbol= with the filename.
 
 ── Code fence discipline ────────────────────────────────────────────────────
 Code fences (```...```) are for code and diagrams ONLY.
 - NEVER put prose, explanations, or narrative text inside a code fence. If it is not executable code, a shell command, a data structure, or an ASCII/PlantUML diagram, it does not belong in a code fence.
 - When drawing ASCII art diagrams, close the fence immediately after the diagram ends. Do NOT continue writing explanations inside the same fence.
 - If you need to explain a diagram, close the code fence first, then write the explanation as normal markdown.
-- Mermaid diagrams are supported: use ```mermaid code fences for flowcharts, sequence diagrams, etc. They will be rendered as interactive diagrams in the chat.
 
 ── apply_patch ─────────────────────────────────────────────────────────────
 Use the `apply_patch` shell command to edit files.
