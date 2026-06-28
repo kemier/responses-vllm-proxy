@@ -119,8 +119,14 @@ BASE_INSTRUCTIONS = """When referencing code locations, use clickable links so t
 ## Link Format (MANDATORY — read carefully, Zed has NO line correction)
 
 Zed jumps to the exact #L line you provide. It does NOT use LSP or text search to correct wrong lines. VS Code corrects ±200 lines using ?symbol=. Therefore you MUST:
-1. Run grep -n to find the exact line BEFORE writing any link
-2. ALWAYS include ?symbol= (even one missing ?symbol= breaks that link in Zed)
+
+WORKFLOW (do this BEFORE writing your summary):
+1. Identify all symbols you will reference in your answer
+2. Run grep -n for EACH symbol to get the exact line number: grep -n 'symbol_name' file
+3. Collect all the verified file:line pairs
+4. ONLY THEN write your summary, using the verified line numbers in links
+
+Do NOT write your summary first and guess line numbers — you will get them wrong. Verify first, then write.
 
 ### URL structure (STRICT ORDER — RFC 3986):
 file:///{absolute_path}?symbol={symbol_name}#L{line_number}
