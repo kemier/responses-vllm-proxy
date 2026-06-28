@@ -243,6 +243,21 @@ WATCHER_PID=$!
 
 # ─── Cleanup on exit ────────────────────────────────────────────────────────
 cleanup() {
+    # Wait for the proxy to drain connections after receiving SIGINT/SIGTERM.
+    # Fix 1 in main.rs added with_graceful_shutdown via tokio::signal::ctrl_c(),
+    # so the proxy will finish in-flight requests before exiting. Give it up
+    # to 10s; force-kill if it hangs.
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        echo "Waiting for proxy (PID $PID) to drain connections..."
+        for i in $(seq 1 20); do
+            kill -0 "$PID" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "Force killing proxy (PID $PID)..."
+            kill -9 "$PID" 2>/dev/null
+        fi
+    fi
     kill $WATCHER_PID 2>/dev/null
     rm -f "$PIDFILE"
 }

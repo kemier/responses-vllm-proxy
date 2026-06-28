@@ -152,7 +152,20 @@ async fn main() {
         socket.listen(1024).expect("Failed to listen");
         tokio::net::TcpListener::from_std(socket.into()).expect("Failed to convert to TcpListener")
     };
-    axum::serve(listener, app).await.expect("Server error");
+    // Graceful shutdown: on SIGINT/SIGTERM, stop accepting new connections
+    // but drain in-flight requests before exiting. Without this, Ctrl+C in
+    // start.sh instantly severs codex's proxy connection, which codex
+    // retries 5x against a dead server before terminating with exit code 1.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        logger::info("main", "Received SIGINT, draining connections before shutdown...");
+        let _ = shutdown_tx.send(());
+    });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+        .await
+        .expect("Server error");
 }
 
 /// Estimate the total token count of a Chat Completions payload.
