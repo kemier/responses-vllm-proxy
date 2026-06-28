@@ -17,23 +17,25 @@ log-dir: "logs"
 log-turn-debug: true
 
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
-    base-url: "https://ray.sero.gic.ericsson.se/backendsso/v1"
-    models:
-      - name: zai-org/GLM-5.1-FP8
-        alias: glm-5.1
-      - name: deepseek-ai/DeepSeek-V4-Flash
-        alias: deepseek-v4-flash
-      - name: deepseek-ai/DeepSeek-V4-Pro
-        alias: deepseek-v4-pro
-      - name: XiaomiMiMo/MiMo-V2.5-Pro
-        alias: mimo-v2.5-pro
-      - name: XiaomiMiMo/MiMo-V2.5
-        alias: mimo-v2.5
-      - name: moonshotai/Kimi-K2.7-Code
-        alias: kimi-k2.7-code
-      - name: moonshotai/Kimi-K2.6
-        alias: kimi-k2.6
-      - name: zai-org/GLM-5.2-FP8
-        alias: glm-5.2
+    - name: "ericai"
+      prefix: "ericai"
+      base-url: "https://ray.sero.gic.ericsson.se/backendsso/v1"
+      models:
+          - name: zai-org/GLM-5.1-FP8
+            alias: glm-5.1
+          - name: deepseek-ai/DeepSeek-V4-Flash
+            alias: deepseek-v4-flash
+          - name: deepseek-ai/DeepSeek-V4-Pro
+            alias: deepseek-v4-pro
+          - name: XiaomiMiMo/MiMo-V2.5-Pro
+            alias: mimo-v2.5-pro
+          - name: XiaomiMiMo/MiMo-V2.5
+            alias: mimo-v2.5
+          - name: moonshotai/Kimi-K2.7-Code
+            alias: kimi-k2.7-code
+          - name: moonshotai/Kimi-K2.6
+            alias: kimi-k2.6
+          - name: zai-org/GLM-5.2-FP8
+            alias: glm-5.2
+          - name: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+            alias: qwen3

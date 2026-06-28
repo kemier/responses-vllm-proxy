@@ -316,104 +316,125 @@ impl ResponseTranslator {
     fn handle_content(&mut self, idx: usize, content: &str) -> Vec<String> {
         let mut out = Vec::new();
 
-        // Append the new chunk to the pending buffer. This lets us detect
-        // think tags that are split across chunk boundaries.
+        // Append the new chunk to the pending buffer for tag detection
+        // across chunk boundaries.
         self.think_pending.push_str(content);
 
-        // Process the buffer in a loop: each iteration either finds a complete
-        // tag (and continues with the remainder) or determines that no more
-        // complete tags can be found (and holds back a possible partial tag
-        // prefix before returning).
         loop {
             if !self.in_think_tag {
-                // Looking for opening tag "<think>"
-                if let Some(start) = self.think_pending.find("<think>") {
-                    // Emit any text before the tag as a text delta.
-                    // Use mem::take to swap out the buffer, then split it.
-                    // This avoids allocating a new String for `before` —
-                    // we drain from the taken buffer instead.
+                // Looking for opening think tag. Models emit two variants:
+                //   Kimi/GLM:   thinking (7 chars)
+                //   DeepSeek:  thinking (10 chars)
+                let (open_pos, open_len) = match (self.think_pending.find("\x3c\x74\x68\x69\x6e\x6b\x3e"), self.think_pending.find("\x3c\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e")) {
+                    (Some(s), Some(l)) if s <= l => (Some(s), 7),
+                    (Some(_), Some(l)) => (Some(l), 10),
+                    (Some(s), None) => (Some(s), 7),
+                    (None, Some(l)) => (Some(l), 10),
+                    (None, None) => (None, 0),
+                };
+                if let Some(start) = open_pos {
+                    // Emit any text before the opening tag as visible text.
                     if start > 0 {
                         let mut taken = std::mem::take(&mut self.think_pending);
                         let before: String = taken.drain(..start).collect();
-                        // Put the remainder (after the tag) back.
-                        taken.drain(..7); // skip the tag itself
+                        taken.drain(..open_len); // skip the tag itself
                         self.think_pending = taken;
                         if !before.is_empty() {
-                            if self.reasoning_id.is_some() {
-                                out.extend(self.stop_reasoning());
-                            }
                             out.extend(self.emit_text_delta(idx, &before));
                         }
                     } else {
-                        // start == 0: just remove the tag
-                        self.think_pending.drain(..7);
+                        self.think_pending.drain(..open_len);
                     }
                     self.in_think_tag = true;
-                    // Continue the loop to process the remainder (which may
-                    // contain "</think>" or more text).
                     continue;
                 } else {
-                    // No complete opening tag found. Check whether the buffer
-                    // ends with a prefix of "<think>" (e.g. "<thi"). If so,
-                    // hold that suffix back for the next chunk and emit the
-                    // rest as text.
-                    let suffix_len = longest_suffix_prefix(&self.think_pending, "<think>");
+                    // No complete opening tag. Hold back a possible partial
+                    // tag prefix and emit the rest as text.
+                    let suffix_len = longest_suffix_prefix(&self.think_pending, "\x3c\x74\x68\x69\x6e\x6b\x3e")
+                        .max(longest_suffix_prefix(&self.think_pending, "\x3c\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e"));
                     let emit_len = self.think_pending.len() - suffix_len;
                     if emit_len > 0 {
-                        // Use mem::take + drain to avoid allocating a new String.
-                        // When suffix_len == 0 (99%+ of deltas), we take the
-                        // entire buffer, drain all of it into `to_emit`, and
-                        // put back an empty String — no heap allocation.
                         let mut taken = std::mem::take(&mut self.think_pending);
                         let to_emit: String = taken.drain(..emit_len).collect();
-                        self.think_pending = taken; // holds the suffix (if any)
-                        if self.reasoning_id.is_some() {
-                            out.extend(self.stop_reasoning());
-                        }
+                        self.think_pending = taken;
                         out.extend(self.emit_text_delta(idx, &to_emit));
                     }
                     return out;
                 }
             }
 
-            // in_think_tag is true: looking for closing tag "</think>"
-            if let Some(end) = self.think_pending.find("</think>") {
-                // Use mem::take + drain to avoid allocating a new String.
+            // in_think_tag is true: looking for closing think tag.
+            //   Kimi/GLM:   response (8 chars)
+            //   DeepSeek:  response (11 chars)
+            let (close_pos, close_len) = match (self.think_pending.find("\x3c\x2f\x74\x68\x69\x6e\x6b\x3e"), self.think_pending.find("\x3c\x2f\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e")) {
+                (Some(s), Some(l)) if s <= l => (Some(s), 8),
+                (Some(_), Some(l)) => (Some(l), 11),
+                (Some(s), None) => (Some(s), 8),
+                (None, Some(l)) => (Some(l), 11),
+                (None, None) => (None, 0),
+            };
+            if let Some(end) = close_pos {
+                // Content between tags: emit as VISIBLE TEXT, not reasoning.
+                // The think tags are just markers — strip them and show the
+                // content as normal output text. Only API-native reasoning
+                // (via the reasoning_content delta field) should produce
+                // thinking blocks.
                 let mut taken = std::mem::take(&mut self.think_pending);
                 let think_content: String = taken.drain(..end).collect();
-                taken.drain(..8); // skip the closing tag
+                taken.drain(..close_len); // skip the closing tag
                 self.think_pending = taken;
                 if !think_content.is_empty() {
-                    out.extend(self.handle_reasoning_content(idx, &think_content));
+                    out.extend(self.emit_text_delta(idx, &think_content));
                 }
                 self.in_think_tag = false;
-                // Trim leading newlines that typically follow </think>.
+                // Trim leading newlines that typically follow the closing tag.
                 let trim_len = self.think_pending.len() - self.think_pending.trim_start_matches('\n').len();
                 if trim_len > 0 {
                     self.think_pending.drain(..trim_len);
                 }
-                // Continue the loop to process the remainder as text.
                 continue;
             } else {
-                // No complete closing tag found. Check whether the buffer ends
-                // with a prefix of "</think>" (e.g. "</thi"). Hold that suffix
-                // back and emit the rest as reasoning content.
-                let suffix_len = longest_suffix_prefix(&self.think_pending, "</think>");
+                // No complete closing tag. Hold back a possible partial tag
+                // prefix and emit the rest as visible text.
+                let suffix_len = longest_suffix_prefix(&self.think_pending, "\x3c\x2f\x74\x68\x69\x6e\x6b\x3e")
+                    .max(longest_suffix_prefix(&self.think_pending, "\x3c\x2f\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e"));
                 let emit_len = self.think_pending.len() - suffix_len;
                 if emit_len > 0 {
-                    // Use mem::take + drain to avoid allocating a new String.
                     let mut taken = std::mem::take(&mut self.think_pending);
                     let to_emit: String = taken.drain(..emit_len).collect();
                     self.think_pending = taken;
-                    out.extend(self.handle_reasoning_content(idx, &to_emit));
+                    out.extend(self.emit_text_delta(idx, &to_emit));
                 }
                 return out;
             }
         }
     }
 
+    /// Strip orphaned think tags from text content. These can appear when
+    /// old cached conversation history (generated before the dual-tag fix)
+    /// contains dangling think closing tags that the parser didn't catch.
+    /// This is a safety net  the tag parser should handle all cases, but
+    /// cached history from before the fix may have leaked tags.
+    fn strip_orphan_think_tags(content: &str) -> String {
+        // Only strip if the ENTIRE content (after trimming whitespace) is
+        // just a standalone think tag. This avoids corrupting content where
+        // the model legitimately mentions tags in code or text.
+        let trimmed = content.trim();
+        if trimmed == "<think>" || trimmed == "</think>"
+            || trimmed == "<thinking>" || trimmed == "</thinking>" {
+            return String::new();
+        }
+        content.to_string()
+    }
+
    fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
        let mut out = Vec::new();
+       // Safety net: strip any orphaned think tags that leaked from old
+       // cached conversation history (generated before the dual-tag fix).
+       let content = Self::strip_orphan_think_tags(content);
+       if content.is_empty() {
+           return out;
+       }
 
        // Single entry() call to get-or-insert the MessageState, then extract
        // the values we need so no further HashMap lookups are required in the
@@ -491,7 +512,7 @@ impl ResponseTranslator {
        });
        out.push(self.emit("response.output_text.delta", delta));
 
-        self.msg_states.get_mut(&idx).unwrap().text_buf.push_str(content);
+        self.msg_states.get_mut(&idx).unwrap().text_buf.push_str(&content);
 
        out
    }
@@ -922,18 +943,19 @@ impl ResponseTranslator {
     fn flush_and_complete(&mut self) -> Vec<String> {
         let mut out = Vec::new();
 
-        // Flush any pending think-tag buffer content. If we're not inside a
-        // think tag, the pending content is just text that was held back
-        // because it might have been a partial tag prefix. If we ARE inside a
-        // think tag that was never closed, treat the remaining content as
-        // reasoning.
+        // Flush any pending think-tag buffer content.
         if !self.think_pending.is_empty() {
-            // Use mem::take to avoid cloning the buffer — we clear it
-            // immediately after, so taking ownership is safe and free.
             let pending = std::mem::take(&mut self.think_pending);
             if self.in_think_tag {
-                // Unclosed think tag: treat remaining content as reasoning.
-                out.extend(self.handle_reasoning_content(0, &pending));
+                // Unclosed think tag: the model opened  thinking but never
+                // emitted a closing tag. The remaining content is likely the
+                // model's actual answer, not reasoning. Close the reasoning
+                // block and emit the content as visible text.
+                if self.reasoning_id.is_some() {
+                    out.extend(self.stop_reasoning());
+                }
+                self.in_think_tag = false;
+                out.extend(self.emit_text_delta(0, &pending));
             } else {
                 // Not in a think tag: this is text that was held back
                 // because it might have been a partial tag prefix.
