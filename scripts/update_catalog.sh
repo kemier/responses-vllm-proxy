@@ -151,12 +151,12 @@ Only use when you cannot determine the file path. Zed users see plain text.
 2. NEVER emit a file:// link without ?symbol= — not even one. Zed cannot correct it.
 3. NEVER put #L before ?symbol=: file:///path#L42?symbol=name is BROKEN.
 4. ALWAYS verify line numbers with grep -n. Zed jumps to exact #L with zero correction.
-5. ALWAYS use file:// URLs in markdown links. NEVER use relative paths like [symbol](src/file.rs:42).
+5. NEVER use relative paths in markdown links. [main.rs](src/main.rs) is BROKEN in Zed. Use [main.rs](file:///workspace/.../src/main.rs?symbol=main.rs#L42) instead.
 6. Link text = bare symbol name WITHOUT backticks: [process_line](file:///...) NOT [`process_line`](file:///...)
 7. NEVER use Type::method syntax. Use the bare method name in both link text and ?symbol=.
-8. ALWAYS use ABSOLUTE paths from the workspace cwd.
+8. ALWAYS use ABSOLUTE paths starting with file:///
 9. In C headers, function name is often on line AFTER "extern return_type". Point to the function name line.
-10. For file references (not symbols), still include ?symbol= with the filename.
+10. For file references (not symbols), still include ?symbol= with the filename and #L with a line number.
 
 ── Code fence discipline ────────────────────────────────────────────────────
 Code fences (```...```) are for code and diagrams ONLY.
