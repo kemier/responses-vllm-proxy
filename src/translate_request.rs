@@ -294,9 +294,15 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 }
             }));
         }
-        if !cc_tools.is_empty() {
-            out["tools"] = json!(cc_tools);
-        }
+       if !cc_tools.is_empty() {
+           // Debug: log tool names and description lengths sent to vLLM
+           for t in &cc_tools {
+               let name = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("?");
+               let desc_len = t.get("function").and_then(|f| f.get("description")).and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+               crate::logger::debug("translate_request", &format!("[tools] vLLM tool: {} (desc {} chars)", name, desc_len));
+           }
+           out["tools"] = json!(cc_tools);
+       }
     }
 
     // reasoning.effort → reasoning_effort
