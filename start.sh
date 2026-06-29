@@ -203,7 +203,7 @@ fi
 
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"
-"$BIN_PATH" &
+(cd "$DIR" && "$BIN_PATH") &
 PID=$!
 echo "$PID" > "$PIDFILE"
 echo "ericai-proxy started (PID $PID)"

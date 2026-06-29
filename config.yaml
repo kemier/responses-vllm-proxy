@@ -9,7 +9,7 @@ request-retry: 3
 # Logging
 logging-to-file: true
 logs-max-total-size-mb: 10
-log-level: "debug"
+log-level: "info"
 log-dir: "logs"
 
 # Per-turn debug logging (instructions length, preview, tools count, input items)
