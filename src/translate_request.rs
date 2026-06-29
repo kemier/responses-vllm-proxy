@@ -167,12 +167,16 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                    // conversation history on follow-up turns and returns an
                    // empty response (0 output tokens). Wrap the input as JSON
                    // so the assistant tool_calls entry matches the schema.
-                   //
+                  //
                    // Same applies to Code Mode's `exec` and `wait` tools,
                    // which are freeform (custom) tools that accept raw text
                    // input (JavaScript source / wait parameters).
+                  //
+                  // NOTE: `wait` is actually a regular function tool, not
+                  // custom. It appears here only if codex sends it as
+                  // custom_tool_call (shouldn't happen in normal flow).
                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                   let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                  let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                    let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
                    let arguments = json!({"input": input}).to_string();
                     pending_tool_calls.push(json!({
@@ -236,15 +240,20 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                continue;
            }
 
-           // Code Mode freeform tools: exec and wait
-           // These are sent as type "custom" with a freeform format (grammar-based).
+           // Code Mode freeform tool: exec only
+           // This is sent as type "custom" with a freeform format (grammar-based).
            // vLLM/Chat Completions doesn't support freeform tools, so we convert
-           // them to standard function tools with a single `input` string parameter.
+           // it to a standard function tool with a single `input` string parameter.
            // The model generates JSON {"input": "..."} as arguments, which the
            // proxy translates back to custom_tool_call items with raw text input.
+           //
+           // NOTE: `wait` is a regular ToolSpec::Function (type "function"),
+           // NOT a freeform/custom tool. It falls through to the generic
+           // function tool handling below with its original parameters
+           // (cell_id, yield_time_ms, max_tokens, terminate).
            if tool_type == "custom" {
                let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
-               if name == "exec" || name == "wait" {
+               if name == "exec" {
                    let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
                    cc_tools.push(json!({
                        "type": "function",
@@ -257,11 +266,7 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                                "properties": {
                                    "input": {
                                        "type": "string",
-                                       "description": if name == "exec" {
-                                           "JavaScript source code to execute. Optionally start with // @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}"
-                                       } else {
-                                           "JSON object with cell_id, yield_time_ms, max_tokens, and optional terminate fields"
-                                       }
+                                       "description": "JavaScript source code to execute. Optionally start with // @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}"
                                    }
                                },
                                "required": ["input"]

@@ -32,12 +32,21 @@ fn longest_suffix_prefix(text: &str, tag: &str) -> usize {
 /// Check if a tool name corresponds to a freeform/custom tool (apply_patch).
 /// These tools must be emitted as `custom_tool_call` items in the Responses API,
 /// not as `function_call` items, because Codex dispatches them via the
-/// `ApplyPatchHandler` which only accepts `ToolPayload::Custom`.
+/// `ApplyPatchHandler` / `CodeModeExecuteHandler` which only accept
+/// `ToolPayload::Custom`.
+///
+/// NOTE: `wait` is a regular function tool (`ToolSpec::Function`), NOT a
+/// freeform/custom tool. Its handler `CodeModeWaitHandler` expects
+/// `ToolPayload::Function { arguments }`, so it must be emitted as a
+/// standard `function_call` item, not a `custom_tool_call`.
 fn is_custom_tool(name: &str) -> bool {
     // apply_patch: freeform tool, dispatched via ApplyPatchHandler
     // exec: Code Mode freeform tool, dispatched via CodeModeExecuteHandler
-    // wait: Code Mode freeform tool, dispatched via CodeModeWaitHandler
-    name == "apply_patch" || name == "exec" || name == "wait"
+    //   (expects ToolPayload::Custom { input })
+    // wait: regular function tool (ToolSpec::Function), dispatched via
+    //   CodeModeWaitHandler (expects ToolPayload::Function { arguments })
+    //   — NOT custom, so excluded here.
+    name == "apply_patch" || name == "exec"
 }
 
 /// Extract the `input` field from a JSON arguments string.
