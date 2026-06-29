@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+use crate::logger;
+
 /// Return the byte length of the longest suffix of `text` that is also a
 /// prefix of `tag`. Used to detect partial tag matches at chunk boundaries.
 ///
@@ -135,29 +137,36 @@ pub struct ResponseTranslator {
     // `event: ...\ndata: ...` envelopes (for HTTP SSE).
     raw_json: bool,
 
-   // Original request for completed event
+    // Original request for completed event
     request_json: Option<std::sync::Arc<Value>>,
 }
 
 impl ResponseTranslator {
-   pub fn new(response_id: &str, request_json: Option<Value>) -> Self {
+    pub fn new(response_id: &str, request_json: Option<Value>) -> Self {
         Self::new_impl(response_id, request_json.map(std::sync::Arc::new), false)
-   }
+    }
 
-   /// Create a translator that emits raw JSON strings (no SSE envelope),
-   /// suitable for WebSocket transport where each frame is a single JSON object.
-   pub fn new_raw_json(response_id: &str, request_json: Option<Value>) -> Self {
+    /// Create a translator that emits raw JSON strings (no SSE envelope),
+    /// suitable for WebSocket transport where each frame is a single JSON object.
+    pub fn new_raw_json(response_id: &str, request_json: Option<Value>) -> Self {
         Self::new_impl(response_id, request_json.map(std::sync::Arc::new), true)
     }
 
     /// Create a translator that emits raw JSON strings, accepting an Arc<Value>
     /// to avoid cloning the full request JSON (which can be large with many
     /// input items on long sessions).
-    pub fn new_raw_json_arc(response_id: &str, request_json: Option<std::sync::Arc<Value>>) -> Self {
+    pub fn new_raw_json_arc(
+        response_id: &str,
+        request_json: Option<std::sync::Arc<Value>>,
+    ) -> Self {
         Self::new_impl(response_id, request_json, true)
-   }
+    }
 
-    fn new_impl(response_id: &str, request_json: Option<std::sync::Arc<Value>>, raw_json: bool) -> Self {
+    fn new_impl(
+        response_id: &str,
+        request_json: Option<std::sync::Arc<Value>>,
+        raw_json: bool,
+    ) -> Self {
         Self {
             response_id: response_id.to_string(),
             created: chrono::Utc::now().timestamp(),
@@ -263,25 +272,57 @@ impl ResponseTranslator {
         // Check for usage in the chunk
         if let Some(usage) = parsed.get("usage") {
             if usage.is_object() {
-                let p = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let c = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let t = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let p = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let c = usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let t = usage
+                    .get("total_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 // vLLM streams usage in two chunks:
                 //   1. Real usage (choices: [], prompt_tokens > 0) — after finish_reason
                 //   2. Zero-usage cleanup chunk (choices: [{delta:{}}], all zeros) — on connection close
                 // Never overwrite real usage with zeros — the cleanup chunk
                 // would corrupt the response.completed event sent to codex,
                 // causing "Context 98% left" when it should be ~53%.
+                logger::debug(
+                    "translate_response",
+                    &format!(
+                        "[usage] raw vLLM usage object: {}",
+                        serde_json::to_string(usage).unwrap_or_default()
+                    ),
+                );
                 if p > 0 || c > 0 || t > 0 || !self.usage_seen {
                     self.usage_seen = true;
                     self.prompt_tokens = p;
                     self.completion_tokens = c;
                     self.total_tokens = t;
                     if let Some(pd) = usage.get("prompt_tokens_details") {
-                        self.cached_tokens = pd.get("cached_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.cached_tokens = pd
+                            .get("cached_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        logger::debug("translate_response", &format!(
+                            "[usage] KV-cache hit: cached_tokens={} / prompt_tokens={} ({:.1}% hit rate)",
+                            self.cached_tokens, p,
+                            if p > 0 { self.cached_tokens as f64 / p as f64 * 100.0 } else { 0.0 }
+                       ));
+                    }
+                    if self.cached_tokens == 0 && p > 0 {
+                        logger::debug("translate_response", &format!(
+                            "[usage] KV-cache MISS: no prompt_tokens_details.cached_tokens in response (prompt_tokens={})", p
+                       ));
                     }
                     if let Some(od) = usage.get("output_tokens_details") {
-                        self.reasoning_tokens = od.get("reasoning_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        self.reasoning_tokens = od
+                            .get("reasoning_tokens")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
                     }
                 }
             }
@@ -296,7 +337,10 @@ impl ResponseTranslator {
                     None => continue,
                 };
 
-                let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str()).unwrap_or("");
+                let finish_reason = choice
+                    .get("finish_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !finish_reason.is_empty() {
                     self.completion_pending = true;
                 }
@@ -348,7 +392,11 @@ impl ResponseTranslator {
                 // Looking for opening think tag. Models emit two variants:
                 //   Kimi/GLM:   thinking (7 chars)
                 //   DeepSeek:  thinking (10 chars)
-                let (open_pos, open_len) = match (self.think_pending.find("\x3c\x74\x68\x69\x6e\x6b\x3e"), self.think_pending.find("\x3c\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e")) {
+                let (open_pos, open_len) = match (
+                    self.think_pending.find("\x3c\x74\x68\x69\x6e\x6b\x3e"),
+                    self.think_pending
+                        .find("\x3c\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e"),
+                ) {
                     (Some(s), Some(l)) if s <= l => (Some(s), 7),
                     (Some(_), Some(l)) => (Some(l), 10),
                     (Some(s), None) => (Some(s), 7),
@@ -373,8 +421,12 @@ impl ResponseTranslator {
                 } else {
                     // No complete opening tag. Hold back a possible partial
                     // tag prefix and emit the rest as text.
-                    let suffix_len = longest_suffix_prefix(&self.think_pending, "\x3c\x74\x68\x69\x6e\x6b\x3e")
-                        .max(longest_suffix_prefix(&self.think_pending, "\x3c\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e"));
+                    let suffix_len =
+                        longest_suffix_prefix(&self.think_pending, "\x3c\x74\x68\x69\x6e\x6b\x3e")
+                            .max(longest_suffix_prefix(
+                                &self.think_pending,
+                                "\x3c\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e",
+                            ));
                     let emit_len = self.think_pending.len() - suffix_len;
                     if emit_len > 0 {
                         let mut taken = std::mem::take(&mut self.think_pending);
@@ -389,7 +441,11 @@ impl ResponseTranslator {
             // in_think_tag is true: looking for closing think tag.
             //   Kimi/GLM:   response (8 chars)
             //   DeepSeek:  response (11 chars)
-            let (close_pos, close_len) = match (self.think_pending.find("\x3c\x2f\x74\x68\x69\x6e\x6b\x3e"), self.think_pending.find("\x3c\x2f\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e")) {
+            let (close_pos, close_len) = match (
+                self.think_pending.find("\x3c\x2f\x74\x68\x69\x6e\x6b\x3e"),
+                self.think_pending
+                    .find("\x3c\x2f\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e"),
+            ) {
                 (Some(s), Some(l)) if s <= l => (Some(s), 8),
                 (Some(_), Some(l)) => (Some(l), 11),
                 (Some(s), None) => (Some(s), 8),
@@ -411,7 +467,8 @@ impl ResponseTranslator {
                 }
                 self.in_think_tag = false;
                 // Trim leading newlines that typically follow the closing tag.
-                let trim_len = self.think_pending.len() - self.think_pending.trim_start_matches('\n').len();
+                let trim_len =
+                    self.think_pending.len() - self.think_pending.trim_start_matches('\n').len();
                 if trim_len > 0 {
                     self.think_pending.drain(..trim_len);
                 }
@@ -419,8 +476,12 @@ impl ResponseTranslator {
             } else {
                 // No complete closing tag. Hold back a possible partial tag
                 // prefix and emit the rest as visible text.
-                let suffix_len = longest_suffix_prefix(&self.think_pending, "\x3c\x2f\x74\x68\x69\x6e\x6b\x3e")
-                    .max(longest_suffix_prefix(&self.think_pending, "\x3c\x2f\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e"));
+                let suffix_len =
+                    longest_suffix_prefix(&self.think_pending, "\x3c\x2f\x74\x68\x69\x6e\x6b\x3e")
+                        .max(longest_suffix_prefix(
+                            &self.think_pending,
+                            "\x3c\x2f\x74\x68\x69\x6e\x6b\x69\x6e\x67\x3e",
+                        ));
                 let emit_len = self.think_pending.len() - suffix_len;
                 if emit_len > 0 {
                     let mut taken = std::mem::take(&mut self.think_pending);
@@ -443,102 +504,112 @@ impl ResponseTranslator {
         // just a standalone think tag. This avoids corrupting content where
         // the model legitimately mentions tags in code or text.
         let trimmed = content.trim();
-        if trimmed == "<think>" || trimmed == "</think>"
-            || trimmed == "<thinking>" || trimmed == "</thinking>" {
+        if trimmed == "<think>"
+            || trimmed == "</think>"
+            || trimmed == "<thinking>"
+            || trimmed == "</thinking>"
+        {
             return String::new();
         }
         content.to_string()
     }
 
-   fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
-       let mut out = Vec::new();
-       // Safety net: strip any orphaned think tags that leaked from old
-       // cached conversation history (generated before the dual-tag fix).
-       let content = Self::strip_orphan_think_tags(content);
-       if content.is_empty() {
-           return out;
-       }
+    fn emit_text_delta(&mut self, idx: usize, content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        // Safety net: strip any orphaned think tags that leaked from old
+        // cached conversation history (generated before the dual-tag fix).
+        let content = Self::strip_orphan_think_tags(content);
+        if content.is_empty() {
+            return out;
+        }
 
-       // Single entry() call to get-or-insert the MessageState, then extract
-       // the values we need so no further HashMap lookups are required in the
-       // hot path. Previously this did 5+ separate lookups per text delta.
-       let (msg_output_index, item_id, need_item_added, need_content_added) = {
-           if !self.msg_states.contains_key(&idx) {
-               let ix = self.alloc_output_index();
-               let item_id = format!("msg_{}_{}", self.response_id, idx);
-               self.msg_states.insert(idx, MessageState {
-                   text_buf: String::new(),
-                   output_ix: ix,
-                   item_added: true,
-                   content_added: true,
-                   item_done: false,
-                   item_id: item_id.clone(),
-               });
-               (ix, item_id, true, true)
-           } else {
-               // Single lookup via get_mut to read values and set flags.
-               // We need to read output_ix, item_id, item_added, content_added.
-               // Then set item_added=true and content_added=true after emitting.
-               // But we can't hold &mut across emit calls, so extract first.
-               let ms = self.msg_states.get_mut(&idx).unwrap();
-               let ix = ms.output_ix;
-               let iid = ms.item_id.clone();
-               let need_item = !ms.item_added;
-               let need_content = !ms.content_added;
-               ms.item_added = true;
-               ms.content_added = true;
-               (ix, iid, need_item, need_content)
-           }
-       };
+        // Single entry() call to get-or-insert the MessageState, then extract
+        // the values we need so no further HashMap lookups are required in the
+        // hot path. Previously this did 5+ separate lookups per text delta.
+        let (msg_output_index, item_id, need_item_added, need_content_added) = {
+            if !self.msg_states.contains_key(&idx) {
+                let ix = self.alloc_output_index();
+                let item_id = format!("msg_{}_{}", self.response_id, idx);
+                self.msg_states.insert(
+                    idx,
+                    MessageState {
+                        text_buf: String::new(),
+                        output_ix: ix,
+                        item_added: true,
+                        content_added: true,
+                        item_done: false,
+                        item_id: item_id.clone(),
+                    },
+                );
+                (ix, item_id, true, true)
+            } else {
+                // Single lookup via get_mut to read values and set flags.
+                // We need to read output_ix, item_id, item_added, content_added.
+                // Then set item_added=true and content_added=true after emitting.
+                // But we can't hold &mut across emit calls, so extract first.
+                let ms = self.msg_states.get_mut(&idx).unwrap();
+                let ix = ms.output_ix;
+                let iid = ms.item_id.clone();
+                let need_item = !ms.item_added;
+                let need_content = !ms.content_added;
+                ms.item_added = true;
+                ms.content_added = true;
+                (ix, iid, need_item, need_content)
+            }
+        };
 
         if need_item_added {
-           let item = json!({
-               "type": "response.output_item.added",
-               "sequence_number": self.next_seq(),
-               "output_index": msg_output_index,
-               "item": {
-                   "id": item_id,
-                   "type": "message",
-                   "status": "in_progress",
-                   "content": [],
-                   "role": "assistant",
-               }
-           });
-           out.push(self.emit("response.output_item.added", item));
-       }
+            let item = json!({
+                "type": "response.output_item.added",
+                "sequence_number": self.next_seq(),
+                "output_index": msg_output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "content": [],
+                    "role": "assistant",
+                }
+            });
+            out.push(self.emit("response.output_item.added", item));
+        }
 
         if need_content_added {
-           let part = json!({
-               "type": "response.content_part.added",
-               "sequence_number": self.next_seq(),
-               "item_id": item_id,
-               "output_index": msg_output_index,
-               "content_index": 0,
-               "part": {
-                   "type": "output_text",
-                   "annotations": [],
-                   "logprobs": [],
-                   "text": "",
-               }
-           });
-           out.push(self.emit("response.content_part.added", part));
-       }
+            let part = json!({
+                "type": "response.content_part.added",
+                "sequence_number": self.next_seq(),
+                "item_id": item_id,
+                "output_index": msg_output_index,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "annotations": [],
+                    "logprobs": [],
+                    "text": "",
+                }
+            });
+            out.push(self.emit("response.content_part.added", part));
+        }
 
-       let delta = json!({
-           "type": "response.output_text.delta",
-           "sequence_number": self.next_seq(),
-           "item_id": item_id,
-           "output_index": msg_output_index,
-           "content_index": 0,
-           "delta": content,
-           "logprobs": [],
-       });
-       out.push(self.emit("response.output_text.delta", delta));
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "sequence_number": self.next_seq(),
+            "item_id": item_id,
+            "output_index": msg_output_index,
+            "content_index": 0,
+            "delta": content,
+            "logprobs": [],
+        });
+        out.push(self.emit("response.output_text.delta", delta));
 
-        self.msg_states.get_mut(&idx).unwrap().text_buf.push_str(&content);
+        self.msg_states
+            .get_mut(&idx)
+            .unwrap()
+            .text_buf
+            .push_str(&content);
 
-       out
-   }
+        out
+    }
 
     fn handle_reasoning_content(&mut self, idx: usize, rc: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -574,20 +645,20 @@ impl ResponseTranslator {
                 }
             });
             out.push(self.emit("response.reasoning_summary_part.added", part));
-       }
+        }
 
-       let rix = self.reasoning_index.unwrap();
+        let rix = self.reasoning_index.unwrap();
         let seq = self.next_seq();
         let rid = self.reasoning_id.as_ref().unwrap();
 
-      let delta = json!({
-           "type": "response.reasoning_summary_text.delta",
-            "sequence_number": seq,
-           "item_id": rid,
-           "output_index": rix,
-           "summary_index": 0,
-           "delta": rc,
-       });
+        let delta = json!({
+            "type": "response.reasoning_summary_text.delta",
+             "sequence_number": seq,
+            "item_id": rid,
+            "output_index": rix,
+            "summary_index": 0,
+            "delta": rc,
+        });
         out.push(self.emit("response.reasoning_summary_text.delta", delta));
 
         self.reasoning_buf.push_str(rc);
@@ -595,58 +666,57 @@ impl ResponseTranslator {
         out
     }
 
-   fn stop_reasoning(&mut self) -> Vec<String> {
-       let mut out = Vec::new();
-       if let Some(rid) = self.reasoning_id.take() {
-           let rix = self.reasoning_index.take().unwrap();
+    fn stop_reasoning(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(rid) = self.reasoning_id.take() {
+            let rix = self.reasoning_index.take().unwrap();
 
-           // Take ownership of the buffer instead of cloning it 3×.
-           // After this point reasoning_buf is empty, so the explicit
-           // .clear() below is no longer needed.
-          let full_reasoning = std::mem::take(&mut self.reasoning_buf);
+            // Take ownership of the buffer instead of cloning it 3×.
+            // After this point reasoning_buf is empty, so the explicit
+            // .clear() below is no longer needed.
+            let full_reasoning = std::mem::take(&mut self.reasoning_buf);
 
-          let done = json!({
-              "type": "response.reasoning_summary_text.done",
-              "sequence_number": self.next_seq(),
-              "item_id": rid,
-              "output_index": rix,
-              "summary_index": 0,
-               "text": &full_reasoning,
-          });
-          out.push(self.emit("response.reasoning_summary_text.done", done));
+            let done = json!({
+                "type": "response.reasoning_summary_text.done",
+                "sequence_number": self.next_seq(),
+                "item_id": rid,
+                "output_index": rix,
+                "summary_index": 0,
+                 "text": &full_reasoning,
+            });
+            out.push(self.emit("response.reasoning_summary_text.done", done));
 
-          let part_done = json!({
-              "type": "response.reasoning_summary_part.done",
-              "sequence_number": self.next_seq(),
-              "item_id": rid,
-              "output_index": rix,
-              "summary_index": 0,
-              "part": {
-                  "type": "summary_text",
-                   "text": &full_reasoning,
-              }
-          });
-          out.push(self.emit("response.reasoning_summary_part.done", part_done));
+            let part_done = json!({
+                "type": "response.reasoning_summary_part.done",
+                "sequence_number": self.next_seq(),
+                "item_id": rid,
+                "output_index": rix,
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                     "text": &full_reasoning,
+                }
+            });
+            out.push(self.emit("response.reasoning_summary_part.done", part_done));
 
-           let item_done = json!({
-               "type": "response.output_item.done",
-               "sequence_number": self.next_seq(),
-               "output_index": rix,
-               "item": {
-                   "id": rid,
-                   "type": "reasoning",
-                   "status": "completed",
-                   "summary": [{
-                       "type": "summary_text",
-                       "text": full_reasoning,
-                   }],
-               }
-           });
-           out.push(self.emit("response.output_item.done", item_done));
-
-       }
-       out
-   }
+            let item_done = json!({
+                "type": "response.output_item.done",
+                "sequence_number": self.next_seq(),
+                "output_index": rix,
+                "item": {
+                    "id": rid,
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": full_reasoning,
+                    }],
+                }
+            });
+            out.push(self.emit("response.output_item.done", item_done));
+        }
+        out
+    }
 
     fn handle_tool_calls(&mut self, idx: usize, tcs: &[Value]) -> Vec<String> {
         let mut out = Vec::new();
@@ -655,40 +725,35 @@ impl ResponseTranslator {
             out.extend(self.stop_reasoning());
         }
 
-        if self.msg_states.get(&idx).map(|s| s.item_added && !s.item_done).unwrap_or(false) {
+        if self
+            .msg_states
+            .get(&idx)
+            .map(|s| s.item_added && !s.item_done)
+            .unwrap_or(false)
+        {
             out.extend(self.close_message(idx));
         }
 
         for tc in tcs {
             let tool_idx = tc.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
             let key = Self::tool_state_key(idx, tool_idx);
-            let new_call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name_chunk = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let new_call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name_chunk = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             if !name_chunk.is_empty() {
-                let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
-                    args_buf: String::new(),
-                    name: String::new(),
-                    call_id: String::new(),
-                    item_id: String::new(),
-                    output_ix: 0,
-                    item_done: false,
-                    item_added: false,
-                });
-                fs.name = name_chunk;
-            }
-
-            let should_emit_item = self.func_states.get(&key).map(|s| !s.item_added).unwrap_or(true)
-                && !new_call_id.is_empty();
-
-           if should_emit_item {
-                // Set up the state entry first, then extract the values we
-                // need so no &mut borrow is held across emit/next_seq calls.
-                let oix = self.alloc_output_index();
-                let name = self.func_states.get(&key).map(|s| s.name.clone()).unwrap_or_default();
-                let precomputed_item_id = format!("fc_{}", new_call_id);
-                {
-                    let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
+                let fs = self
+                    .func_states
+                    .entry(key.clone())
+                    .or_insert_with(|| FunctionCallState {
                         args_buf: String::new(),
                         name: String::new(),
                         call_id: String::new(),
@@ -697,6 +762,39 @@ impl ResponseTranslator {
                         item_done: false,
                         item_added: false,
                     });
+                fs.name = name_chunk;
+            }
+
+            let should_emit_item = self
+                .func_states
+                .get(&key)
+                .map(|s| !s.item_added)
+                .unwrap_or(true)
+                && !new_call_id.is_empty();
+
+            if should_emit_item {
+                // Set up the state entry first, then extract the values we
+                // need so no &mut borrow is held across emit/next_seq calls.
+                let oix = self.alloc_output_index();
+                let name = self
+                    .func_states
+                    .get(&key)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                let precomputed_item_id = format!("fc_{}", new_call_id);
+                {
+                    let fs =
+                        self.func_states
+                            .entry(key.clone())
+                            .or_insert_with(|| FunctionCallState {
+                                args_buf: String::new(),
+                                name: String::new(),
+                                call_id: String::new(),
+                                item_id: String::new(),
+                                output_ix: 0,
+                                item_done: false,
+                                item_added: false,
+                            });
                     fs.call_id = new_call_id.clone();
                     fs.item_id = precomputed_item_id.clone();
                     fs.output_ix = oix;
@@ -718,40 +816,50 @@ impl ResponseTranslator {
                             "name": name,
                         }
                     })
-               } else {
-                   json!({
-                       "type": "response.output_item.added",
-                       "sequence_number": self.next_seq(),
-                        "output_index": oix,
-                       "item": {
-                           "id": precomputed_item_id,
-                           "type": "function_call",
-                           "status": "in_progress",
-                           "arguments": "",
-                           "call_id": new_call_id,
-                           "name": name,
-                       }
-                   })
+                } else {
+                    json!({
+                        "type": "response.output_item.added",
+                        "sequence_number": self.next_seq(),
+                         "output_index": oix,
+                        "item": {
+                            "id": precomputed_item_id,
+                            "type": "function_call",
+                            "status": "in_progress",
+                            "arguments": "",
+                            "call_id": new_call_id,
+                            "name": name,
+                        }
+                    })
                 };
                 out.push(self.emit("response.output_item.added", item));
             }
 
-            if let Some(args) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
-               if !args.is_empty() {
+            if let Some(args) = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+            {
+                if !args.is_empty() {
                     let (item_id, oix, is_custom) = {
-                       let fs = self.func_states.entry(key.clone()).or_insert_with(|| FunctionCallState {
-                           args_buf: String::new(),
-                           name: String::new(),
-                           call_id: new_call_id.clone(),
-                           item_id: format!("fc_{}", new_call_id),
-                           output_ix: 0,
-                           item_done: false,
-                           item_added: false,
-                       });
-                       fs.args_buf.push_str(args);
-                       let iid = if fs.item_id.is_empty() { format!("fc_{}", new_call_id) } else { fs.item_id.clone() };
+                        let fs = self.func_states.entry(key.clone()).or_insert_with(|| {
+                            FunctionCallState {
+                                args_buf: String::new(),
+                                name: String::new(),
+                                call_id: new_call_id.clone(),
+                                item_id: format!("fc_{}", new_call_id),
+                                output_ix: 0,
+                                item_done: false,
+                                item_added: false,
+                            }
+                        });
+                        fs.args_buf.push_str(args);
+                        let iid = if fs.item_id.is_empty() {
+                            format!("fc_{}", new_call_id)
+                        } else {
+                            fs.item_id.clone()
+                        };
                         (iid, fs.output_ix, is_custom_tool(&fs.name))
-                   };
+                    };
 
                     if !item_id.is_empty() && !is_custom {
                         // Regular function calls: stream the raw argument
@@ -854,12 +962,19 @@ impl ResponseTranslator {
             out.extend(self.stop_reasoning());
         }
 
-        if self.msg_states.get(&idx).map(|s| s.item_added && !s.item_done).unwrap_or(false) {
+        if self
+            .msg_states
+            .get(&idx)
+            .map(|s| s.item_added && !s.item_done)
+            .unwrap_or(false)
+        {
             out.extend(self.close_message(idx));
         }
 
         let prefix = format!("{}:", idx);
-        let keys_to_close: Vec<String> = self.func_states.iter()
+        let keys_to_close: Vec<String> = self
+            .func_states
+            .iter()
             .filter(|(k, s)| k.starts_with(&prefix) && !s.item_done)
             .map(|(k, _)| k.clone())
             .collect();
@@ -884,7 +999,13 @@ impl ResponseTranslator {
             // Use mem::take to avoid cloning the potentially large args buffer.
             // This is the final operation on this state — the buffer is no
             // longer needed after close.
-            (fs.item_id.clone(), fs.call_id.clone(), fs.output_ix, fs.args_buf.clone(), fs.name.clone())
+            (
+                fs.item_id.clone(),
+                fs.call_id.clone(),
+                fs.output_ix,
+                fs.args_buf.clone(),
+                fs.name.clone(),
+            )
         };
 
         let is_custom = is_custom_tool(&name);
@@ -993,7 +1114,9 @@ impl ResponseTranslator {
             out.extend(self.stop_reasoning());
         }
 
-        let open_msgs: Vec<usize> = self.msg_states.iter()
+        let open_msgs: Vec<usize> = self
+            .msg_states
+            .iter()
             .filter(|(_, s)| s.item_added && !s.item_done)
             .map(|(k, _)| *k)
             .collect();
@@ -1001,7 +1124,9 @@ impl ResponseTranslator {
             out.extend(self.close_message(idx));
         }
 
-        let open_funcs: Vec<String> = self.func_states.iter()
+        let open_funcs: Vec<String> = self
+            .func_states
+            .iter()
             .filter(|(_, s)| s.item_added && !s.item_done)
             .map(|(k, _)| k.clone())
             .collect();
@@ -1035,11 +1160,28 @@ impl ResponseTranslator {
         });
 
         if let Some(req) = &self.request_json {
-            for field in ["instructions", "max_output_tokens", "max_tool_calls", "model",
-                "parallel_tool_calls", "previous_response_id", "prompt_cache_key",
-                "reasoning", "safety_identifier", "service_tier", "store",
-                "temperature", "text", "tool_choice", "tools", "top_logprobs",
-                "top_p", "truncation", "user", "metadata"] {
+            for field in [
+                "instructions",
+                "max_output_tokens",
+                "max_tool_calls",
+                "model",
+                "parallel_tool_calls",
+                "previous_response_id",
+                "prompt_cache_key",
+                "reasoning",
+                "safety_identifier",
+                "service_tier",
+                "store",
+                "temperature",
+                "text",
+                "tool_choice",
+                "tools",
+                "top_logprobs",
+                "top_p",
+                "truncation",
+                "user",
+                "metadata",
+            ] {
                 if let Some(v) = req.get(field) {
                     response[field] = v.clone();
                 }
@@ -1217,7 +1359,11 @@ impl ResponseTranslator {
 /// Convert a non-streaming chat completions response to a Responses API response object.
 /// Used for compact and non-streaming /v1/responses.
 pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) -> Value {
-    let id = raw.get("id").and_then(|v| v.as_str()).unwrap_or("resp_unknown").to_string();
+    let id = raw
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("resp_unknown")
+        .to_string();
     let response_id = if let Some(rest) = id.strip_prefix("chatcmpl_") {
         format!("resp_{}", rest)
     } else if let Some(rest) = id.strip_prefix("resp_") {
@@ -1226,10 +1372,14 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
         format!("resp_{}", id)
     };
 
-    let created = raw.get("created").and_then(|v| v.as_i64()).unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let created = raw
+        .get("created")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
     // end_turn: false if the model emitted tool calls, true otherwise.
-    let has_tool_calls = raw.get("choices")
+    let has_tool_calls = raw
+        .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|c| c.first())
         .and_then(|c| c.get("message"))
@@ -1247,11 +1397,28 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
     });
 
     if let Some(req) = request_json {
-        for field in ["instructions", "max_output_tokens", "max_tool_calls", "model",
-            "parallel_tool_calls", "previous_response_id", "prompt_cache_key",
-            "reasoning", "safety_identifier", "service_tier", "store",
-            "temperature", "text", "tool_choice", "tools", "top_logprobs",
-            "top_p", "truncation", "user", "metadata"] {
+        for field in [
+            "instructions",
+            "max_output_tokens",
+            "max_tool_calls",
+            "model",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "prompt_cache_key",
+            "reasoning",
+            "safety_identifier",
+            "service_tier",
+            "store",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "truncation",
+            "user",
+            "metadata",
+        ] {
             if let Some(v) = req.get(field) {
                 resp[field] = v.clone();
             }
@@ -1262,15 +1429,16 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
 
     let mut output = Vec::new();
 
-    let rc_text = raw.get("choices")
+    let rc_text = raw
+        .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("reasoning_content"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let include_reasoning = !rc_text.is_empty()
-        || request_json.and_then(|r| r.get("reasoning")).is_some();
+    let include_reasoning =
+        !rc_text.is_empty() || request_json.and_then(|r| r.get("reasoning")).is_some();
 
     if include_reasoning {
         let rid = if let Some(rest) = response_id.strip_prefix("resp_") {
@@ -1317,9 +1485,23 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
 
                 if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tcs {
-                        let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let is_custom = is_custom_tool(&name);
                         let item = if is_custom {
                             let input = extract_custom_tool_input(&args);
@@ -1351,7 +1533,10 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
     resp["output"] = json!(output);
 
     if let Some(usage) = raw.get("usage") {
-        if usage.get("prompt_tokens").is_some() || usage.get("completion_tokens").is_some() || usage.get("total_tokens").is_some() {
+        if usage.get("prompt_tokens").is_some()
+            || usage.get("completion_tokens").is_some()
+            || usage.get("total_tokens").is_some()
+        {
             resp["usage"] = json!({
                 "input_tokens": usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
                 "input_tokens_details": {
