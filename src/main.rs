@@ -519,7 +519,13 @@ pub async fn handle_responses_ws(
         // inserted (and currently active) response_id — causing cache
         // misses on the very next incremental request.
         let mut cache_insertion_order: std::collections::VecDeque<String> =
-            std::collections::VecDeque::new();
+           std::collections::VecDeque::new();
+
+        // Track previous turn's Chat Completions messages to detect
+        // pure-append (good for vLLM prefix/KV-cache) vs prefix-change
+        // (KV-cache break). Reset on each new WebSocket connection.
+        let mut prev_cc_messages: Option<Vec<Value>> = None;
+        let mut prev_cc_msg_count: usize = 0;
 
         // ── Connection-reuse loop ──────────────────────────────────────
         // Codex opens ONE WebSocket connection and sends multiple turns
@@ -712,6 +718,125 @@ pub async fn handle_responses_ws(
                 is_stream,
             );
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
+            logger::debug("ws", &format!("[{}] cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {}", conn_short, cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(), cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0)));
+
+            // Debug: dump message roles and content previews
+           if let Some(msgs) = cc_payload.get("messages").and_then(|m| m.as_array()) {
+               let mut msg_summary = Vec::new();
+               for (i, msg) in msgs.iter().enumerate() {
+                   let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                   if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                       let names: Vec<&str> = tc.iter().map(|c| c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("?")).collect();
+                       msg_summary.push(format!("  [{}] {} tool_calls:{}", i, role, names.join(",")));
+                   } else if role == "tool" {
+                       let preview = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").chars().take(80).collect::<String>();
+                       msg_summary.push(format!("  [{}] tool -> {}", i, preview));
+                   } else {
+                       let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                       let preview = content.chars().take(80).collect::<String>();
+                       msg_summary.push(format!("  [{}] {}: {}", i, role, preview));
+                   }
+               }
+               logger::debug("ws", &format!("[{}] cc_payload messages:\n{}", conn_short, msg_summary.join("\n")));
+           }
+
+            // Debug: diff messages vs previous turn to verify only-append semantics.
+            // Logs the message count, how many are unchanged prefix, and what's new.
+            {
+                let msgs = cc_payload.get("messages").and_then(|m| m.as_array());
+                if let Some(msgs) = msgs {
+                    let curr_len = msgs.len();
+                    let prev_len = prev_cc_msg_count;
+                    // Determine the shared prefix length
+                    let shared = if let Some(ref prev_msgs) = prev_cc_messages {
+                        let mut s = 0;
+                        for (i, pm) in prev_msgs.iter().enumerate() {
+                            if i >= curr_len { break; }
+                            // Compare by role + has_tool_calls + content prefix (fast heuristic)
+                            let cm = &msgs[i];
+                            let pm_role = pm.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                            let cm_role = cm.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                            let pm_has_tc = pm.get("tool_calls").is_some();
+                            let cm_has_tc = cm.get("tool_calls").is_some();
+                            let pm_content = pm.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let cm_content = cm.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            if pm_role == cm_role && pm_has_tc == cm_has_tc
+                                && pm_content.get(..60.min(pm_content.len())) == cm_content.get(..60.min(cm_content.len()))
+                            {
+                                s = i + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        s
+                    } else { 0 };
+                    let new_count = curr_len.saturating_sub(shared);
+
+                    // Build a compact signature of each message for hashing
+                    let sig = |m: &Value| -> String {
+                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                        if m.get("tool_calls").is_some() {
+                            let names: Vec<&str> = m.get("tool_calls")
+                                .and_then(|v| v.as_array())
+                                .map(|tc| tc.iter().map(|c| c.get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|n| n.as_str()).unwrap_or("?")).collect())
+                                .unwrap_or_default();
+                            format!("{}+tc({})", role, names.join(","))
+                        } else if role == "tool" {
+                            let call_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                            format!("tool[{}]", &call_id[..call_id.len().min(12)])
+                        } else {
+                            let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            format!("{}:'{}'", role, &c[..c.len().min(40)])
+                        }
+                    };
+
+                    let curr_sigs: Vec<String> = msgs.iter().map(|m| sig(m)).collect();
+
+                    if shared == prev_len && new_count > 0 && shared > 0 {
+                        // Pure append — ideal case
+                        let new_items: Vec<String> = curr_sigs[shared..].iter().cloned().collect();
+                        logger::debug("ws", &format!(
+                            "[{}] msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
+                            conn_short, shared, new_count, curr_len, new_items.join(", ")
+                        ));
+                    } else if shared < prev_len && prev_len > 0 {
+                        // Prefix changed — KV-cache break!
+                        let removed: Vec<String> = if let Some(ref prev_msgs) = prev_cc_messages {
+                            prev_msgs[shared..].iter().map(|m| sig(m)).collect()
+                        } else { vec![] };
+                        let added: Vec<String> = if shared < curr_len {
+                            curr_sigs[shared..].iter().cloned().collect()
+                        } else { vec![] };
+                        logger::warn("ws", &format!(
+                            "[{}] msg_diff: PREFIX CHANGED (KV-cache break!) | shared={} removed={} added={} total={}",
+                            conn_short, shared, removed.len(), added.len(), curr_len
+                        ));
+                        logger::warn("ws", &format!(
+                            "[{}]   removed: [{}]", conn_short, removed.join(", ")
+                        ));
+                        logger::warn("ws", &format!(
+                            "[{}]   added:   [{}]", conn_short, added.join(", ")
+                        ));
+                    } else if prev_len == 0 {
+                        // First turn
+                        logger::debug("ws", &format!(
+                            "[{}] msg_diff: FIRST TURN | total={}", conn_short, curr_len
+                        ));
+                    } else {
+                        // shared == prev_len, new_count == 0 (no change?) or edge case
+                        logger::debug("ws", &format!(
+                            "[{}] msg_diff: no change | prev={} curr={} shared={}",
+                            conn_short, prev_len, curr_len, shared
+                        ));
+                    }
+
+                    // Store for next turn
+                    prev_cc_messages = Some(msgs.clone());
+                    prev_cc_msg_count = curr_len;
+                }
+            }
 
             // Context size warning: estimate tokens and log if exceeds model's context window.
             // We do NOT trim here — codex has its own context management (auto-compaction
@@ -845,9 +970,13 @@ pub async fn handle_responses_ws(
                                while let Some(rel_pos) = buffer[read_pos..].find('\n') {
                                     let pos = read_pos + rel_pos;
                                     let events = translator.process_line(&buffer[read_pos..pos]);
+                                    let _raw_line: String = buffer[read_pos..pos].chars().take(300).collect();
+                                    logger::debug("ws", &format!("[{}] ← upstream line: {}", conn_short, _raw_line));
                                     read_pos = pos + 1;
                                    for event in events {
                                        stream_event_count += 1;
+                                       let _preview: String = event.chars().take(500).collect();
+                                       logger::debug("ws", &format!("[{}] → codex #{} (stream): {}", conn_short, stream_event_count, _preview));
                                        // In raw JSON mode, process_line returns JSON objects directly.
                                        if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                                            break 'connection; // socket dead
@@ -903,6 +1032,8 @@ pub async fn handle_responses_ws(
                let events = translator.process_line(&buffer[read_pos..]);
                for event in events {
                    stream_event_count += 1;
+                   let _preview: String = event.chars().take(500).collect();
+                   logger::debug("ws", &format!("[{}] → codex #{} (flush): {}", conn_short, stream_event_count, _preview));
                     if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                         break 'connection; // socket dead
                     }
@@ -934,6 +1065,8 @@ pub async fn handle_responses_ws(
             // missing output, usage, model, and other fields.
             let done_events = translator.process_line("data: [DONE]");
             for event in done_events {
+                let _preview: String = event.chars().take(500).collect();
+                logger::debug("ws", &format!("[{}] → codex (DONE flush): {}", conn_short, _preview));
                 if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                     break 'connection; // socket dead
                 }
@@ -949,6 +1082,7 @@ pub async fn handle_responses_ws(
             // tool calls. The LLM would not see its own prior output and
             // would re-do the same work, causing an infinite loop.
             let output_items = translator.get_output_items();
+            logger::debug("ws", &format!("[{}] get_output_items: {} items — types: [{}]", conn_short, output_items.len(), output_items.iter().map(|item| item.get("type").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>().join(", ")));
             if !output_items.is_empty() {
                 if let Some(cached_arc) = response_request_cache.get(&response_id_for_cache).cloned() {
                     let mut cached_arc = cached_arc;
@@ -968,6 +1102,7 @@ pub async fn handle_responses_ws(
 
             // Turn complete — loop back to recv() the next request on the
             // SAME connection.  No log spam; only log on actual close.
+            logger::debug("ws", &format!("[{}] Turn complete ({} events sent), looping back to recv() next request", conn_short, stream_event_count));
         }
 
         logger::info("ws", &format!("[{}] WebSocket connection closed", conn_short));

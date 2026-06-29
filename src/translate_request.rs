@@ -50,17 +50,37 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
         let messages = out["messages"].as_array_mut().unwrap();
 
         let flush_pending = |pending: &mut Vec<Value>, pending_ids: &mut Vec<String>, messages: &mut Vec<Value>, awaiting: &mut std::collections::HashSet<String>| {
-            if pending.is_empty() {
-                return;
-            }
-            messages.push(json!({"role": "assistant", "tool_calls": pending.clone()}));
-            for id in pending_ids.drain(..) {
-                if !id.trim().is_empty() {
-                    awaiting.insert(id);
+           if pending.is_empty() {
+               return;
+           }
+            // Merge tool_calls into the previous assistant message if it has
+            // content but no tool_calls. The Chat Completions API expects a
+            // single assistant message with both content and tool_calls —
+            // two consecutive assistant messages confuse some models (e.g.
+            // qwen3 emits EOS after the text preamble instead of continuing
+            // to a tool call on subsequent turns).
+            let should_merge = messages.last()
+                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                .map(|r| r == "assistant")
+                .unwrap_or(false)
+                && messages.last()
+                    .map(|m| m.get("tool_calls").is_none())
+                    .unwrap_or(false);
+
+            if should_merge {
+                if let Some(last) = messages.last_mut() {
+                    last["tool_calls"] = json!(pending.clone());
                 }
+            } else {
+                messages.push(json!({"role": "assistant", "tool_calls": pending.clone()}));
             }
-            pending.clear();
-        };
+           for id in pending_ids.drain(..) {
+               if !id.trim().is_empty() {
+                   awaiting.insert(id);
+               }
+           }
+           pending.clear();
+       };
 
         let flush_deferred = |deferred: &mut Vec<Value>, messages: &mut Vec<Value>| {
             for msg in deferred.drain(..) {
@@ -274,24 +294,45 @@ pub fn inject_thinking(mut payload: Value, model: &str) -> Value {
     // Remove "reasoning" object (not valid for chat completions)
     payload.as_object_mut().map(|m| m.remove("reasoning"));
 
-    // Inject chat_template_kwargs
-    if let Some(effort) = &effort {
-        if lower_model.contains("deepseek") {
-            let ds_effort = if effort == "xhigh" { "max" } else { "high" };
-            payload["chat_template_kwargs"] = json!({
-                "thinking": true,
-                "reasoning_effort": ds_effort,
-            });
-        } else if lower_model.contains("glm") {
-            let enable_thinking = effort != "low";
-            payload["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
-        }
+   // Inject chat_template_kwargs
+   if let Some(effort) = &effort {
+       if lower_model.contains("deepseek") {
+           let ds_effort = if effort == "xhigh" { "max" } else { "high" };
+           payload["chat_template_kwargs"] = json!({
+               "thinking": true,
+               "reasoning_effort": ds_effort,
+           });
+       } else if lower_model.contains("glm") {
+           let enable_thinking = effort != "low";
+           payload["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
+       }
+   }
+
+    // Qwen3 models: always inject chat_template_kwargs with enable_thinking.
+    // Qwen3-Coder-Instruct defaults to non-thinking, but the chat template
+    // still checks enable_thinking to select the correct output format
+    // (including tool-call formatting). Without it, the model may emit EOS
+    // prematurely after a short text preamble instead of making a tool call.
+    if lower_model.contains("qwen3") || lower_model.contains("qwen-3") {
+        let enable_thinking = match effort.as_deref() {
+            Some("low") | Some("medium") | Some("high") | Some("xhigh") => true,
+            _ => false, // "none" or not set -> non-thinking mode
+        };
+        payload["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
     }
 
-    // Request usage in stream (only if streaming)
-    if payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-        payload["stream_options"] = json!({"include_usage": true});
+    // Set a default max_tokens if not already provided.
+    // Codex doesn't send max_output_tokens for models whose catalog entry
+    // has max_output_tokens = null. Without max_tokens, vLLM may apply a
+    // very small default or the model may behave unpredictably.
+    if payload.get("max_tokens").is_none() {
+        payload["max_tokens"] = json!(16384);
     }
+
+   // Request usage in stream (only if streaming)
+   if payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+       payload["stream_options"] = json!({"include_usage": true});
+   }
 
     payload
 }

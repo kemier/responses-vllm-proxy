@@ -251,15 +251,26 @@ impl ResponseTranslator {
         // Check for usage in the chunk
         if let Some(usage) = parsed.get("usage") {
             if usage.is_object() {
-                self.usage_seen = true;
-                self.prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                self.completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                self.total_tokens = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                if let Some(pd) = usage.get("prompt_tokens_details") {
-                    self.cached_tokens = pd.get("cached_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                }
-                if let Some(od) = usage.get("output_tokens_details") {
-                    self.reasoning_tokens = od.get("reasoning_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let p = usage.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let c = usage.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let t = usage.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                // vLLM streams usage in two chunks:
+                //   1. Real usage (choices: [], prompt_tokens > 0) — after finish_reason
+                //   2. Zero-usage cleanup chunk (choices: [{delta:{}}], all zeros) — on connection close
+                // Never overwrite real usage with zeros — the cleanup chunk
+                // would corrupt the response.completed event sent to codex,
+                // causing "Context 98% left" when it should be ~53%.
+                if p > 0 || c > 0 || t > 0 || !self.usage_seen {
+                    self.usage_seen = true;
+                    self.prompt_tokens = p;
+                    self.completion_tokens = c;
+                    self.total_tokens = t;
+                    if let Some(pd) = usage.get("prompt_tokens_details") {
+                        self.cached_tokens = pd.get("cached_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    }
+                    if let Some(od) = usage.get("output_tokens_details") {
+                        self.reasoning_tokens = od.get("reasoning_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    }
                 }
             }
         }

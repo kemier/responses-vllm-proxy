@@ -341,7 +341,11 @@ def get_reasoning(slug):
     for prefix, profile in reasoning_profiles.items():
         if slug.lower().startswith(prefix):
             return profile["levels"], profile["default"]
-    return [], None
+    # Non-thinking models (e.g. qwen3-coder-instruct): advertise a single
+    # "none" reasoning level. This makes codex's `single_supported_effort`
+    # check true so the model picker closes immediately via
+    # `dismiss_on_select` instead of looping back to the same dialogue.
+    return [{"effort": "none", "description": "Non-reasoning model"}], "none"
 
 def normalize_display_name(slug):
     lower = slug.lower()
@@ -359,6 +363,8 @@ def normalize_display_name(slug):
         return f"Kimi {slug[5:].upper()}"
     if lower.startswith("minimax-"):
         return f"MiniMax {slug[8:].upper()}"
+    if lower.startswith("qwen"):
+        return f"Qwen {slug[4:].upper()}"
     if lower.startswith("gemini-"):
         return f"Gemini {slug[7:]}"
     if lower.startswith("claude-"):
@@ -390,7 +396,9 @@ for i, slug in enumerate(proxy_ids):
         "supported_in_api": True,
         "priority": i,
         "base_instructions": BASE_INSTRUCTIONS,
-        "supports_reasoning_summaries": bool(levels),
+        # Only models with real thinking (low/high/etc.) get reasoning summaries.
+        # "none"-only models are non-reasoning and must not advertise summaries.
+        "supports_reasoning_summaries": any(e["effort"] != "none" for e in levels),
         "support_verbosity": False,
         "default_reasoning_summary": "auto",
         "truncation_policy": {"mode": "bytes", "limit": 10000},
