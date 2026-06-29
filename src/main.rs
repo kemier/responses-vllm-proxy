@@ -792,24 +792,24 @@ pub async fn handle_responses_ws(
                         }
                     };
 
-                    let curr_sigs: Vec<String> = msgs.iter().map(|m| sig(m)).collect();
+                    let curr_sigs: Vec<String> = msgs.iter().map(sig).collect();
 
-                    if shared == prev_len && new_count > 0 && shared > 0 {
-                        // Pure append — ideal case
-                        let new_items: Vec<String> = curr_sigs[shared..].iter().cloned().collect();
-                        logger::debug("ws", &format!(
-                            "[{}] msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
-                            conn_short, shared, new_count, curr_len, new_items.join(", ")
-                        ));
-                    } else if shared < prev_len && prev_len > 0 {
-                        // Prefix changed — KV-cache break!
-                        let removed: Vec<String> = if let Some(ref prev_msgs) = prev_cc_messages {
-                            prev_msgs[shared..].iter().map(|m| sig(m)).collect()
-                        } else { vec![] };
-                        let added: Vec<String> = if shared < curr_len {
-                            curr_sigs[shared..].iter().cloned().collect()
-                        } else { vec![] };
-                        logger::warn("ws", &format!(
+                   if shared == prev_len && new_count > 0 && shared > 0 {
+                       // Pure append — ideal case
+                       let new_items: Vec<String> = curr_sigs[shared..].to_vec();
+                       logger::debug("ws", &format!(
+                           "[{}] msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
+                           conn_short, shared, new_count, curr_len, new_items.join(", ")
+                       ));
+                   } else if shared < prev_len && prev_len > 0 {
+                       // Prefix changed — KV-cache break!
+                       let removed: Vec<String> = if let Some(ref prev_msgs) = prev_cc_messages {
+                           prev_msgs[shared..].iter().map(sig).collect()
+                       } else { vec![] };
+                       let added: Vec<String> = if shared < curr_len {
+                           curr_sigs[shared..].to_vec()
+                       } else { vec![] };
+                       logger::warn("ws", &format!(
                             "[{}] msg_diff: PREFIX CHANGED (KV-cache break!) | shared={} removed={} added={} total={}",
                             conn_short, shared, removed.len(), added.len(), curr_len
                         ));
