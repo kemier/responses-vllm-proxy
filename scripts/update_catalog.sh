@@ -411,9 +411,16 @@ for i, slug in enumerate(proxy_ids):
         "effective_context_window_percent": 100,
        "experimental_supported_tools": [],
         "apply_patch_tool_type": "freeform",
-        "web_search_tool_type": "text",
-        "supports_search_tool": False,
-    }
+       "web_search_tool_type": "text",
+       "supports_search_tool": False,
+   }
+
+    # Advertise Code Mode support. The proxy translates exec/wait freeform
+    # tools to Chat Completions function tools, so all models can use Code
+    # Mode. Setting tool_mode="code_mode" suppresses codex's
+    # "model does not advertise Code Mode support" warning and enables
+    # the Code Mode tool surface (exec + wait) instead of direct tools.
+    entry["tool_mode"] = "code_mode"
 
     if levels:
         entry["supported_reasoning_levels"] = levels
