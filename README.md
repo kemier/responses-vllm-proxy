@@ -53,8 +53,8 @@ flowchart LR
 | **Server & Routes** | [main.rs](src/main.rs) | Axum HTTP/WebSocket server, all route handlers, request orchestration, context estimation, client-disconnect detection |
 | **Config** | [config.rs](src/config.rs) | YAML config loader (`config.yaml`), model alias → backend ID resolution, provider lookup |
 | **Auth** | [auth.rs](src/auth.rs) | MSAL OAuth2 token management — loads from disk, auto-refreshes 5 min before expiry, deduplicates concurrent refreshes via mutex, persists refreshed tokens atomically |
-| **Request Translation** | [translate_request.rs](src/translate_request.rs) | Converts OpenAI Responses API requests → Chat Completions format (instructions→system message, input array→messages, tools schema, function calls, `custom_tool_call`/`apply_patch` handling, reasoning effort injection) |
-| **Response Translation** | [translate_response.rs](src/translate_response.rs) | State machine that converts Chat Completions SSE stream → Responses API SSE events (or raw JSON for WebSocket). Handles thinking/reasoning tags, tool calls, usage aggregation, and non-streaming response conversion |
+| **Request Translation** | [translate_request.rs](src/translate_request.rs) | Converts OpenAI Responses API requests → Chat Completions format (instructions→system message, input array→messages, tools schema, function calls, `custom_tool_call`/`apply_patch` handling, Code Mode `exec`/`wait` tool conversion, reasoning effort injection, qwen3 thinking injection) |
+| **Response Translation** | [translate_response.rs](src/translate_response.rs) | State machine that converts Chat Completions SSE stream → Responses API SSE events (or raw JSON for WebSocket). Handles thinking/reasoning tags, tool calls, usage aggregation (with KV-cache hit/miss logging), qwen3 tool_calls merging, and non-streaming response conversion |
 | **Logger** | [logger.rs](src/logger.rs) | Non-blocking async logger with bounded mpsc channel, background writer task, file rotation (10 MB/file), total size enforcement, per-request error files |
 
 ### Request Lifecycle
@@ -69,9 +69,13 @@ Codex CLI ──POST /v1/responses──▶ ericai-proxy
   │    ├─ instructions → system message
   │    ├─ input[] → messages[] (handles message, function_call, custom_tool_call, function_call_output)
   │    └─ tools[] → Chat Completions tool schema (apply_patch as freeform function)
+  │       ├─ apply_patch (custom/freeform) → function tool with single `input` string param
+  │       ├─ exec (custom/freeform, Code Mode) → function tool with `input` string param
+  │       └─ wait / exec_command / others → pass through as regular function tools
   ├─ translate_request::inject_thinking()
   │    ├─ DeepSeek: chat_template_kwargs = {thinking: true, reasoning_effort}
-  │    └─ GLM: chat_template_kwargs = {enable_thinking}
+  │    ├─ GLM: chat_template_kwargs = {enable_thinking}
+  │    └─ Qwen3: chat_template_kwargs = {enable_thinking: false}, max_tokens = 16384
   ├─ TokenManager::get_token() → MSAL Bearer token (auto-refresh if expiring)
   ├─ POST {base_url}/chat/completions (streaming SSE)
   │
@@ -199,9 +203,11 @@ Generates `~/.codex/model_catalog.json` — the file Codex reads to know which m
 3. **Fetch backend metadata** from `ericai api models.list` (context window, health status, GPU info, modalities)
 4. **Filter**: only include models that are `HEALTHY` + `loaded` + `running ≥ 1` replica
 5. **Build entries**: each entry includes slug, display name, context window, reasoning levels (per-model: DeepSeek/GLM/Kimi/MiMo), truncation policy, supported tools
-6. **Schema drift detection**: warn if Codex has fields not in our entries
-7. **Atomic write**: `.tmp` → `os.replace()` → final catalog
-8. **Validate**: run `codex debug models` again, compare field sets, report stripped/auto-filled fields
+6. **base_instructions**: includes file link format, code fence discipline, and full apply_patch patch grammar (codex's tool description is only 32 chars — the proxy must supply the grammar)
+7. **tool_mode**: set to `"code_mode"` for all models — enables Codex Code Mode (exec/wait tools)
+8. **Schema drift detection**: warn if Codex has fields not in our entries
+9. **Atomic write**: `.tmp` → `os.replace()` → final catalog
+10. **Validate**: run `codex debug models` again, compare field sets, report stripped/auto-filled fields
 
 #### `scripts/check_health.sh` — Health Monitor
 
@@ -220,6 +226,9 @@ Called every 30s by the `start.sh` watcher. Exits `1` if catalog regeneration is
 - **Client disconnect propagation**: HTTP SSE uses an mpsc channel — when the client drops the connection, `tx.send()` fails and the upstream stream is aborted via `CancellationToken`. WebSocket detects dead sockets via failed `socket.send()`.
 - **Empty-stream protection**: If upstream returns an empty stream or errors mid-stream, the proxy sends a `{type: "error"}` event instead of `response.completed` — preventing Codex from treating empty turns as successful (which caused degenerate model behavior).
 - **Cached model catalog**: `~/.codex/model_catalog.json` is loaded once at startup into an `Arc<Option<Value>>` and shared across all handlers — previously it was read from disk on every request (13+ reads per WebSocket connection).
+- **Code Mode tool translation**: Codex's Code Mode uses freeform (grammar-based) tools (`exec`, `apply_patch`) that vLLM's Chat Completions API doesn't support. The proxy converts these to standard function tools with a single `input` string parameter. The `wait` tool is a regular `ToolSpec::Function` and passes through unchanged. Model catalog sets `tool_mode: "code_mode"` to enable Code Mode in Codex.
+- **apply_patch grammar in base_instructions**: Codex's `apply_patch` tool description is only 32 chars (`"Use the apply_patch tool to edit files..."`). For OpenAI's hosted GPT-5, the full patch grammar comes from the model's `base_instructions` and the Responses API's grammar-constrained decoding. Since vLLM supports neither, the proxy injects the complete patch grammar into `base_instructions` via `scripts/update_catalog.sh`. The `exec` tool description (~3000 chars) is built dynamically by codex and needs no extra injection.
+- **KV-cache prefix stability**: The proxy tracks message prefix hashes per turn and logs `KV-cache break!` when the prefix changes. Incremental requests (`previous_response_id`) merge new items into the cached request to preserve prefix stability. vLLM 0.23.0 does not return `prompt_tokens_details.cached_tokens` in API responses, so the proxy logs cache MISS per turn (will auto-detect hits if EricAI upgrades vLLM).
 
 ## Endpoints
 
@@ -258,8 +267,14 @@ See `config.yaml` — minimal config with only EricAI provider settings.
 
 - **Request translation**: Responses API → Chat Completions (instructions, input array, tools, function calls, reasoning effort)
 - **Response translation**: Chat Completions SSE → Responses API SSE (full event sequence)
-- **Thinking injection**: DeepSeek (`thinking: true, reasoning_effort`), GLM (`enable_thinking`)
+- **Thinking injection**: DeepSeek (`thinking: true, reasoning_effort`), GLM (`enable_thinking`), Qwen3 (`enable_thinking: false`, `max_tokens: 16384`)
+- **Code Mode support**: Translates Codex's freeform `exec` tool (V8 JavaScript orchestration) to a function tool with `input` string param. The `wait` tool passes through as a regular function tool. Model catalog advertises `tool_mode: "code_mode"` to enable Code Mode in Codex.
+- **Tool translation**: Custom/freeform tools (`apply_patch`, `exec`) → function tools with single `input` param (vLLM doesn't support grammar-constrained decoding). Regular function tools pass through unchanged. `custom_tool_call` history items wrapped as JSON `{"input": "..."}`.
+- **KV-cache prefix tracking**: Logs message prefix changes between turns (`KV-cache break!`), incremental request merging preserves prefix stability, per-turn usage logging with cache hit/miss detection.
+- **Qwen3 compatibility**: Merges assistant `tool_calls` into a single message (qwen3 requires this), injects `enable_thinking: false` and default `max_tokens: 16384`.
+- **apply_patch grammar**: Full patch grammar injected into `base_instructions` in model catalog (codex's tool description is only 32 chars; the proxy must supply the grammar since vLLM can't use grammar-constrained decoding).
 - **Token management**: MSAL OAuth refresh, auto-refresh 5min before expiry
 - **Remote compaction**: Wraps chat completion as `response.compaction` object
 - **WebSocket support**: Stateful Responses WS transport for Codex — `generate=false` prewarm handshake, connection reuse across turns, and `previous_response_id` incremental-input expansion (rebuilds full history for the stateless vLLM backend)
 - **Model aliasing**: Config aliases (e.g. `glm-5.2` → `zai-org/GLM-5.2-FP8`)
+- **Debug logging**: Per-turn tool list logging (incoming from codex + outgoing to vLLM), raw vLLM usage object logging, KV-cache hit/miss per turn.
