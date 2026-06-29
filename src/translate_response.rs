@@ -34,12 +34,15 @@ fn longest_suffix_prefix(text: &str, tag: &str) -> usize {
 /// not as `function_call` items, because Codex dispatches them via the
 /// `ApplyPatchHandler` which only accepts `ToolPayload::Custom`.
 fn is_custom_tool(name: &str) -> bool {
-    name == "apply_patch"
+    // apply_patch: freeform tool, dispatched via ApplyPatchHandler
+    // exec: Code Mode freeform tool, dispatched via CodeModeExecuteHandler
+    // wait: Code Mode freeform tool, dispatched via CodeModeWaitHandler
+    name == "apply_patch" || name == "exec" || name == "wait"
 }
 
 /// Extract the `input` field from a JSON arguments string.
 ///
-/// The model sends apply_patch arguments as JSON: {"input": "*** Begin Patch\n..."}
+/// The model sends apply_patch/exec/wait arguments as JSON: {"input": "..."}
 /// The Responses API `custom_tool_call` item expects a plain `input` string,
 /// not a JSON `arguments` string.
 fn extract_custom_tool_input(arguments: &str) -> String {

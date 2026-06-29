@@ -156,21 +156,25 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 }
 
                 "custom_tool_call" => {
-                    // Codex sends apply_patch calls as custom_tool_call items
-                    // with an "input" field (raw patch text) instead of "arguments"
-                    // (JSON). The Chat Completions tool schema we advertise for
-                    // apply_patch declares a single `input` string parameter, so
-                    // the model expects arguments to be JSON: {"input": "..."}.
-                    //
-                    // If we pass the raw patch text as `arguments` directly, the
-                    // model sees a malformed (non-JSON) arguments string in its
-                    // conversation history on follow-up turns and returns an
-                    // empty response (0 output tokens). Wrap the input as JSON
-                    // so the assistant tool_calls entry matches the schema.
-                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
-                    let arguments = json!({"input": input}).to_string();
+                   // Codex sends apply_patch calls as custom_tool_call items
+                   // with an "input" field (raw patch text) instead of "arguments"
+                   // (JSON). The Chat Completions tool schema we advertise for
+                   // apply_patch declares a single `input` string parameter, so
+                   // the model expects arguments to be JSON: {"input": "..."}.
+                   //
+                   // If we pass the raw patch text as `arguments` directly, the
+                   // model sees a malformed (non-JSON) arguments string in its
+                   // conversation history on follow-up turns and returns an
+                   // empty response (0 output tokens). Wrap the input as JSON
+                   // so the assistant tool_calls entry matches the schema.
+                   //
+                   // Same applies to Code Mode's `exec` and `wait` tools,
+                   // which are freeform (custom) tools that accept raw text
+                   // input (JavaScript source / wait parameters).
+                   let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                   let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                   let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                   let arguments = json!({"input": input}).to_string();
                     pending_tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",
@@ -213,29 +217,65 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             // apply_patch custom tool
-            if tool_type == "custom" && tool.get("name").and_then(|v| v.as_str()) == Some("apply_patch") {
-                cc_tools.push(json!({
-                    "type": "function",
-                    "function": {
-                        "name": "apply_patch",
-                        "description": "Edit files using a patch format.",
-                        "strict": false,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "input": {"type": "string", "description": "Patch content. MUST start with *** Begin Patch"}
-                            },
-                            "required": ["input"]
-                        }
-                    }
-                }));
-                continue;
-            }
+           if tool_type == "custom" && tool.get("name").and_then(|v| v.as_str()) == Some("apply_patch") {
+               cc_tools.push(json!({
+                   "type": "function",
+                   "function": {
+                       "name": "apply_patch",
+                       "description": "Edit files using a patch format.",
+                       "strict": false,
+                       "parameters": {
+                           "type": "object",
+                           "properties": {
+                               "input": {"type": "string", "description": "Patch content. MUST start with *** Begin Patch"}
+                           },
+                           "required": ["input"]
+                       }
+                   }
+               }));
+               continue;
+           }
 
-            // Skip built-in tools (web_search, image_generation, etc.)
-            if !tool_type.is_empty() && tool_type != "function" && tool.is_object() {
-                continue;
-            }
+           // Code Mode freeform tools: exec and wait
+           // These are sent as type "custom" with a freeform format (grammar-based).
+           // vLLM/Chat Completions doesn't support freeform tools, so we convert
+           // them to standard function tools with a single `input` string parameter.
+           // The model generates JSON {"input": "..."} as arguments, which the
+           // proxy translates back to custom_tool_call items with raw text input.
+           if tool_type == "custom" {
+               let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+               if name == "exec" || name == "wait" {
+                   let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                   cc_tools.push(json!({
+                       "type": "function",
+                       "function": {
+                           "name": name,
+                           "description": desc,
+                           "strict": false,
+                           "parameters": {
+                               "type": "object",
+                               "properties": {
+                                   "input": {
+                                       "type": "string",
+                                       "description": if name == "exec" {
+                                           "JavaScript source code to execute. Optionally start with // @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}"
+                                       } else {
+                                           "JSON object with cell_id, yield_time_ms, max_tokens, and optional terminate fields"
+                                       }
+                                   }
+                               },
+                               "required": ["input"]
+                           }
+                       }
+                   }));
+                   continue;
+               }
+           }
+
+           // Skip built-in tools (web_search, image_generation, etc.)
+           if !tool_type.is_empty() && tool_type != "function" && tool.is_object() {
+               continue;
+           }
 
             let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
