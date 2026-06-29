@@ -457,10 +457,9 @@ except Exception:
 print(f"\nModel catalog updated: {len(models)} models → {CATALOG}")
 for m in models:
     cw = m["context_window"]
-    acl = cw * 9 // 10  # Codex default: 90% of context_window
     efforts = [e["effort"] for e in m.get("supported_reasoning_levels", [])]
     effort_str = f"efforts={','.join(efforts)}" if efforts else "no-effort"
-    print(f"  {m['slug']:25s} context_window={cw:>7d} compact_at={acl:>7d} {effort_str}")
+    print(f"  {m['slug']:25s} context_window={cw:>7d} {effort_str}")
 
 # ── Step 7: Validate — run `codex debug models` and verify ──────────────────
 try:
