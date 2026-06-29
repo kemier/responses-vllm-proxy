@@ -12,6 +12,16 @@ CATALOG="$HOME/.codex/model_catalog.json"
 PORT=8317
 PIDFILE="/tmp/ericai-proxy-$USER.pid"
 
+LAB_DIR="${LAB_DIR:-/workspace/git/ezennin/lab}"
+
+# Resolve the binary: prefer a release build in the source tree (dev mode),
+# otherwise fall back to an installed copy in $DIR/bin (installed mode).
+if [ -f "$DIR/target/release/ericai-proxy" ]; then
+    BIN_PATH="$DIR/target/release/ericai-proxy"
+else
+    BIN_PATH="$DIR/bin/ericai-proxy"
+fi
+
 # ─── Parse args ─────────────────────────────────────────────────────────────
 RESTART=false
 BUILD_ONLY=false
@@ -114,7 +124,7 @@ fi
 
 # ─── Build ──────────────────────────────────────────────────────────────────
 NEED_BUILD=false
-if [ "$REBUILD" = true ] || [ "$BUILD_ONLY" = true ] || [ ! -f "$DIR/target/release/ericai-proxy" ]; then
+if [ "$REBUILD" = true ] || [ "$BUILD_ONLY" = true ] || [ ! -f "$BIN_PATH" ]; then
     NEED_BUILD=true
 fi
 
@@ -131,7 +141,7 @@ fi
 
 # ─── Refresh EricAI token ───────────────────────────────────────────────────
 echo "Refreshing EricAI token..."
-(cd /workspace/git/ezennin/lab && OPENAI_API_KEY="" OPENAI_BASE_URL="" uv run python3 -c "
+(cd "$LAB_DIR" && OPENAI_API_KEY="" OPENAI_BASE_URL="" uv run python3 -c "
 import json, os, time
 from ericai.sso_auth import get_token
 from ericai.eri_mix import _get_rt
@@ -166,7 +176,7 @@ else
     echo "❌ Token refresh failed — MSAL refresh token likely expired (7-day max)."
     echo "   Re-authenticate with:"
     echo ""
-    echo "     cd /workspace/git/ezennin/lab && uv run ericai login"
+    echo "     cd \"$LAB_DIR\" && uv run ericai login"
     echo ""
     echo "   Then re-run: ./start.sh"
     exit 1
@@ -193,7 +203,7 @@ fi
 
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"
-"$DIR/target/release/ericai-proxy" &
+"$BIN_PATH" &
 PID=$!
 echo "$PID" > "$PIDFILE"
 echo "ericai-proxy started (PID $PID)"
@@ -206,7 +216,7 @@ done
 
 # ─── Initial catalog generation ─────────────────────────────────────────────
 export CATALOG PORT CONFIG_PATH="$DIR/config.yaml"
-"$DIR/scripts/update_catalog.sh"
+"$DIR/scripts/update_catalog.sh" "$LAB_DIR"
 echo "Catalog written to $CATALOG"
 
 # ─── Watch config + monitor health ──────────────────────────────────────────
@@ -230,11 +240,11 @@ echo "Catalog written to $CATALOG"
         HEALTH_COUNTER=$((HEALTH_COUNTER + 1))
         if [ $HEALTH_COUNTER -ge 10 ]; then
             HEALTH_COUNTER=0
-            "$DIR/scripts/check_health.sh" || REBUILD=1
+            "$DIR/scripts/check_health.sh" "$LAB_DIR" || REBUILD=1
         fi
 
         if [ $REBUILD -eq 1 ]; then
-            "$DIR/scripts/update_catalog.sh"
+            "$DIR/scripts/update_catalog.sh" "$LAB_DIR"
             echo "Catalog written to $CATALOG"
         fi
     done

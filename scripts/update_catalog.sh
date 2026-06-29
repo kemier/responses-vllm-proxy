@@ -15,6 +15,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 CATALOG="${CATALOG:-$HOME/.codex/model_catalog.json}"
 PORT="${PORT:-8317}"
 CONFIG_PATH="${CONFIG_PATH:-$DIR/config.yaml}"
+LAB_DIR="${1:-${LAB_DIR:-/workspace/git/ezennin/lab}}"
 
 # Locate the codex binary (same one codex-acp will spawn)
 CODEX_BIN="${CODEX_BIN:-$(find "$HOME/.npm-global/lib/node_modules/@openai" -path "*/codex-linux-x64/vendor/*/bin/codex" -type f 2>/dev/null | head -1)}"
@@ -29,7 +30,7 @@ for i in $(seq 1 10); do
     sleep 0.5
 done
 
-CATALOG="$CATALOG" PORT="$PORT" CONFIG_PATH="$CONFIG_PATH" CODEX_BIN="$CODEX_BIN" uv run --project /workspace/git/ezennin/lab python3 << 'PYEOF'
+CATALOG="$CATALOG" PORT="$PORT" CONFIG_PATH="$CONFIG_PATH" CODEX_BIN="$CODEX_BIN" LAB_DIR="$LAB_DIR" uv run --project "$LAB_DIR" python3 << 'PYEOF'
 import json, os, subprocess, sys, urllib.request, tempfile
 
 CATALOG = os.environ["CATALOG"]
@@ -267,7 +268,7 @@ try:
     result = subprocess.run(
         ["uv", "run", "ericai", "api", "models.list"],
         capture_output=True, text=True, timeout=30,
-        cwd="/workspace/git/ezennin/lab",
+        cwd=os.environ.get("LAB_DIR", "/workspace/git/ezennin/lab"),
         env={**os.environ, "OPENAI_API_KEY": "", "OPENAI_BASE_URL": ""}
     )
     import re

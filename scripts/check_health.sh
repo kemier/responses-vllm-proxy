@@ -4,8 +4,9 @@
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CATALOG="${CATALOG:-$HOME/.codex/model_catalog.json}"
 CONFIG_PATH="${CONFIG_PATH:-$DIR/config.yaml}"
+LAB_DIR="${1:-${LAB_DIR:-/workspace/git/ezennin/lab}}"
 
-uv run --project /workspace/git/ezennin/lab python3 << 'PYEOF'
+LAB_DIR="$LAB_DIR" uv run --project "$LAB_DIR" python3 << 'PYEOF'
 import json, os, subprocess, sys, re
 
 CATALOG = os.environ.get("CATALOG", os.path.expanduser("~/.codex/model_catalog.json"))
@@ -28,7 +29,7 @@ try:
     result = subprocess.run(
         ["uv", "run", "ericai", "api", "models.list"],
         capture_output=True, text=True, timeout=30,
-        cwd="/workspace/git/ezennin/lab",
+        cwd=os.environ.get("LAB_DIR", "/workspace/git/ezennin/lab"),
         env={**os.environ, "OPENAI_API_KEY": "", "OPENAI_BASE_URL": ""}
     )
     for obj_text in re.split(r'(?<=\})\s*(?=\{)', result.stdout):
