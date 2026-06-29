@@ -214,10 +214,16 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
         }));
     }
 
-    // tools
-    if let Some(tools) = input.get("tools").and_then(|v| v.as_array()) {
-        let mut cc_tools: Vec<Value> = Vec::new();
-        for tool in tools {
+   // tools
+   if let Some(tools) = input.get("tools").and_then(|v| v.as_array()) {
+       crate::logger::debug("translate_request", &format!("[tools] incoming {} tools from codex", tools.len()));
+       for tool in tools {
+           let ty = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+           let nm = tool.get("name").and_then(|v| v.as_str()).unwrap_or_else(|| tool.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""));
+           crate::logger::debug("translate_request", &format!("[tools]   incoming: type={} name={}", ty, nm));
+       }
+       let mut cc_tools: Vec<Value> = Vec::new();
+       for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             // apply_patch custom tool
