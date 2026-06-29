@@ -785,10 +785,10 @@ pub async fn handle_responses_ws(
                             format!("{}+tc({})", role, names.join(","))
                         } else if role == "tool" {
                             let call_id = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-                            format!("tool[{}]", &call_id[..call_id.len().min(12)])
+                            format!("tool[{}]", call_id.chars().take(12).collect::<String>())
                         } else {
                             let c = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                            format!("{}:'{}'", role, &c[..c.len().min(40)])
+                            format!("{}:'{}'", role, c.chars().take(40).collect::<String>())
                         }
                     };
 
