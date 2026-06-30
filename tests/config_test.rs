@@ -29,8 +29,17 @@ openai-compatibility:
     assert!(cfg.ericai_provider().is_some());
     let models = cfg.all_models();
     assert_eq!(models.len(), 2);
-    assert_eq!(models[0], ("glm-5.2".to_string(), "zai-org/GLM-5.2-FP8".to_string()));
-    assert_eq!(models[1], ("deepseek-v4-pro".to_string(), "deepseek-ai/DeepSeek-V4-Pro".to_string()));
+    assert_eq!(
+        models[0],
+        ("glm-5.2".to_string(), "zai-org/GLM-5.2-FP8".to_string())
+    );
+    assert_eq!(
+        models[1],
+        (
+            "deepseek-v4-pro".to_string(),
+            "deepseek-ai/DeepSeek-V4-Pro".to_string()
+        )
+    );
 }
 
 #[test]
@@ -49,7 +58,10 @@ openai-compatibility:
     let path = "/tmp/test_ericai_config2.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
-    assert_eq!(cfg.ericai_provider().unwrap().base_url, "https://api.example.com");
+    assert_eq!(
+        cfg.ericai_provider().unwrap().base_url,
+        "https://api.example.com"
+    );
 }
 
 #[test]
@@ -174,7 +186,10 @@ openai-compatibility:
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert_eq!(cfg.resolve_model("glm-5.2"), "zai-org/GLM-5.2-FP8");
-    assert_eq!(cfg.resolve_model("deepseek-v4-pro"), "deepseek-ai/DeepSeek-V4-Pro");
+    assert_eq!(
+        cfg.resolve_model("deepseek-v4-pro"),
+        "deepseek-ai/DeepSeek-V4-Pro"
+    );
 }
 
 #[test]

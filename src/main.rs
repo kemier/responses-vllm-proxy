@@ -1,13 +1,13 @@
 #[allow(clippy::duplicate_mod)]
+pub mod auth;
+#[allow(clippy::duplicate_mod)]
 pub mod config;
 #[allow(clippy::duplicate_mod)]
-pub mod auth;
+pub mod logger;
 #[allow(clippy::duplicate_mod)]
 pub mod translate_request;
 #[allow(clippy::duplicate_mod)]
 pub mod translate_response;
-#[allow(clippy::duplicate_mod)]
-pub mod logger;
 
 use axum::{
     body::Body,
@@ -34,12 +34,12 @@ pub struct AppState {
     pub token_mgr: Arc<auth::TokenManager>,
     pub http_client: reqwest::Client,
     pub model_catalog: ModelCatalog,
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Pre-allocated SSE keepalive comment bytes — avoids allocating a new
 /// String on every 15-second keepalive tick.
-static KEEPALIVE_BYTES: axum::body::Bytes =
-    axum::body::Bytes::from_static(b": keepalive\n\n");
+static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": keepalive\n\n");
 
 /// Look up a model's context_window from the cached catalog.
 /// Falls back to 196608 (192K) if the catalog isn't loaded or the model
@@ -61,8 +61,7 @@ pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
 
 #[tokio::main]
 async fn main() {
-    let config_path = std::env::var("CONFIG_PATH")
-        .unwrap_or_else(|_| "config.yaml".to_string());
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
 
     let cfg = match config::Config::load(&config_path) {
         Ok(c) => Arc::new(c),
@@ -74,7 +73,12 @@ async fn main() {
 
     // Initialize logger
     let to_stderr = !cfg.logging_to_file || cfg.debug;
-    logger::init(&cfg.log_dir, cfg.logs_max_total_size_mb, to_stderr, &cfg.log_level);
+    logger::init(
+        &cfg.log_dir,
+        cfg.logs_max_total_size_mb,
+        to_stderr,
+        &cfg.log_level,
+    );
 
     if cfg.ericai_provider().is_none() {
         logger::error("main", "No 'ericai' provider found in config");
@@ -95,24 +99,38 @@ async fn main() {
             .ok()
             .map(|h| format!("{}/.codex/model_catalog.json", h))
             .and_then(|p| std::fs::read_to_string(&p).ok())
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
     );
     if model_catalog.is_some() {
-        logger::info("main", "Model catalog loaded from ~/.codex/model_catalog.json");
+        logger::info(
+            "main",
+            "Model catalog loaded from ~/.codex/model_catalog.json",
+        );
     } else {
-        logger::warn("main", "Model catalog not found — using default context_window=196608");
+        logger::warn(
+            "main",
+            "Model catalog not found — using default context_window=196608",
+        );
     }
+
+    // Shared shutdown signal — cancelled on SIGINT/SIGTERM so all WebSocket
+    // handlers can close their connections gracefully.
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
 
     let state = AppState {
         cfg: cfg.clone(),
         token_mgr,
         http_client,
         model_catalog,
+        shutdown: shutdown_token.clone(),
     };
 
     let app = axum::Router::new()
         .route("/v1/models", get(handle_models))
-        .route("/v1/responses", post(handle_responses).get(handle_responses_ws))
+        .route(
+            "/v1/responses",
+            post(handle_responses).get(handle_responses_ws),
+        )
         .route("/v1/chat/completions", post(handle_chat_completions))
         // Codex can send very large request bodies (up to ~30MB for long
         // conversation contexts with 196K+ tokens). Axum's default body
@@ -124,14 +142,20 @@ async fn main() {
         // configures base_url as http://localhost:8317/backend-api/codex
         // instead of the standard /v1. With base_url=/v1 (default config),
         // these routes are never hit — codex calls /v1/responses instead.
-        .route("/backend-api/codex/responses", post(handle_responses).get(handle_responses_ws))
+        .route(
+            "/backend-api/codex/responses",
+            post(handle_responses).get(handle_responses_ws),
+        )
         .route("/backend-api/codex/responses/compact", post(handle_compact))
         .route("/v1/responses/compact", post(handle_compact))
         .route("/health", get(handle_health))
         .with_state(state);
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    logger::info("main", &format!("ericai-proxy listening on http://{}", addr));
+    logger::info(
+        "main",
+        &format!("ericai-proxy listening on http://{}", addr),
+    );
 
     // Bind with retry — give the old process time to fully release the port.
     // Use SO_REUSEADDR via socket2 so that a quick restart doesn't fail with
@@ -141,29 +165,63 @@ async fn main() {
             socket2::Domain::IPV4,
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
-        ).expect("Failed to create socket");
-        socket.set_reuse_address(true).expect("set_reuse_address failed");
-        socket.set_nonblocking(true).expect("set_nonblocking failed");
-        socket.bind(&socket2::SockAddr::from(
-            format!("{}:{}", cfg.host, cfg.port).parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-                std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port))
-            })
-        )).expect("Failed to bind");
+        )
+        .expect("Failed to create socket");
+        socket
+            .set_reuse_address(true)
+            .expect("set_reuse_address failed");
+        socket
+            .set_nonblocking(true)
+            .expect("set_nonblocking failed");
+        socket
+            .bind(&socket2::SockAddr::from(
+                format!("{}:{}", cfg.host, cfg.port)
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port))),
+            ))
+            .expect("Failed to bind");
         socket.listen(1024).expect("Failed to listen");
         tokio::net::TcpListener::from_std(socket.into()).expect("Failed to convert to TcpListener")
     };
-    // Graceful shutdown: on SIGINT/SIGTERM, stop accepting new connections
-    // but drain in-flight requests before exiting. Without this, Ctrl+C in
-    // start.sh instantly severs codex's proxy connection, which codex
-    // retries 5x against a dead server before terminating with exit code 1.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        logger::info("main", "Received SIGINT, draining connections before shutdown...");
-        let _ = shutdown_tx.send(());
+    // Graceful shutdown: on SIGINT OR SIGTERM, cancel all WebSocket
+    // connections (so codex gets a proper Close frame instead of a TCP RST),
+    // stop accepting new connections, and give in-flight HTTP requests a
+    // few seconds to finish before the process exits.
+    //
+    // Without this, Ctrl+C in start.sh severs codex's WebSocket connection
+    // (axum 0.7's with_graceful_shutdown does NOT close upgraded WS
+    // connections — it only stops accepting NEW ones), and `make stop`
+    // (pkill → SIGTERM) kills the proxy instantly with no shutdown at all.
+    // Codex then retries 5× against a dead server and terminates with
+    // exit code 1.
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let token = shutdown_token.clone();
+        async move {
+            // Wait for SIGINT (Ctrl+C) OR SIGTERM (kill / pkill / make stop).
+            let sigint = tokio::signal::ctrl_c();
+            let sigterm = async {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler")
+                    .recv()
+                    .await;
+            };
+            tokio::pin!(sigint);
+            tokio::select! {
+                _ = &mut sigint => {
+                    logger::info("main", "Received SIGINT, initiating graceful shutdown...");
+                }
+                _ = sigterm => {
+                    logger::info("main", "Received SIGTERM, initiating graceful shutdown...");
+                }
+            }
+            token.cancel();
+        }
     });
     axum::serve(listener, app)
-        .with_graceful_shutdown(async { shutdown_rx.await.ok(); })
+        .with_graceful_shutdown(async move {
+            shutdown_token.cancelled().await;
+        })
         .await
         .expect("Server error");
 }
@@ -247,8 +305,8 @@ fn estimate_tokens(cc_payload: &Value) -> usize {
 /// heuristic).
 fn json_byte_len(v: &Value) -> usize {
     match v {
-        Value::Null => 4, // "null"
-        Value::Bool(true) => 4, // "true"
+        Value::Null => 4,        // "null"
+        Value::Bool(true) => 4,  // "true"
         Value::Bool(false) => 5, // "false"
         Value::Number(n) => {
             // Numbers: just count the digits/dots via the cheap `as_*` path.
@@ -256,14 +314,24 @@ fn json_byte_len(v: &Value) -> usize {
             if let Some(i) = n.as_i64() {
                 let mut len = if i < 0 { 1 } else { 0 };
                 let mut abs = i.unsigned_abs();
-                if abs == 0 { return 1; }
-                while abs > 0 { len += 1; abs /= 10; }
+                if abs == 0 {
+                    return 1;
+                }
+                while abs > 0 {
+                    len += 1;
+                    abs /= 10;
+                }
                 len
             } else if let Some(u) = n.as_u64() {
                 let mut len = 0;
                 let mut abs = u;
-                if abs == 0 { return 1; }
-                while abs > 0 { len += 1; abs /= 10; }
+                if abs == 0 {
+                    return 1;
+                }
+                while abs > 0 {
+                    len += 1;
+                    abs /= 10;
+                }
                 len
             } else {
                 // floats: ~16 chars worst case
@@ -297,15 +365,20 @@ fn json_byte_len(v: &Value) -> usize {
 
 // ─── GET /v1/models ─────────────────────────────────────────────────────────
 pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
-    let models: Vec<Value> = state.cfg.all_models().iter().map(|(alias, name)| {
-        json!({
-            "id": alias,
-            "object": "model",
-            "created": 1700000000,
-            "owned_by": "ericai",
-            "ericai_backend_id": name,
+    let models: Vec<Value> = state
+        .cfg
+        .all_models()
+        .iter()
+        .map(|(alias, name)| {
+            json!({
+                "id": alias,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "ericai",
+                "ericai_backend_id": name,
+            })
         })
-    }).collect();
+        .collect();
 
     Json(json!({"object": "list", "data": models}))
 }
@@ -316,73 +389,69 @@ pub async fn handle_health() -> impl IntoResponse {
 }
 
 // ─── POST /v1/responses ────────────────────────────────────────────────────
-pub async fn handle_responses(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Response {
+pub async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             logger::error("responses", &format!("Invalid JSON: {}", e));
-            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
         }
     };
 
-    let model_alias = request_json.get("model")
+    let model_alias = request_json
+        .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
 
-   // Resolve alias → backend model ID
+    // Resolve alias → backend model ID
     let backend_model = state.cfg.resolve_model(&model_alias);
 
-   let is_stream = request_json.get("stream")
-       .and_then(|v| v.as_bool())
-       .unwrap_or(true);
+    let is_stream = request_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
-   // Translate request
-   let mut cc_payload = translate_request::responses_to_chat_completions(
-       &backend_model,
-       &request_json,
-       is_stream,
-   );
-   cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
+    // Translate request
+    let mut cc_payload =
+        translate_request::responses_to_chat_completions(&backend_model, &request_json, is_stream);
+    cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
-   // Context size warning: estimate tokens and log if exceeds model's context window.
-   // We do NOT trim here — codex has its own context management (auto-compaction
-   // at 90% of context_window, tool_output_token_limit, etc.). The proxy's
-   // trimming was broken: it only counted `content` as a string (missing array
-   // content, tool_calls, tool results, and the tools schema entirely), and the
-   // `total > 4` guard allowed huge single messages through. Removing it lets
-   // codex's proven context management handle this correctly.
-   let context_window = get_context_window(&state.model_catalog, &model_alias);
-   let estimated_tokens = estimate_tokens(&cc_payload);
-   if estimated_tokens as u64 > context_window {
-       logger::warn("responses", &format!(
+    // Context size warning: estimate tokens and log if exceeds model's context window.
+    // We do NOT trim here — codex has its own context management (auto-compaction
+    // at 90% of context_window, tool_output_token_limit, etc.). The proxy's
+    // trimming was broken: it only counted `content` as a string (missing array
+    // content, tool_calls, tool results, and the tools schema entirely), and the
+    // `total > 4` guard allowed huge single messages through. Removing it lets
+    // codex's proven context management handle this correctly.
+    let context_window = get_context_window(&state.model_catalog, &model_alias);
+    let estimated_tokens = estimate_tokens(&cc_payload);
+    if estimated_tokens as u64 > context_window {
+        logger::warn("responses", &format!(
            "Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
            estimated_tokens, context_window, model_alias
        ));
-   }
+    }
 
     // Get auth token
     let token = match state.token_mgr.get_token().await {
         Ok(t) => t,
         Err(e) => {
             logger::error("auth", &format!("Token error: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e))
-                .into_response();
+            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
         }
     };
 
     let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
-    logger::info("responses", &format!(
-        "POST {} model={} stream={}", url, backend_model, is_stream
-    ));
+    logger::info(
+        "responses",
+        &format!("POST {} model={} stream={}", url, backend_model, is_stream),
+    );
 
-    let resp = match state.http_client
+    let resp = match state
+        .http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "text/event-stream")
@@ -393,24 +462,33 @@ pub async fn handle_responses(
         Ok(r) => r,
         Err(e) => {
             logger::error("responses", &format!("Upstream error: {}", e));
-            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
         }
     };
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
-        logger::error("responses", &format!("Upstream returned {}: {}", status, logger::extract_error_summary(&body_text, 300)));
-        logger::error_request("v1-responses", &cc_payload.to_string(), &body_text, status.as_u16());
+        logger::error(
+            "responses",
+            &format!(
+                "Upstream returned {}: {}",
+                status,
+                logger::extract_error_summary(&body_text, 300)
+            ),
+        );
+        logger::error_request(
+            "v1-responses",
+            &cc_payload.to_string(),
+            &body_text,
+            status.as_u16(),
+        );
         return (status, body_text).into_response();
     }
     if is_stream {
         let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
-        let mut translator = translate_response::ResponseTranslator::new(
-            &response_id,
-            Some(request_json.clone()),
-        );
+        let mut translator =
+            translate_response::ResponseTranslator::new(&response_id, Some(request_json.clone()));
 
         let byte_stream = resp.bytes_stream();
 
@@ -423,6 +501,7 @@ pub async fn handle_responses(
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let upstream_cancel = cancel_token.clone();
+        let server_shutdown = state.shutdown.clone();
 
         // Spawn the upstream reader task
         tokio::spawn(async move {
@@ -442,50 +521,55 @@ pub async fn handle_responses(
 
             loop {
                 tokio::select! {
-                    // Poll upstream for next chunk
-                    chunk_result = stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                               buffer.push_str(&String::from_utf8_lossy(&chunk));
-                               while let Some(rel_pos) = buffer[read_pos..].find('\n') {
-                                    let pos = read_pos + rel_pos;
-                                    let events = translator.process_line(&buffer[read_pos..pos]);
-                                    read_pos = pos + 1;
-                                   for event in events {
-                                       if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
-                                           // Client disconnected — stop reading upstream
-                                           upstream_cancel.cancel();
-                                            return;
-                                        }
-                                    }
-                                }
-                                // Compact: remove processed bytes once per chunk
-                                // instead of once per line via drain().
-                                if read_pos > 0 {
-                                    buffer.drain(..read_pos);
-                                    read_pos = 0;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                logger::error("responses", &format!("Stream error: {}", e));
-                                break;
-                            }
-                            None => break, // upstream finished
-                        }
-                    }
-                   // SSE keepalive: send comment to keep connection alive
-                   _ = sse_keepalive.tick() => {
-                       // SSE comments start with ':' and are ignored by clients
-                       // but keep the TCP connection alive
-                        if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
-                           return;
-                       }
-                   }
-                    // Client disconnect detected via cancellation
-                    _ = upstream_cancel.cancelled() => {
-                        logger::info("responses", "Client disconnected, aborting upstream stream");
-                        return;
-                    }
+                      // Poll upstream for next chunk
+                      chunk_result = stream.next() => {
+                          match chunk_result {
+                              Some(Ok(chunk)) => {
+                                 buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                 while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                      let pos = read_pos + rel_pos;
+                                      let events = translator.process_line(&buffer[read_pos..pos]);
+                                      read_pos = pos + 1;
+                                     for event in events {
+                                         if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
+                                             // Client disconnected — stop reading upstream
+                                             upstream_cancel.cancel();
+                                              return;
+                                          }
+                                      }
+                                  }
+                                  // Compact: remove processed bytes once per chunk
+                                  // instead of once per line via drain().
+                                  if read_pos > 0 {
+                                      buffer.drain(..read_pos);
+                                      read_pos = 0;
+                                  }
+                              }
+                              Some(Err(e)) => {
+                                  logger::error("responses", &format!("Stream error: {}", e));
+                                  break;
+                              }
+                              None => break, // upstream finished
+                          }
+                      }
+                     // SSE keepalive: send comment to keep connection alive
+                     _ = sse_keepalive.tick() => {
+                         // SSE comments start with ':' and are ignored by clients
+                         // but keep the TCP connection alive
+                          if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
+                             return;
+                         }
+                     }
+                      // Client disconnect detected via cancellation
+                     _ = upstream_cancel.cancelled() => {
+                         logger::info("responses", "Client disconnected, aborting upstream stream");
+                         return;
+                     }
+                     // Server shutdown — stop streaming gracefully
+                     _ = server_shutdown.cancelled() => {
+                         logger::info("responses", "Server shutting down, aborting upstream stream");
+                         return;
+                     }
                 }
             }
 
@@ -493,7 +577,11 @@ pub async fn handle_responses(
             if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
                 let events = translator.process_line(&buffer[read_pos..]);
                 for event in events {
-                    if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
+                    if tx
+                        .send(Ok(axum::body::Bytes::from(event.into_bytes())))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -502,7 +590,11 @@ pub async fn handle_responses(
             // Send [DONE]
             let events = translator.process_line("data: [DONE]");
             for event in events {
-                if tx.send(Ok(axum::body::Bytes::from(event.into_bytes()))).await.is_err() {
+                if tx
+                    .send(Ok(axum::body::Bytes::from(event.into_bytes())))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -526,15 +618,12 @@ pub async fn handle_responses(
             Ok(v) => v,
             Err(e) => {
                 logger::error("responses", &format!("Parse error: {}", e));
-                return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))
-                    .into_response();
+                return (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)).into_response();
             }
         };
 
-        let response = translate_response::chat_completion_to_response(
-            &full_body,
-            Some(&request_json),
-        );
+        let response =
+            translate_response::chat_completion_to_response(&full_body, Some(&request_json));
 
         Json(response).into_response()
     }
@@ -618,6 +707,13 @@ pub async fn handle_responses_ws(
                     break 'connection;
                 }
             };
+
+            // Check if the server is shutting down (SIGINT/SIGTERM received).
+            if state.shutdown.is_cancelled() {
+                logger::info("ws", &format!("[{}] Server shutting down, closing WebSocket", conn_short));
+                let _ = socket.close().await;
+                break 'connection;
+            }
 
             // Handle protocol-level control frames
             let text = match msg {
@@ -1100,6 +1196,14 @@ pub async fn handle_responses_ws(
                             break 'connection; // socket dead
                         }
                     }
+                    // Server shutdown: send a Close frame and exit the stream loop.
+                    // Without this, axum 0.7's with_graceful_shutdown waits forever
+                    // for upgraded WebSocket connections that never close on their own.
+                    _ = state.shutdown.cancelled() => {
+                        logger::info("ws", &format!("[{}] Server shutting down, closing WebSocket during stream", conn_short));
+                        let _ = socket.close().await;
+                        break 'connection;
+                    }
                 }
             }
 
@@ -1237,36 +1341,39 @@ pub async fn handle_chat_completions(
         Ok(v) => v,
         Err(e) => {
             logger::error("chat", &format!("Invalid JSON: {}", e));
-            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
         }
     };
 
-    let model = request_json.get("model")
+    let model = request_json
+        .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
-       .to_string();
+        .to_string();
 
     let backend_model = state.cfg.resolve_model(&model);
 
-   // Resolve alias in the request
-   request_json["model"] = json!(backend_model);
+    // Resolve alias in the request
+    request_json["model"] = json!(backend_model);
 
     let token = match state.token_mgr.get_token().await {
         Ok(t) => t,
         Err(e) => {
             logger::error("chat", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e))
-                .into_response();
+            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
         }
     };
 
     let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
-    logger::info("chat", &format!("Passthrough POST {} model={}", url, backend_model));
+    logger::info(
+        "chat",
+        &format!("Passthrough POST {} model={}", url, backend_model),
+    );
 
-    let resp = state.http_client
+    let resp = state
+        .http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "text/event-stream")
@@ -1279,7 +1386,11 @@ pub async fn handle_chat_completions(
             let status = r.status();
             let headers = r.headers().clone();
 
-            if request_json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if request_json
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 let stream = r.bytes_stream();
                 let body = Body::from_stream(stream);
                 let mut response = Response::builder()
@@ -1310,16 +1421,12 @@ pub async fn handle_chat_completions(
 }
 
 // ─── POST /backend-api/codex/responses/compact ─────────────────────────────
-pub async fn handle_compact(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> Response {
+pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     let mut request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             logger::error("compact", &format!("Invalid JSON: {}", e));
-            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e))
-                .into_response();
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
         }
     };
 
@@ -1328,26 +1435,23 @@ pub async fn handle_compact(
         obj.remove("stream");
     }
 
-    let model_alias = request_json.get("model")
+    let model_alias = request_json
+        .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
-       .to_string();
+        .to_string();
 
     let backend_model = state.cfg.resolve_model(&model_alias);
 
-   let mut cc_payload = translate_request::responses_to_chat_completions(
-       &backend_model,
-       &request_json,
-       false,
-    );
+    let mut cc_payload =
+        translate_request::responses_to_chat_completions(&backend_model, &request_json, false);
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
     let token = match state.token_mgr.get_token().await {
         Ok(t) => t,
         Err(e) => {
             logger::error("compact", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e))
-                .into_response();
+            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
         }
     };
 
@@ -1373,9 +1477,16 @@ pub async fn handle_compact(
     cc_payload["stream"] = json!(true);
     cc_payload["stream_options"] = json!({"include_usage": true});
 
-    logger::info("compact", &format!("Compact POST (streaming) {} model={} est_tokens={}", url, backend_model, estimated_tokens));
+    logger::info(
+        "compact",
+        &format!(
+            "Compact POST (streaming) {} model={} est_tokens={}",
+            url, backend_model, estimated_tokens
+        ),
+    );
 
-    let resp = match state.http_client
+    let resp = match state
+        .http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "text/event-stream")
@@ -1386,16 +1497,27 @@ pub async fn handle_compact(
         Ok(r) => r,
         Err(e) => {
             logger::error("compact", &format!("Upstream error: {}", e));
-            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e))
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
         }
     };
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
-        logger::error("compact", &format!("Upstream {}: {}", status, logger::extract_error_summary(&body_text, 300)));
-        logger::error_request("compact", &cc_payload.to_string(), &body_text, status.as_u16());
+        logger::error(
+            "compact",
+            &format!(
+                "Upstream {}: {}",
+                status,
+                logger::extract_error_summary(&body_text, 300)
+            ),
+        );
+        logger::error_request(
+            "compact",
+            &cc_payload.to_string(),
+            &body_text,
+            status.as_u16(),
+        );
         return (status, body_text).into_response();
     }
 
@@ -1412,35 +1534,43 @@ pub async fn handle_compact(
         match chunk_result {
             Ok(chunk) => {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
-              while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                while let Some(rel_pos) = buffer[read_pos..].find('\n') {
                     let pos = read_pos + rel_pos;
                     let line = buffer[read_pos..pos].to_string();
                     read_pos = pos + 1;
                     let line = line.trim_end();
                     if let Some(data) = line.strip_prefix("data: ") {
-                      if data.trim() == "[DONE]" { continue; }
-                      if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                           // Extract text delta
-                           if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) {
-                               for choice in choices {
-                                   if let Some(delta) = choice.get("delta") {
-                                       if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                                           full_text.push_str(content);
-                                       }
-                                   }
-                                   if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-                                       finish_reason = Some(fr.to_string());
-                                   }
-                               }
-                           }
-                       }
-                   }
-               }
-               // Compact: remove processed bytes once per chunk
-               if read_pos > 0 {
-                   buffer.drain(..read_pos);
-                   read_pos = 0;
-               }
+                        if data.trim() == "[DONE]" {
+                            continue;
+                        }
+                        if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                            // Extract text delta
+                            if let Some(choices) =
+                                chunk_json.get("choices").and_then(|c| c.as_array())
+                            {
+                                for choice in choices {
+                                    if let Some(delta) = choice.get("delta") {
+                                        if let Some(content) =
+                                            delta.get("content").and_then(|c| c.as_str())
+                                        {
+                                            full_text.push_str(content);
+                                        }
+                                    }
+                                    if let Some(fr) =
+                                        choice.get("finish_reason").and_then(|f| f.as_str())
+                                    {
+                                        finish_reason = Some(fr.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Compact: remove processed bytes once per chunk
+                if read_pos > 0 {
+                    buffer.drain(..read_pos);
+                    read_pos = 0;
+                }
             }
             Err(e) => {
                 logger::error("compact", &format!("Stream error: {}", e));
@@ -1456,14 +1586,19 @@ pub async fn handle_compact(
             if let Some(data) = remaining.strip_prefix("data: ") {
                 if data.trim() != "[DONE]" {
                     if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
-                        if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) {
+                        if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array())
+                        {
                             for choice in choices {
                                 if let Some(delta) = choice.get("delta") {
-                                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                                    if let Some(content) =
+                                        delta.get("content").and_then(|c| c.as_str())
+                                    {
                                         full_text.push_str(content);
                                     }
                                 }
-                                if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                                if let Some(fr) =
+                                    choice.get("finish_reason").and_then(|f| f.as_str())
+                                {
                                     finish_reason = Some(fr.to_string());
                                 }
                             }
@@ -1474,7 +1609,14 @@ pub async fn handle_compact(
         }
     }
 
-    logger::info("compact", &format!("Compact completed: {} chars of summary (finish={:?})", full_text.len(), finish_reason));
+    logger::info(
+        "compact",
+        &format!(
+            "Compact completed: {} chars of summary (finish={:?})",
+            full_text.len(),
+            finish_reason
+        ),
+    );
 
     let compaction_item = json!({
         "type": "compaction",

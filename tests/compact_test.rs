@@ -6,9 +6,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ericai_proxy::main::{handle_compact, AppState};
-use ericai_proxy::main::config::Config;
 use ericai_proxy::main::auth::TokenManager;
+use ericai_proxy::main::config::Config;
+use ericai_proxy::main::{handle_compact, AppState};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -45,10 +45,7 @@ fn unique_tmp_dir(prefix: &str) -> std::path::PathBuf {
     ))
 }
 
-async fn run_compact_test(
-    upstream_sse: Vec<String>,
-    request_body: Value,
-) -> (StatusCode, Value) {
+async fn run_compact_test(upstream_sse: Vec<String>, request_body: Value) -> (StatusCode, Value) {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_port = upstream_listener.local_addr().unwrap().port();
 
@@ -72,9 +69,8 @@ async fn run_compact_test(
         let mut buf = vec![0u8; 65536];
         let _ = socket.read(&mut buf).await.unwrap();
 
-        let mut response = String::from(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-        );
+        let mut response =
+            String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
         for chunk in &upstream_sse {
             response.push_str(chunk);
             response.push('\n');
@@ -130,12 +126,13 @@ openai-compatibility:
         .build()
         .unwrap();
 
-   let state = AppState {
-       cfg: cfg.clone(),
-       token_mgr,
-       http_client,
-       model_catalog: std::sync::Arc::new(None),
-   };
+    let state = AppState {
+        cfg: cfg.clone(),
+        token_mgr,
+        http_client,
+        model_catalog: std::sync::Arc::new(None),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
 
     use axum::routing::post;
     let app = axum::Router::new()
@@ -158,18 +155,13 @@ openai-compatibility:
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    let body_json: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
-        json!({"_raw": String::from_utf8_lossy(&body_bytes).to_string()})
-    });
+    let body_json: Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or_else(|_| json!({"_raw": String::from_utf8_lossy(&body_bytes).to_string()}));
 
     // Don't block forever if the mock upstream task is still waiting for
     // a connection that will never arrive. A short timeout is enough —
     // the proxy either connected (task finished) or failed (still waiting).
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        upstream,
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), upstream).await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     (status, body_json)
@@ -220,12 +212,13 @@ openai-compatibility:
         .build()
         .unwrap();
 
-   let state = AppState {
-       cfg,
-       token_mgr,
-       http_client,
-       model_catalog: std::sync::Arc::new(None),
-   };
+    let state = AppState {
+        cfg,
+        token_mgr,
+        http_client,
+        model_catalog: std::sync::Arc::new(None),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
 
     use axum::routing::post;
     let app = axum::Router::new()

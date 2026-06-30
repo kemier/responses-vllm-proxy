@@ -1,4 +1,4 @@
-use ericai_proxy::translate_response::{ResponseTranslator, chat_completion_to_response};
+use ericai_proxy::translate_response::{chat_completion_to_response, ResponseTranslator};
 use serde_json::json;
 
 // ─── ResponseTranslator (streaming) tests ───────────────────────────────────
@@ -13,9 +13,15 @@ fn test_simple_text_streaming() {
     assert!(events.len() >= 5);
     assert!(events[0].contains("response.created"));
     assert!(events[1].contains("response.in_progress"));
-    assert!(events.iter().any(|e| e.contains("response.output_item.added")));
-    assert!(events.iter().any(|e| e.contains("response.content_part.added")));
-    assert!(events.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Hello")));
+    assert!(events
+        .iter()
+        .any(|e| e.contains("response.output_item.added")));
+    assert!(events
+        .iter()
+        .any(|e| e.contains("response.content_part.added")));
+    assert!(events
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("Hello")));
 }
 
 #[test]
@@ -28,8 +34,12 @@ fn test_multi_chunk_text_streaming() {
 
     // First chunk has setup events, subsequent chunks just have deltas
     assert!(e1.iter().any(|e| e.contains("response.output_text.delta")));
-    assert!(e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains(", world")));
-    assert!(e3.iter().any(|e| e.contains("response.output_text.delta") && e.contains("!")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains(", world")));
+    assert!(e3
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("!")));
 }
 
 #[test]
@@ -40,13 +50,22 @@ fn test_done_emits_completion_events() {
     let done_events = t.process_line("data: [DONE]");
 
     // Should emit: output_text.done, content_part.done, output_item.done, response.completed
-    assert!(done_events.iter().any(|e| e.contains("response.output_text.done")));
-    assert!(done_events.iter().any(|e| e.contains("response.content_part.done")));
-    assert!(done_events.iter().any(|e| e.contains("response.output_item.done")));
+    assert!(done_events
+        .iter()
+        .any(|e| e.contains("response.output_text.done")));
+    assert!(done_events
+        .iter()
+        .any(|e| e.contains("response.content_part.done")));
+    assert!(done_events
+        .iter()
+        .any(|e| e.contains("response.output_item.done")));
     assert!(done_events.iter().any(|e| e.contains("response.completed")));
 
     // The completed event should contain the full text
-    let completed = done_events.iter().find(|e| e.contains("response.completed")).unwrap();
+    let completed = done_events
+        .iter()
+        .find(|e| e.contains("response.completed"))
+        .unwrap();
     assert!(completed.contains("Hi"));
 }
 
@@ -55,11 +74,16 @@ fn test_finish_reason_closes_message() {
     let mut t = ResponseTranslator::new("resp_test4", None);
 
     t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Done"}}]}"#);
-    let finish_events = t.process_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+    let finish_events =
+        t.process_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
 
     // Should close the message: output_text.done, content_part.done, output_item.done
-    assert!(finish_events.iter().any(|e| e.contains("response.output_text.done")));
-    assert!(finish_events.iter().any(|e| e.contains("response.output_item.done")));
+    assert!(finish_events
+        .iter()
+        .any(|e| e.contains("response.output_text.done")));
+    assert!(finish_events
+        .iter()
+        .any(|e| e.contains("response.output_item.done")));
 }
 
 #[test]
@@ -68,25 +92,38 @@ fn test_tool_call_streaming() {
 
     // First chunk: tool call with id and name
     let e1 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"get_weather","arguments":""}}]}}]}"#);
-    assert!(e1.iter().any(|e| e.contains("response.output_item.added") && e.contains("function_call")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("response.output_item.added") && e.contains("function_call")));
     assert!(e1.iter().any(|e| e.contains("get_weather")));
 
     // Second chunk: argument delta
     let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#);
-    assert!(e2.iter().any(|e| e.contains("response.function_call_arguments.delta")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("response.function_call_arguments.delta")));
 
     // Third chunk: more arguments
     let e3 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Stockholm\"}"}}]}}]}"#);
-    assert!(e3.iter().any(|e| e.contains("response.function_call_arguments.delta")));
+    assert!(e3
+        .iter()
+        .any(|e| e.contains("response.function_call_arguments.delta")));
 
     // Done
     let done = t.process_line("data: [DONE]");
-    assert!(done.iter().any(|e| e.contains("response.function_call_arguments.done")));
-    assert!(done.iter().any(|e| e.contains("response.output_item.done") && e.contains("function_call")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("response.function_call_arguments.done")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("response.output_item.done") && e.contains("function_call")));
     assert!(done.iter().any(|e| e.contains("response.completed")));
 
     // Verify accumulated arguments in the done event
-    let args_done = done.iter().find(|e| e.contains("response.function_call_arguments.done")).unwrap();
+    let args_done = done
+        .iter()
+        .find(|e| e.contains("response.function_call_arguments.done"))
+        .unwrap();
     assert!(args_done.contains("Stockholm"));
 }
 
@@ -94,10 +131,20 @@ fn test_tool_call_streaming() {
 fn test_reasoning_content_streaming() {
     let mut t = ResponseTranslator::new("resp_test6", None);
 
-    let e1 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."}}]}"#);
-    assert!(e1.iter().any(|e| e.contains("response.output_item.added") && e.contains("reasoning")));
-    assert!(e1.iter().any(|e| e.contains("response.reasoning_summary_part.added")));
-    assert!(e1.iter().any(|e| e.contains("response.reasoning_summary_text.delta") && e.contains("Let me think")));
+    let e1 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Let me think..."}}]}"#,
+    );
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("response.output_item.added") && e.contains("reasoning")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("response.reasoning_summary_part.added")));
+    assert!(
+        e1.iter()
+            .any(|e| e.contains("response.reasoning_summary_text.delta")
+                && e.contains("Let me think"))
+    );
 }
 
 #[test]
@@ -105,14 +152,23 @@ fn test_reasoning_then_text() {
     let mut t = ResponseTranslator::new("resp_test7", None);
 
     // Reasoning first
-    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Thinking..."}}]}"#);
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Thinking..."}}]}"#,
+    );
     // Then text content
-    let text_events = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Answer"}}]}"#);
+    let text_events =
+        t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Answer"}}]}"#);
 
     // Should stop reasoning (emit done events) then start message
-    assert!(text_events.iter().any(|e| e.contains("response.reasoning_summary_text.done")));
-    assert!(text_events.iter().any(|e| e.contains("response.output_item.done")));
-    assert!(text_events.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Answer")));
+    assert!(text_events
+        .iter()
+        .any(|e| e.contains("response.reasoning_summary_text.done")));
+    assert!(text_events
+        .iter()
+        .any(|e| e.contains("response.output_item.done")));
+    assert!(text_events
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("Answer")));
 }
 
 #[test]
@@ -125,7 +181,10 @@ fn test_usage_in_stream() {
     // [DONE] triggers the completed event with usage
     let done = t.process_line("data: [DONE]");
 
-    let completed = done.iter().find(|e| e.contains("response.completed")).unwrap();
+    let completed = done
+        .iter()
+        .find(|e| e.contains("response.completed"))
+        .unwrap();
     assert!(completed.contains("input_tokens"));
     assert!(completed.contains("\"input_tokens\":10"));
 }
@@ -156,10 +215,16 @@ fn test_think_tag_stripped_to_text() {
     let events = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>Internal reasoning</think>Actual answer"}}]}"#);
 
     // Both fragments are emitted as text — tags are stripped.
-    assert!(events.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Internal reasoning")));
-    assert!(events.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Actual answer")));
+    assert!(events
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("Internal reasoning")));
+    assert!(events
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("Actual answer")));
     // No reasoning events for plain text think tags.
-    assert!(!events.iter().any(|e| e.contains("reasoning_summary_text.delta")));
+    assert!(!events
+        .iter()
+        .any(|e| e.contains("reasoning_summary_text.delta")));
 }
 
 #[test]
@@ -171,7 +236,9 @@ fn test_multiple_tool_calls_same_choice() {
     // Second tool call in same choice
     let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"tool_b","arguments":"{}"}}]}}]}"#);
 
-    assert!(e2.iter().any(|e| e.contains("response.output_item.added") && e.contains("tool_b")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("response.output_item.added") && e.contains("tool_b")));
 }
 
 // ─── apply_patch (custom tool) streaming tests ─────────────────────────────
@@ -190,7 +257,9 @@ fn test_apply_patch_no_streaming_deltas_for_arguments() {
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch1","function":{"name":"apply_patch","arguments":""}}]}}]}"#,
     );
     // Should emit the output_item.added as custom_tool_call
-    assert!(e1.iter().any(|e| e.contains("response.output_item.added") && e.contains("custom_tool_call")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("response.output_item.added") && e.contains("custom_tool_call")));
     assert!(e1.iter().any(|e| e.contains("apply_patch")));
 
     // Second chunk: argument fragment (raw JSON, incomplete)
@@ -199,7 +268,8 @@ fn test_apply_patch_no_streaming_deltas_for_arguments() {
     );
     // CRITICAL: must NOT emit any custom_tool_call_input.delta for this fragment
     assert!(
-        !e2.iter().any(|e| e.contains("response.custom_tool_call_input.delta")),
+        !e2.iter()
+            .any(|e| e.contains("response.custom_tool_call_input.delta")),
         "apply_patch argument fragments must not be streamed as deltas"
     );
 
@@ -208,7 +278,8 @@ fn test_apply_patch_no_streaming_deltas_for_arguments() {
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"put\": \"*** Begin Patch\\n"}}]}}]}"#,
     );
     assert!(
-        !e3.iter().any(|e| e.contains("response.custom_tool_call_input.delta")),
+        !e3.iter()
+            .any(|e| e.contains("response.custom_tool_call_input.delta")),
         "apply_patch argument fragments must not be streamed as deltas"
     );
 
@@ -217,7 +288,8 @@ fn test_apply_patch_no_streaming_deltas_for_arguments() {
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"*** End Patch\"}"}}]}}]}"#,
     );
     assert!(
-        !e4.iter().any(|e| e.contains("response.custom_tool_call_input.delta")),
+        !e4.iter()
+            .any(|e| e.contains("response.custom_tool_call_input.delta")),
         "apply_patch argument fragments must not be streamed as deltas"
     );
 }
@@ -262,7 +334,9 @@ fn test_apply_patch_emits_clean_delta_on_done() {
     assert!(!delta.contains("{\\\""));
 
     // Should emit the done event with the clean input
-    assert!(done.iter().any(|e| e.contains("response.custom_tool_call_input.done")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("response.custom_tool_call_input.done")));
     let done_evt = done
         .iter()
         .find(|e| e.contains("response.custom_tool_call_input.done"))
@@ -271,7 +345,9 @@ fn test_apply_patch_emits_clean_delta_on_done() {
     assert!(done_evt.contains("*** End Patch"));
 
     // Should emit output_item.done with custom_tool_call type
-    assert!(done.iter().any(|e| e.contains("response.output_item.done") && e.contains("custom_tool_call")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("response.output_item.done") && e.contains("custom_tool_call")));
 
     // Should emit response.completed
     assert!(done.iter().any(|e| e.contains("response.completed")));
@@ -285,14 +361,19 @@ fn test_apply_patch_finish_reason_closes_cleanly() {
     t.process_line(
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_patch3","function":{"name":"apply_patch","arguments":"{\"input\": \"*** Begin Patch\\n*** End Patch\"}"}}]}}]}"#,
     );
-    let finish_events = t.process_line(
-        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
-    );
+    let finish_events = t
+        .process_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#);
 
     // finish_reason should trigger close_function_call
-    assert!(finish_events.iter().any(|e| e.contains("response.custom_tool_call_input.delta")));
-    assert!(finish_events.iter().any(|e| e.contains("response.custom_tool_call_input.done")));
-    assert!(finish_events.iter().any(|e| e.contains("response.output_item.done") && e.contains("custom_tool_call")));
+    assert!(finish_events
+        .iter()
+        .any(|e| e.contains("response.custom_tool_call_input.delta")));
+    assert!(finish_events
+        .iter()
+        .any(|e| e.contains("response.custom_tool_call_input.done")));
+    assert!(finish_events
+        .iter()
+        .any(|e| e.contains("response.output_item.done") && e.contains("custom_tool_call")));
 
     // The done event should contain the extracted patch text
     let done_evt = finish_events
@@ -335,7 +416,9 @@ fn test_regular_function_call_still_streams_deltas() {
     let e2 = t.process_line(
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#,
     );
-    assert!(e2.iter().any(|e| e.contains("response.function_call_arguments.delta")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("response.function_call_arguments.delta")));
 }
 
 // ─── think tag split across chunks (regression) tests ─────────────────────
@@ -352,12 +435,11 @@ fn test_think_open_tag_split_across_chunks() {
     let mut t = ResponseTranslator::new("resp_split1", None);
 
     // Chunk 1: text + partial opening tag "<thi"
-    let e1 = t.process_line(
-        r#"data: {"choices":[{"index":0,"delta":{"content":"Hello <thi"}}]}"#,
-    );
+    let e1 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Hello <thi"}}]}"#);
     // Should emit "Hello " as text, hold back "<thi"
     assert!(
-        e1.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Hello")),
+        e1.iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("Hello")),
         "text before partial tag should be emitted"
     );
     // Should NOT emit "<thi" as text
@@ -372,11 +454,13 @@ fn test_think_open_tag_split_across_chunks() {
     );
     // Both "reasoning here" and "answer" are emitted as text (think tags stripped).
     assert!(
-        e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("reasoning here")),
+        e2.iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("reasoning here")),
         "think content (between tags) is emitted as visible text"
     );
     assert!(
-        e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("answer")),
+        e2.iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("answer")),
         "text after closing tag should be emitted"
     );
     // Should NOT leak any tag fragments
@@ -396,7 +480,8 @@ fn test_think_close_tag_split_across_chunks() {
     );
     // After c47e10a: think-tag content is emitted as visible text.
     assert!(
-        e1.iter().any(|e| e.contains("response.output_text.delta") && e.contains("some reasoning")),
+        e1.iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("some reasoning")),
         "think content before partial closing tag should be emitted as text"
     );
     // Should NOT emit "</thi" as reasoning or text
@@ -406,12 +491,12 @@ fn test_think_close_tag_split_across_chunks() {
     );
 
     // Rest of closing tag + answer
-    let e2 = t.process_line(
-        r#"data: {"choices":[{"index":0,"delta":{"content":"nk>the answer"}}]}"#,
-    );
+    let e2 =
+        t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"nk>the answer"}}]}"#);
     // Should emit "the answer" as text
     assert!(
-        e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("the answer")),
+        e2.iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("the answer")),
         "text after closing tag should be emitted as text"
     );
     assert!(
@@ -436,7 +521,8 @@ fn test_think_tag_split_at_every_boundary() {
     // After c47e10a: content after fully assembled opening tag is emitted
     // as visible text (think tag is just a stripped marker).
     assert!(
-        e7.iter().any(|e| e.contains("response.output_text.delta") && e.contains("brain dump")),
+        e7.iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("brain dump")),
         "content after fully assembled opening tag should be emitted as text"
     );
 
@@ -448,10 +534,13 @@ fn test_think_tag_split_at_every_boundary() {
     t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"i"}}]}"#);
     t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"n"}}]}"#);
     t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"k"}}]}"#);
-    let final_e = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":">final answer"}}]}"#);
+    let final_e =
+        t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":">final answer"}}]}"#);
 
     assert!(
-        final_e.iter().any(|e| e.contains("response.output_text.delta") && e.contains("final answer")),
+        final_e
+            .iter()
+            .any(|e| e.contains("response.output_text.delta") && e.contains("final answer")),
         "text after fully assembled closing tag should be emitted as text"
     );
 }
@@ -464,7 +553,9 @@ fn test_literal_less_than_not_held_forever() {
 
     // "5 <" — the "<" is held back because it's a prefix of "<think"
     let e1 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"5 <"}}]}"#);
-    assert!(e1.iter().any(|e| e.contains("response.output_text.delta") && e.contains("5 ")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("5 ")));
 
     // " 10" — "<" + " 10" = "< 10" which is NOT a prefix of "<think", so all held content is emitted
     let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":" 10"}}]}"#);
@@ -489,13 +580,17 @@ fn test_think_tag_never_closed_flushed_as_text() {
     // flush_and_complete() for the rationale.
     let mut t = ResponseTranslator::new("resp_split5", None);
 
-    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>unfinished reasoning"}}]}"#);
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"<think>unfinished reasoning"}}]}"#,
+    );
     let done = t.process_line("data: [DONE]");
 
     // The "unfinished reasoning" should appear as text output.
     let text_blob: String = done
         .iter()
-        .filter(|e| e.contains("response.output_text.delta") || e.contains("response.output_text.done"))
+        .filter(|e| {
+            e.contains("response.output_text.delta") || e.contains("response.output_text.done")
+        })
         .cloned()
         .collect();
     assert!(
@@ -505,7 +600,9 @@ fn test_think_tag_never_closed_flushed_as_text() {
     );
     // And it should NOT be emitted as a reasoning summary.
     assert!(
-        !done.iter().any(|e| e.contains("reasoning_summary_text.done") && e.contains("unfinished reasoning")),
+        !done.iter().any(
+            |e| e.contains("reasoning_summary_text.done") && e.contains("unfinished reasoning")
+        ),
         "unclosed think tag content must not produce a reasoning summary"
     );
 }
@@ -523,7 +620,9 @@ fn test_partial_tag_at_stream_end_flushed_as_text() {
     // it was never completed into a full tag)
     let text_deltas: String = done
         .iter()
-        .filter(|e| e.contains("response.output_text.delta") || e.contains("response.output_text.done"))
+        .filter(|e| {
+            e.contains("response.output_text.delta") || e.contains("response.output_text.done")
+        })
         .cloned()
         .collect();
     assert!(
@@ -539,13 +638,23 @@ fn test_multiple_think_tags_in_sequence() {
     let mut t = ResponseTranslator::new("resp_split7", None);
 
     // First think block + text
-    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>first</think>mid"}}]}"#);
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"<think>first</think>mid"}}]}"#,
+    );
     // Second think block + text
-    let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>second</think>end"}}]}"#);
+    let e2 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"content":"<think>second</think>end"}}]}"#,
+    );
 
     let all: String = e2.iter().cloned().collect();
-    assert!(all.contains("second"), "second think block content should be routed to reasoning");
-    assert!(all.contains("end"), "text after second think block should be emitted as text");
+    assert!(
+        all.contains("second"),
+        "second think block content should be routed to reasoning"
+    );
+    assert!(
+        all.contains("end"),
+        "text after second think block should be emitted as text"
+    );
 }
 
 // ─── chat_completion_to_response (non-streaming) tests ──────────────────────
@@ -604,7 +713,10 @@ fn test_non_streaming_with_tool_calls() {
     assert_eq!(output[0]["type"], "function_call");
     assert_eq!(output[0]["name"], "get_weather");
     assert_eq!(output[0]["call_id"], "call_123");
-    assert!(output[0]["arguments"].as_str().unwrap().contains("Stockholm"));
+    assert!(output[0]["arguments"]
+        .as_str()
+        .unwrap()
+        .contains("Stockholm"));
 }
 
 #[test]
@@ -661,7 +773,10 @@ fn test_non_streaming_usage_mapping() {
     assert_eq!(resp["usage"]["output_tokens"], 50);
     assert_eq!(resp["usage"]["total_tokens"], 150);
     assert_eq!(resp["usage"]["input_tokens_details"]["cached_tokens"], 20);
-    assert_eq!(resp["usage"]["output_tokens_details"]["reasoning_tokens"], 5);
+    assert_eq!(
+        resp["usage"]["output_tokens_details"]["reasoning_tokens"],
+        5
+    );
 }
 
 #[test]
@@ -745,9 +860,19 @@ fn test_raw_json_mode_no_sse_envelope() {
     // In raw JSON mode, each event should be a JSON object (starts with '{')
     // and NOT contain SSE envelope prefixes like "event:" or "data:"
     for event in &events {
-        assert!(event.starts_with('{'), "Expected JSON object, got: {}", &event[..20.min(event.len())]);
-        assert!(!event.contains("event: "), "Should not contain SSE envelope");
-        assert!(!event.contains("data: "), "Should not contain SSE data prefix");
+        assert!(
+            event.starts_with('{'),
+            "Expected JSON object, got: {}",
+            &event[..20.min(event.len())]
+        );
+        assert!(
+            !event.contains("event: "),
+            "Should not contain SSE envelope"
+        );
+        assert!(
+            !event.contains("data: "),
+            "Should not contain SSE data prefix"
+        );
     }
 
     // First event should be response.created

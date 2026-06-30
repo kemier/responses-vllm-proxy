@@ -37,10 +37,18 @@ pub struct Config {
     pub model_lookup: HashMap<String, String>,
 }
 
-fn default_true() -> bool { true }
-fn default_logs_size() -> u64 { 10 }
-fn default_log_level() -> String { "info".to_string() }
-fn default_log_dir() -> String { "logs".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_logs_size() -> u64 {
+    10
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_log_dir() -> String {
+    "logs".to_string()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -77,7 +85,12 @@ impl Config {
         // Build the alias → backend model lookup map once.
         let model_pairs: Vec<(String, String)> = cfg
             .ericai_provider()
-            .map(|p| p.models.iter().map(|m| (m.alias.clone(), m.name.clone())).collect())
+            .map(|p| {
+                p.models
+                    .iter()
+                    .map(|m| (m.alias.clone(), m.name.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         for (alias, name) in model_pairs {
             cfg.model_lookup.insert(alias, name);
@@ -86,7 +99,9 @@ impl Config {
     }
 
     pub fn ericai_provider(&self) -> Option<&OpenAICompatProvider> {
-        self.openai_compatibility.iter().find(|p| p.name == "ericai")
+        self.openai_compatibility
+            .iter()
+            .find(|p| p.name == "ericai")
     }
 
     pub fn all_models(&self) -> Vec<(String, String)> {

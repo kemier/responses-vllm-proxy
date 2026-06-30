@@ -63,8 +63,9 @@ if [ "$RESTART" = true ]; then
         if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
             echo "Stopping existing instance (PID $OLD_PID)..."
             kill "$OLD_PID" 2>/dev/null
-            # Wait for it to exit (max 5s)
-            for i in $(seq 1 10); do
+            # Wait for it to exit (max 15s — graceful shutdown needs time
+            # to close WebSocket connections and drain in-flight requests)
+            for i in $(seq 1 30); do
                 kill -0 "$OLD_PID" 2>/dev/null || break
                 sleep 0.5
             done
@@ -256,10 +257,11 @@ cleanup() {
     # Wait for the proxy to drain connections after receiving SIGINT/SIGTERM.
     # Fix 1 in main.rs added with_graceful_shutdown via tokio::signal::ctrl_c(),
     # so the proxy will finish in-flight requests before exiting. Give it up
-    # to 10s; force-kill if it hangs.
+    # to 15s; force-kill if it hangs. The proxy now also handles SIGTERM
+    # (not just SIGINT) and cancels WebSocket connections on shutdown.
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         echo "Waiting for proxy (PID $PID) to drain connections..."
-        for i in $(seq 1 20); do
+        for i in $(seq 1 30); do
             kill -0 "$PID" 2>/dev/null || break
             sleep 0.5
         done

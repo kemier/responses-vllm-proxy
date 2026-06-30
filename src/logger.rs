@@ -2,8 +2,8 @@ use chrono::Local;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -139,12 +139,16 @@ pub fn init(log_dir: &str, max_total_size_mb: u64, to_stderr: bool, level_str: &
         });
     }
 
-    log(LogLevel::Info, "logger", &format!(
-        "Logging initialized: dir={}, max_total={}MB, level={}",
-        log_dir.display(),
-        max_total_size_mb,
-        level.as_str()
-    ));
+    log(
+        LogLevel::Info,
+        "logger",
+        &format!(
+            "Logging initialized: dir={}, max_total={}MB, level={}",
+            log_dir.display(),
+            max_total_size_mb,
+            level.as_str()
+        ),
+    );
 }
 
 fn run_cleaner(log_dir: PathBuf, max_bytes: u64) {
@@ -208,9 +212,11 @@ fn enforce_size_limit(log_dir: &Path, max_bytes: u64) -> io::Result<()> {
     }
 
     if deleted > 0 {
-        log(LogLevel::Debug, "logger", &format!(
-            "Removed {} old log file(s) to enforce size limit", deleted
-        ));
+        log(
+            LogLevel::Debug,
+            "logger",
+            &format!("Removed {} old log file(s) to enforce size limit", deleted),
+        );
     }
 
     Ok(())
@@ -238,10 +244,15 @@ fn rotate_if_needed(state: &mut LoggerState) {
         .open(&main_log)
         .ok();
 
-    log(LogLevel::Debug, "logger", &format!(
-        "Rotated main.log → {} (was {} bytes)",
-        rotated.display(), state.max_file_size_bytes
-    ));
+    log(
+        LogLevel::Debug,
+        "logger",
+        &format!(
+            "Rotated main.log → {} (was {} bytes)",
+            rotated.display(),
+            state.max_file_size_bytes
+        ),
+    );
 }
 
 /// Write a single record to file and/or stderr. Called only by the
@@ -370,7 +381,10 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
     let id = &Uuid::new_v4().simple().to_string()[..8];
     let filename = format!("error-{}-{}.log", endpoint.replace('/', "-"), ts);
 
-    let filepath = LOG_DIR.get().map(|d| d.join(&filename)).unwrap_or_else(|| PathBuf::from("logs").join(&filename));
+    let filepath = LOG_DIR
+        .get()
+        .map(|d| d.join(&filename))
+        .unwrap_or_else(|| PathBuf::from("logs").join(&filename));
 
     let content = format!(
         "[{}] Error Log — {} (HTTP {})\n\
@@ -393,15 +407,25 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
 
     // Write to stderr
     if *TO_STDERR.get().unwrap_or(&true) {
-        let _ = io::stderr().write_all(format!(
-            "[{}] [error] [request] {} returned {}: see {}\n",
-            Local::now().format("%Y-%m-%d %H:%M:%S"),
-            endpoint, status, filename
-        ).as_bytes());
+        let _ = io::stderr().write_all(
+            format!(
+                "[{}] [error] [request] {} returned {}: see {}\n",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                endpoint,
+                status,
+                filename
+            )
+            .as_bytes(),
+        );
     }
 
     // Write error file (synchronous — error path only)
-    if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&filepath) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&filepath)
+    {
         let _ = f.write_all(content.as_bytes());
     }
 
@@ -409,7 +433,10 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
     log(
         LogLevel::Error,
         "request",
-        &format!("{} returned HTTP {} — saved to {}", endpoint, status, filename),
+        &format!(
+            "{} returned HTTP {} — saved to {}",
+            endpoint, status, filename
+        ),
     );
 }
 
@@ -418,10 +445,18 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
 pub fn extract_error_summary(body: &str, max_len: usize) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         // Try common error paths
-        if let Some(msg) = v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
             return msg.to_string();
         }
-        if let Some(msg) = v.get("error").and_then(|e| e.get("internal_message")).and_then(|m| m.as_str()) {
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("internal_message"))
+            .and_then(|m| m.as_str())
+        {
             return msg.to_string();
         }
         if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {

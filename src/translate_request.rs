@@ -30,7 +30,8 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
     // input array → messages
     if let Some(input_arr) = input.get("input").and_then(|v| v.as_array()) {
         // Track which call_ids have function_call_output
-        let mut output_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut output_call_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for item in input_arr {
             if item.get("type").and_then(|v| v.as_str()) == Some("function_call_output") {
                 if let Some(cid) = item.get("call_id").and_then(|v| v.as_str()) {
@@ -44,43 +45,50 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
 
         let mut pending_tool_calls: Vec<Value> = Vec::new();
         let mut pending_tool_call_ids: Vec<String> = Vec::new();
-        let mut awaiting_tool_outputs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut awaiting_tool_outputs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut deferred_messages: Vec<Value> = Vec::new();
 
         let messages = out["messages"].as_array_mut().unwrap();
 
-        let flush_pending = |pending: &mut Vec<Value>, pending_ids: &mut Vec<String>, messages: &mut Vec<Value>, awaiting: &mut std::collections::HashSet<String>| {
-           if pending.is_empty() {
-               return;
-           }
-            // Merge tool_calls into the previous assistant message if it has
-            // content but no tool_calls. The Chat Completions API expects a
-            // single assistant message with both content and tool_calls —
-            // two consecutive assistant messages confuse some models (e.g.
-            // qwen3 emits EOS after the text preamble instead of continuing
-            // to a tool call on subsequent turns).
-            let should_merge = messages.last()
-                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
-                .map(|r| r == "assistant")
-                .unwrap_or(false)
-                && messages.last()
-                    .map(|m| m.get("tool_calls").is_none())
-                    .unwrap_or(false);
-
-            if should_merge {
-                if let Some(last) = messages.last_mut() {
-                    last["tool_calls"] = json!(pending.clone());
+        let flush_pending =
+            |pending: &mut Vec<Value>,
+             pending_ids: &mut Vec<String>,
+             messages: &mut Vec<Value>,
+             awaiting: &mut std::collections::HashSet<String>| {
+                if pending.is_empty() {
+                    return;
                 }
-            } else {
-                messages.push(json!({"role": "assistant", "tool_calls": pending.clone()}));
-            }
-           for id in pending_ids.drain(..) {
-               if !id.trim().is_empty() {
-                   awaiting.insert(id);
-               }
-           }
-           pending.clear();
-       };
+                // Merge tool_calls into the previous assistant message if it has
+                // content but no tool_calls. The Chat Completions API expects a
+                // single assistant message with both content and tool_calls —
+                // two consecutive assistant messages confuse some models (e.g.
+                // qwen3 emits EOS after the text preamble instead of continuing
+                // to a tool call on subsequent turns).
+                let should_merge = messages
+                    .last()
+                    .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                    .map(|r| r == "assistant")
+                    .unwrap_or(false)
+                    && messages
+                        .last()
+                        .map(|m| m.get("tool_calls").is_none())
+                        .unwrap_or(false);
+
+                if should_merge {
+                    if let Some(last) = messages.last_mut() {
+                        last["tool_calls"] = json!(pending.clone());
+                    }
+                } else {
+                    messages.push(json!({"role": "assistant", "tool_calls": pending.clone()}));
+                }
+                for id in pending_ids.drain(..) {
+                    if !id.trim().is_empty() {
+                        awaiting.insert(id);
+                    }
+                }
+                pending.clear();
+            };
 
         let flush_deferred = |deferred: &mut Vec<Value>, messages: &mut Vec<Value>| {
             for msg in deferred.drain(..) {
@@ -97,7 +105,12 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
             };
 
             if item_type != "function_call" {
-                flush_pending(&mut pending_tool_calls, &mut pending_tool_call_ids, messages, &mut awaiting_tool_outputs);
+                flush_pending(
+                    &mut pending_tool_calls,
+                    &mut pending_tool_call_ids,
+                    messages,
+                    &mut awaiting_tool_outputs,
+                );
             }
 
             match item_type {
@@ -110,7 +123,10 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                     if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
                         let mut text_parts: Vec<String> = Vec::new();
                         for ci in content {
-                            let ct = ci.get("type").and_then(|v| v.as_str()).unwrap_or("input_text");
+                            let ct = ci
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("input_text");
                             match ct {
                                 "input_text" | "text" | "output_text" => {
                                     if let Some(t) = ci.get("text").and_then(|v| v.as_str()) {
@@ -118,7 +134,8 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                                     }
                                 }
                                 "input_image" => {
-                                    if let Some(url) = ci.get("image_url").and_then(|v| v.as_str()) {
+                                    if let Some(url) = ci.get("image_url").and_then(|v| v.as_str())
+                                    {
                                         text_parts.push(format!("[image: {}]", url));
                                     }
                                 }
@@ -135,7 +152,9 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                     }
 
                     // Check if we're awaiting tool outputs
-                    let has_awaiting = awaiting_tool_outputs.iter().any(|id| output_call_ids.contains(id));
+                    let has_awaiting = awaiting_tool_outputs
+                        .iter()
+                        .any(|id| output_call_ids.contains(id));
                     if has_awaiting {
                         deferred_messages.push(message);
                     } else {
@@ -156,29 +175,29 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 }
 
                 "custom_tool_call" => {
-                   // Codex sends apply_patch calls as custom_tool_call items
-                   // with an "input" field (raw patch text) instead of "arguments"
-                   // (JSON). The Chat Completions tool schema we advertise for
-                   // apply_patch declares a single `input` string parameter, so
-                   // the model expects arguments to be JSON: {"input": "..."}.
-                   //
-                   // If we pass the raw patch text as `arguments` directly, the
-                   // model sees a malformed (non-JSON) arguments string in its
-                   // conversation history on follow-up turns and returns an
-                   // empty response (0 output tokens). Wrap the input as JSON
-                   // so the assistant tool_calls entry matches the schema.
-                  //
-                   // Same applies to Code Mode's `exec` and `wait` tools,
-                   // which are freeform (custom) tools that accept raw text
-                   // input (JavaScript source / wait parameters).
-                  //
-                  // NOTE: `wait` is actually a regular function tool, not
-                  // custom. It appears here only if codex sends it as
-                  // custom_tool_call (shouldn't happen in normal flow).
-                   let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                  let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                   let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
-                   let arguments = json!({"input": input}).to_string();
+                    // Codex sends apply_patch calls as custom_tool_call items
+                    // with an "input" field (raw patch text) instead of "arguments"
+                    // (JSON). The Chat Completions tool schema we advertise for
+                    // apply_patch declares a single `input` string parameter, so
+                    // the model expects arguments to be JSON: {"input": "..."}.
+                    //
+                    // If we pass the raw patch text as `arguments` directly, the
+                    // model sees a malformed (non-JSON) arguments string in its
+                    // conversation history on follow-up turns and returns an
+                    // empty response (0 output tokens). Wrap the input as JSON
+                    // so the assistant tool_calls entry matches the schema.
+                    //
+                    // Same applies to Code Mode's `exec` and `wait` tools,
+                    // which are freeform (custom) tools that accept raw text
+                    // input (JavaScript source / wait parameters).
+                    //
+                    // NOTE: `wait` is actually a regular function tool, not
+                    // custom. It appears here only if codex sends it as
+                    // custom_tool_call (shouldn't happen in normal flow).
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = item.get("input").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = json!({"input": input}).to_string();
                     pending_tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",
@@ -189,9 +208,14 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
 
                 "function_call_output" | "custom_tool_call_output" => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let output = item.get("output").map(|v| {
-                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())
-                    }).unwrap_or_default();
+                    let output = item
+                        .get("output")
+                        .map(|v| {
+                            v.as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| v.to_string())
+                        })
+                        .unwrap_or_default();
                     messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -206,7 +230,12 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 _ => {}
             }
         }
-        flush_pending(&mut pending_tool_calls, &mut pending_tool_call_ids, messages, &mut awaiting_tool_outputs);
+        flush_pending(
+            &mut pending_tool_calls,
+            &mut pending_tool_call_ids,
+            messages,
+            &mut awaiting_tool_outputs,
+        );
         flush_deferred(&mut deferred_messages, messages);
     } else if let Some(text) = input.get("input").and_then(|v| v.as_str()) {
         out["messages"].as_array_mut().unwrap().push(json!({
@@ -214,21 +243,37 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
         }));
     }
 
-   // tools
-   if let Some(tools) = input.get("tools").and_then(|v| v.as_array()) {
-       crate::logger::debug("translate_request", &format!("[tools] incoming {} tools from codex", tools.len()));
-       for tool in tools {
-           let ty = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
-           let nm = tool.get("name").and_then(|v| v.as_str()).unwrap_or_else(|| tool.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or(""));
-           crate::logger::debug("translate_request", &format!("[tools]   incoming: type={} name={}", ty, nm));
-       }
-       let mut cc_tools: Vec<Value> = Vec::new();
-       for tool in tools {
+    // tools
+    if let Some(tools) = input.get("tools").and_then(|v| v.as_array()) {
+        crate::logger::debug(
+            "translate_request",
+            &format!("[tools] incoming {} tools from codex", tools.len()),
+        );
+        for tool in tools {
+            let ty = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let nm = tool
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                });
+            crate::logger::debug(
+                "translate_request",
+                &format!("[tools]   incoming: type={} name={}", ty, nm),
+            );
+        }
+        let mut cc_tools: Vec<Value> = Vec::new();
+        for tool in tools {
             let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             // apply_patch custom tool
-           if tool_type == "custom" && tool.get("name").and_then(|v| v.as_str()) == Some("apply_patch") {
-               cc_tools.push(json!({
+            if tool_type == "custom"
+                && tool.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+            {
+                cc_tools.push(json!({
                    "type": "function",
                    "function": {
                        "name": "apply_patch",
@@ -243,25 +288,28 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                        }
                    }
                }));
-               continue;
-           }
+                continue;
+            }
 
-           // Code Mode freeform tool: exec only
-           // This is sent as type "custom" with a freeform format (grammar-based).
-           // vLLM/Chat Completions doesn't support freeform tools, so we convert
-           // it to a standard function tool with a single `input` string parameter.
-           // The model generates JSON {"input": "..."} as arguments, which the
-           // proxy translates back to custom_tool_call items with raw text input.
-           //
-           // NOTE: `wait` is a regular ToolSpec::Function (type "function"),
-           // NOT a freeform/custom tool. It falls through to the generic
-           // function tool handling below with its original parameters
-           // (cell_id, yield_time_ms, max_tokens, terminate).
-           if tool_type == "custom" {
-               let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
-               if name == "exec" {
-                   let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                   cc_tools.push(json!({
+            // Code Mode freeform tool: exec only
+            // This is sent as type "custom" with a freeform format (grammar-based).
+            // vLLM/Chat Completions doesn't support freeform tools, so we convert
+            // it to a standard function tool with a single `input` string parameter.
+            // The model generates JSON {"input": "..."} as arguments, which the
+            // proxy translates back to custom_tool_call items with raw text input.
+            //
+            // NOTE: `wait` is a regular ToolSpec::Function (type "function"),
+            // NOT a freeform/custom tool. It falls through to the generic
+            // function tool handling below with its original parameters
+            // (cell_id, yield_time_ms, max_tokens, terminate).
+            if tool_type == "custom" {
+                let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name == "exec" {
+                    let desc = tool
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    cc_tools.push(json!({
                        "type": "function",
                        "function": {
                            "name": name,
@@ -279,17 +327,20 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                            }
                        }
                    }));
-                   continue;
-               }
-           }
+                    continue;
+                }
+            }
 
-           // Skip built-in tools (web_search, image_generation, etc.)
-           if !tool_type.is_empty() && tool_type != "function" && tool.is_object() {
-               continue;
-           }
+            // Skip built-in tools (web_search, image_generation, etc.)
+            if !tool_type.is_empty() && tool_type != "function" && tool.is_object() {
+                continue;
+            }
 
             let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let params = tool.get("parameters").cloned().unwrap_or(json!({}));
             cc_tools.push(json!({
                 "type": "function",
@@ -300,19 +351,35 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 }
             }));
         }
-       if !cc_tools.is_empty() {
-           // Debug: log tool names and description lengths sent to vLLM
-           for t in &cc_tools {
-               let name = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("?");
-               let desc_len = t.get("function").and_then(|f| f.get("description")).and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
-               crate::logger::debug("translate_request", &format!("[tools] vLLM tool: {} (desc {} chars)", name, desc_len));
-           }
-           out["tools"] = json!(cc_tools);
-       }
+        if !cc_tools.is_empty() {
+            // Debug: log tool names and description lengths sent to vLLM
+            for t in &cc_tools {
+                let name = t
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let desc_len = t
+                    .get("function")
+                    .and_then(|f| f.get("description"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                crate::logger::debug(
+                    "translate_request",
+                    &format!("[tools] vLLM tool: {} (desc {} chars)", name, desc_len),
+                );
+            }
+            out["tools"] = json!(cc_tools);
+        }
     }
 
     // reasoning.effort → reasoning_effort
-    if let Some(effort) = input.get("reasoning").and_then(|r| r.get("effort")).and_then(|v| v.as_str()) {
+    if let Some(effort) = input
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|v| v.as_str())
+    {
         let effort = effort.to_lowercase();
         if !effort.is_empty() {
             out["reasoning_effort"] = json!(effort);
@@ -332,7 +399,10 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
 pub fn inject_thinking(mut payload: Value, model: &str) -> Value {
     let lower_model = model.to_lowercase();
 
-    let effort = payload.get("reasoning_effort").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let effort = payload
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     if let Some(ref effort) = effort {
         let normalized = match effort.as_str() {
@@ -351,19 +421,19 @@ pub fn inject_thinking(mut payload: Value, model: &str) -> Value {
     // Remove "reasoning" object (not valid for chat completions)
     payload.as_object_mut().map(|m| m.remove("reasoning"));
 
-   // Inject chat_template_kwargs
-   if let Some(effort) = &effort {
-       if lower_model.contains("deepseek") {
-           let ds_effort = if effort == "xhigh" { "max" } else { "high" };
-           payload["chat_template_kwargs"] = json!({
-               "thinking": true,
-               "reasoning_effort": ds_effort,
-           });
-       } else if lower_model.contains("glm") {
-           let enable_thinking = effort != "low";
-           payload["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
-       }
-   }
+    // Inject chat_template_kwargs
+    if let Some(effort) = &effort {
+        if lower_model.contains("deepseek") {
+            let ds_effort = if effort == "xhigh" { "max" } else { "high" };
+            payload["chat_template_kwargs"] = json!({
+                "thinking": true,
+                "reasoning_effort": ds_effort,
+            });
+        } else if lower_model.contains("glm") {
+            let enable_thinking = effort != "low";
+            payload["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
+        }
+    }
 
     // Qwen3 models: always inject chat_template_kwargs with enable_thinking.
     // Qwen3-Coder-Instruct defaults to non-thinking, but the chat template
@@ -386,10 +456,14 @@ pub fn inject_thinking(mut payload: Value, model: &str) -> Value {
         payload["max_tokens"] = json!(16384);
     }
 
-   // Request usage in stream (only if streaming)
-   if payload.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
-       payload["stream_options"] = json!({"include_usage": true});
-   }
+    // Request usage in stream (only if streaming)
+    if payload
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        payload["stream_options"] = json!({"include_usage": true});
+    }
 
     payload
 }

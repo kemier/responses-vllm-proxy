@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
-const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6b87953f/oauth2/v2.0/token";
+const TOKEN_ENDPOINT: &str =
+    "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6b87953f/oauth2/v2.0/token";
 const CLIENT_ID: &str = "b46aa582-485a-4a7d-b30e-552dbd790b16";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +138,10 @@ impl TokenManager {
         }
 
         *guard = Some(new_token);
-        logger::info("auth", &format!("EricAI token refreshed (expires_at={})", expires_at));
+        logger::info(
+            "auth",
+            &format!("EricAI token refreshed (expires_at={})", expires_at),
+        );
         Ok(())
     }
 }

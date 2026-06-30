@@ -1,5 +1,5 @@
-use ericai_proxy::translate_request::responses_to_chat_completions;
 use ericai_proxy::translate_request::inject_thinking;
+use ericai_proxy::translate_request::responses_to_chat_completions;
 use serde_json::{json, Value};
 
 #[test]
@@ -95,7 +95,10 @@ fn test_function_call_and_output() {
     assert_eq!(messages[0]["role"], "user");
     assert_eq!(messages[1]["role"], "assistant");
     assert!(messages[1]["tool_calls"].is_array());
-    assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "get_weather");
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
     assert_eq!(messages[1]["tool_calls"][0]["id"], "call_123");
     assert_eq!(messages[2]["role"], "tool");
     assert_eq!(messages[2]["tool_call_id"], "call_123");
@@ -158,7 +161,10 @@ fn test_function_tool_conversion() {
     let out = responses_to_chat_completions("glm", &req, true);
     let tools = out["tools"].as_array().unwrap();
     assert_eq!(tools[0]["function"]["name"], "get_weather");
-    assert_eq!(tools[0]["function"]["parameters"]["properties"]["city"]["type"], "string");
+    assert_eq!(
+        tools[0]["function"]["parameters"]["properties"]["city"]["type"],
+        "string"
+    );
 }
 
 #[test]
@@ -269,12 +275,12 @@ fn test_custom_tool_call_empty_input_still_valid_json() {
     });
     let out = responses_to_chat_completions("glm", &req, true);
     let messages = out["messages"].as_array().unwrap();
-    let args_str = messages[0]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+    let args_str = messages[0]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
     let args: Value = serde_json::from_str(args_str).expect("arguments must be valid JSON");
     assert_eq!(args["input"], "");
 }
-
-
 
 #[test]
 fn test_inject_thinking_deepseek() {
