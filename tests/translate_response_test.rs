@@ -146,15 +146,20 @@ fn test_invalid_json_ignored() {
 }
 
 #[test]
-fn test_think_tag_stripped_to_reasoning() {
+fn test_think_tag_stripped_to_text() {
+    // Commit c47e10a intentionally changed the behavior: text-based think
+    // tags are now stripped MARKERS, and their content is emitted as
+    // visible output_text (not as a reasoning block). Only API-native
+    // reasoning via `delta.reasoning_content` produces thinking blocks.
     let mut t = ResponseTranslator::new("resp_test11", None);
 
-    // Content with think tag
     let events = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>Internal reasoning</think>Actual answer"}}]}"#);
 
-    // Should route think content to reasoning, then output the actual answer
-    assert!(events.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("Internal reasoning")));
+    // Both fragments are emitted as text — tags are stripped.
+    assert!(events.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Internal reasoning")));
     assert!(events.iter().any(|e| e.contains("response.output_text.delta") && e.contains("Actual answer")));
+    // No reasoning events for plain text think tags.
+    assert!(!events.iter().any(|e| e.contains("reasoning_summary_text.delta")));
 }
 
 #[test]
@@ -340,6 +345,10 @@ fn test_regular_function_call_still_streams_deltas() {
 
 #[test]
 fn test_think_open_tag_split_across_chunks() {
+    // After commit c47e10a, think-tag content is emitted as visible text
+    // (the tags themselves are stripped). This test verifies the tag
+    // parser correctly handles tag fragments split across chunks while
+    // routing the content through the text path.
     let mut t = ResponseTranslator::new("resp_split1", None);
 
     // Chunk 1: text + partial opening tag "<thi"
@@ -361,12 +370,11 @@ fn test_think_open_tag_split_across_chunks() {
     let e2 = t.process_line(
         r#"data: {"choices":[{"index":0,"delta":{"content":"nk>reasoning here</think>answer"}}]}"#,
     );
-    // Should route "reasoning here" to reasoning
+    // Both "reasoning here" and "answer" are emitted as text (think tags stripped).
     assert!(
-        e2.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("reasoning here")),
-        "think content must be routed to reasoning"
+        e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("reasoning here")),
+        "think content (between tags) is emitted as visible text"
     );
-    // Should emit "answer" as text
     assert!(
         e2.iter().any(|e| e.contains("response.output_text.delta") && e.contains("answer")),
         "text after closing tag should be emitted"
@@ -386,14 +394,14 @@ fn test_think_close_tag_split_across_chunks() {
     let e1 = t.process_line(
         r#"data: {"choices":[{"index":0,"delta":{"content":"<think>some reasoning</thi"}}]}"#,
     );
-    // Should route "some reasoning" to reasoning
+    // After c47e10a: think-tag content is emitted as visible text.
     assert!(
-        e1.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("some reasoning")),
-        "think content before partial closing tag should be routed to reasoning"
+        e1.iter().any(|e| e.contains("response.output_text.delta") && e.contains("some reasoning")),
+        "think content before partial closing tag should be emitted as text"
     );
     // Should NOT emit "</thi" as reasoning or text
     assert!(
-        !e1.iter().any(|e| e.contains("</thi") || e.contains("thi")),
+        !e1.iter().any(|e| e.contains("</thi")),
         "partial closing tag must not leak"
     );
 
@@ -425,10 +433,11 @@ fn test_think_tag_split_at_every_boundary() {
     t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"k"}}]}"#);
     let e7 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":">brain dump"}}]}"#);
 
-    // After the ">", we should now be inside the think tag
+    // After c47e10a: content after fully assembled opening tag is emitted
+    // as visible text (think tag is just a stripped marker).
     assert!(
-        e7.iter().any(|e| e.contains("reasoning_summary_text.delta") && e.contains("brain dump")),
-        "content after fully assembled opening tag should be routed to reasoning"
+        e7.iter().any(|e| e.contains("response.output_text.delta") && e.contains("brain dump")),
+        "content after fully assembled opening tag should be emitted as text"
     );
 
     // Now close it, also split
@@ -473,18 +482,31 @@ fn test_literal_less_than_not_held_forever() {
 }
 
 #[test]
-fn test_think_tag_never_closed_flushed_as_reasoning() {
-    // If the stream ends while inside a think tag (never closed),
-    // the pending content should be flushed as reasoning.
+fn test_think_tag_never_closed_flushed_as_text() {
+    // After c47e10a: if the stream ends while inside an unclosed think tag,
+    // the pending content is the model's actual answer (not reasoning) and
+    // must be flushed as visible text. See translate_response.rs
+    // flush_and_complete() for the rationale.
     let mut t = ResponseTranslator::new("resp_split5", None);
 
     t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"<think>unfinished reasoning"}}]}"#);
     let done = t.process_line("data: [DONE]");
 
-    // The "unfinished reasoning" should appear in the reasoning summary
+    // The "unfinished reasoning" should appear as text output.
+    let text_blob: String = done
+        .iter()
+        .filter(|e| e.contains("response.output_text.delta") || e.contains("response.output_text.done"))
+        .cloned()
+        .collect();
     assert!(
-        done.iter().any(|e| e.contains("reasoning_summary_text.done") && e.contains("unfinished reasoning")),
-        "unclosed think tag content should be flushed as reasoning on [DONE]"
+        text_blob.contains("unfinished reasoning"),
+        "unclosed think tag content should be flushed as text on [DONE]. Got: {}",
+        text_blob
+    );
+    // And it should NOT be emitted as a reasoning summary.
+    assert!(
+        !done.iter().any(|e| e.contains("reasoning_summary_text.done") && e.contains("unfinished reasoning")),
+        "unclosed think tag content must not produce a reasoning summary"
     );
 }
 

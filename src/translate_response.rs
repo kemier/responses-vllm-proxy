@@ -523,6 +523,15 @@ impl ResponseTranslator {
             return out;
         }
 
+        // If an API-native reasoning block (from `delta.reasoning_content`)
+        // is currently open, close it now before emitting the first text
+        // delta of the response. Without this the reasoning summary item
+        // is left in `in_progress` state, and codex never sees the
+        // `response.reasoning_summary_text.done` event.
+        if self.reasoning_id.is_some() {
+            out.extend(self.stop_reasoning());
+        }
+
         // Single entry() call to get-or-insert the MessageState, then extract
         // the values we need so no further HashMap lookups are required in the
         // hot path. Previously this did 5+ separate lookups per text delta.
@@ -1366,8 +1375,11 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
         .to_string();
     let response_id = if let Some(rest) = id.strip_prefix("chatcmpl_") {
         format!("resp_{}", rest)
-    } else if let Some(rest) = id.strip_prefix("resp_") {
-        rest.to_string()
+    } else if id.starts_with("resp_") {
+        // Already correctly prefixed — keep verbatim. The previous logic
+        // stripped the prefix and then re-added it nowhere, so a
+        // `resp_already` id became `already`.
+        id
     } else {
         format!("resp_{}", id)
     };
