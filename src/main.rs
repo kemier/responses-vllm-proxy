@@ -226,16 +226,73 @@ fn estimate_tokens(cc_payload: &Value) -> usize {
         }
     }
 
-    // Count tools schema (previously not counted at all)
+    // Count tools schema (previously not counted at all).
+    // Use a recursive walker instead of `tool.to_string().len()` to avoid
+    // allocating a full JSON serialization of every tool definition on every
+    // request (Code Mode tool descriptions are 3K+ chars each).
     if let Some(tools) = cc_payload.get("tools").and_then(|t| t.as_array()) {
         for tool in tools {
-            // Serialize each tool definition to measure its size
-            total_chars += tool.to_string().len();
+            total_chars += json_byte_len(tool);
         }
     }
 
     // Rough: ~4 chars per token
     total_chars / 4
+}
+
+/// Approximate the serialized JSON length of a `Value` without allocating
+/// a full JSON string. This is a length-only walker — it counts the bytes
+/// `serde_json::to_string` would produce (within a few percent for normal
+/// inputs; precise enough for token estimation, which is itself a /4
+/// heuristic).
+fn json_byte_len(v: &Value) -> usize {
+    match v {
+        Value::Null => 4, // "null"
+        Value::Bool(true) => 4, // "true"
+        Value::Bool(false) => 5, // "false"
+        Value::Number(n) => {
+            // Numbers: just count the digits/dots via the cheap `as_*` path.
+            // For non-finite (shouldn't occur in JSON), use a small fallback.
+            if let Some(i) = n.as_i64() {
+                let mut len = if i < 0 { 1 } else { 0 };
+                let mut abs = i.unsigned_abs();
+                if abs == 0 { return 1; }
+                while abs > 0 { len += 1; abs /= 10; }
+                len
+            } else if let Some(u) = n.as_u64() {
+                let mut len = 0;
+                let mut abs = u;
+                if abs == 0 { return 1; }
+                while abs > 0 { len += 1; abs /= 10; }
+                len
+            } else {
+                // floats: ~16 chars worst case
+                16
+            }
+        }
+        Value::String(s) => s.len() + 2, // surrounding quotes (escape not counted; close enough)
+        Value::Array(arr) => {
+            let mut len = 2; // []
+            if !arr.is_empty() {
+                len += arr.len() - 1; // commas
+                for item in arr {
+                    len += json_byte_len(item);
+                }
+            }
+            len
+        }
+        Value::Object(obj) => {
+            let mut len = 2; // {}
+            if !obj.is_empty() {
+                len += obj.len() - 1; // commas between pairs
+                for (k, val) in obj {
+                    len += k.len() + 3; // "key":
+                    len += json_byte_len(val);
+                }
+            }
+            len
+        }
+    }
 }
 
 // ─── GET /v1/models ─────────────────────────────────────────────────────────
@@ -521,10 +578,13 @@ pub async fn handle_responses_ws(
         let mut cache_insertion_order: std::collections::VecDeque<String> =
            std::collections::VecDeque::new();
 
-        // Track previous turn's Chat Completions messages to detect
-        // pure-append (good for vLLM prefix/KV-cache) vs prefix-change
-        // (KV-cache break). Reset on each new WebSocket connection.
-        let mut prev_cc_messages: Option<Vec<Value>> = None;
+        // Track previous turn's per-message *signatures* (not the full
+        // messages) to detect pure-append (good for vLLM prefix/KV-cache)
+        // vs prefix-change (KV-cache break). Storing only signatures avoids
+        // a multi-MB Value::clone of the entire messages array every turn
+        // on long conversations with many concurrent clients.
+        // Reset on each new WebSocket connection.
+        let mut prev_cc_signatures: Option<Vec<String>> = None;
         let mut prev_cc_msg_count: usize = 0;
 
         // ── Connection-reuse loop ──────────────────────────────────────
@@ -625,80 +685,94 @@ pub async fn handle_responses_ws(
             // the input array contains ONLY the new items since the last response.
             // We need to merge the cached full input with the new delta items to
             // reconstruct the complete conversation for the Chat Completions API.
-            let mut effective_request = request_json.clone();
+            //
+            // Move `request_json` into `effective_request` (no clone) — for
+            // long conversations this avoids a multi-MB Value::clone every turn.
+            let mut effective_request = request_json;
             let response_id_for_cache = format!("resp_{}", uuid::Uuid::new_v4().simple());
 
-            if let Some(prev_id) = request_json.get("previous_response_id").and_then(|v| v.as_str()) {
-                if !prev_id.is_empty() {
-                    if let Some(cached_req_arc) = response_request_cache.get(prev_id) {
-                        let cached_req = cached_req_arc.as_ref();
-                        // Merge: cached full input + new delta items from this request
-                        let cached_input = cached_req.get("input").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                        let new_items = request_json.get("input")
-                            .and_then(|v| v.as_array())
-                            .cloned()
-                            .unwrap_or_default();
+            // Extract previous_response_id before any further reads/moves.
+            let prev_id_owned: Option<String> = effective_request
+                .get("previous_response_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
 
-                        let mut merged_input = cached_input.clone();
-                        merged_input.extend(new_items);
+            if let Some(prev_id) = prev_id_owned.as_deref() {
+                if let Some(cached_req_arc) = response_request_cache.get(prev_id).cloned() {
+                    let cached_req = cached_req_arc.as_ref();
+                    // Cached input must be cloned (it lives behind Arc<Value>
+                    // shared with the cache). New items are *taken* out of
+                    // effective_request without cloning.
+                    let mut merged_input: Vec<Value> = cached_req
+                        .get("input")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let cached_count = merged_input.len();
+                    let new_items: Vec<Value> = effective_request
+                        .get_mut("input")
+                        .and_then(|v| v.as_array_mut())
+                        .map(std::mem::take)
+                        .unwrap_or_default();
+                    let new_count = new_items.len();
+                    merged_input.extend(new_items);
+                    let total_count = merged_input.len();
+                    effective_request["input"] = Value::Array(merged_input);
 
-                        effective_request["input"] = json!(merged_input);
-
-                        // Restore fields that codex does NOT resend on incremental
-                        // requests: instructions (system prompt), tools, reasoning,
-                        // tool_choice, parallel_tool_calls, etc.
-                        // Without these, the LLM has no system prompt or tool
-                        // definitions → hallucination.
-                        for field in ["instructions", "tools", "reasoning", "tool_choice",
-                            "parallel_tool_calls", "max_output_tokens", "max_tool_calls",
-                            "temperature", "top_p", "truncation", "text",
-                            "safety_identifier", "service_tier", "store",
-                            "prompt_cache_key", "metadata"] {
-                            if effective_request.get(field).is_none() {
-                                if let Some(v) = cached_req.get(field) {
-                                    effective_request[field] = v.clone();
-                                }
+                    // Restore fields that codex does NOT resend on incremental
+                    // requests: instructions (system prompt), tools, reasoning,
+                    // tool_choice, parallel_tool_calls, etc.
+                    // Without these, the LLM has no system prompt or tool
+                    // definitions → hallucination.
+                    for field in ["instructions", "tools", "reasoning", "tool_choice",
+                        "parallel_tool_calls", "max_output_tokens", "max_tool_calls",
+                        "temperature", "top_p", "truncation", "text",
+                        "safety_identifier", "service_tier", "store",
+                        "prompt_cache_key", "metadata"] {
+                        if effective_request.get(field).is_none() {
+                            if let Some(v) = cached_req.get(field) {
+                                effective_request[field] = v.clone();
                             }
                         }
-
-                        logger::info("ws", &format!(
-                            "[{}] Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
-                            conn_short, prev_id, cached_input.len(),
-                            request_json.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-                            merged_input.len()
-                        ));
-                    } else {
-                        // Cache miss: previous_response_id was evicted (FIFO
-                        // at 50 entries) or belongs to a different connection.
-                        // Sending only the delta items (1-3 new items) would
-                        // give the LLM an incomplete conversation → hallucination.
-                        // Instead, send an explicit 409 error so codex retries
-                        // with a full request (no previous_response_id).
-                        logger::error("ws", &format!(
-                            "[{}] previous_response_id={} not found in cache — sending 409 to force full retry",
-                            conn_short, prev_id
-                        ));
-                        let err_payload = json!({
-                            "type": "error",
-                            "status": 409,
-                            "error": {
-                                "message": format!("previous_response_id {} not found in cache — please retry with full context", prev_id)
-                            }
-                        });
-                        let _ = socket.send(axum::extract::ws::Message::Text(
-                            err_payload.to_string()
-                        )).await;
-                        continue 'connection;
                     }
+
+                    logger::info("ws", &format!(
+                        "[{}] Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
+                        conn_short, prev_id, cached_count, new_count, total_count
+                    ));
+                } else {
+                    // Cache miss: previous_response_id was evicted (FIFO
+                    // at 50 entries) or belongs to a different connection.
+                    // Sending only the delta items (1-3 new items) would
+                    // give the LLM an incomplete conversation → hallucination.
+                    // Instead, send an explicit 409 error so codex retries
+                    // with a full request (no previous_response_id).
+                    logger::error("ws", &format!(
+                        "[{}] previous_response_id={} not found in cache — sending 409 to force full retry",
+                        conn_short, prev_id
+                    ));
+                    let err_payload = json!({
+                        "type": "error",
+                        "status": 409,
+                        "error": {
+                            "message": format!("previous_response_id {} not found in cache — please retry with full context", prev_id)
+                        }
+                    });
+                    let _ = socket.send(axum::extract::ws::Message::Text(
+                        err_payload.to_string()
+                    )).await;
+                    continue 'connection;
                 }
             }
 
            // Cache this request's full effective_request under the new response_id
            // for future incremental requests. Store the effective_request (after
            // merge) so the cache always has the complete conversation.
-           // Use Arc to avoid cloning the full request JSON (can be large with
-           // many input items) — previously cloned twice per WS turn.
-           let effective_request_arc = std::sync::Arc::new(effective_request.clone());
+           //
+           // Move `effective_request` into the Arc — no clone. Subsequent
+           // reads use `effective_request_arc.as_ref()` / `.get(...)`.
+           let effective_request_arc = std::sync::Arc::new(effective_request);
            response_request_cache.insert(response_id_for_cache.clone(), effective_request_arc.clone());
            cache_insertion_order.push_back(response_id_for_cache.clone());
            // Limit cache size to prevent unbounded memory growth
@@ -714,65 +788,51 @@ pub async fn handle_responses_ws(
 
             let mut cc_payload = translate_request::responses_to_chat_completions(
                 &backend_model,
-                &effective_request,
+                effective_request_arc.as_ref(),
                 is_stream,
             );
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
-            logger::debug("ws", &format!("[{}] cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {}", conn_short, cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(), cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0)));
+            if logger::is_enabled(logger::LogLevel::Debug) {
+                logger::debug("ws", &format!("[{}] cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {}", conn_short, cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(), cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0)));
 
-            // Debug: dump message roles and content previews
-           if let Some(msgs) = cc_payload.get("messages").and_then(|m| m.as_array()) {
-               let mut msg_summary = Vec::new();
-               for (i, msg) in msgs.iter().enumerate() {
-                   let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                   if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                       let names: Vec<&str> = tc.iter().map(|c| c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("?")).collect();
-                       msg_summary.push(format!("  [{}] {} tool_calls:{}", i, role, names.join(",")));
-                   } else if role == "tool" {
-                       let preview = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").chars().take(80).collect::<String>();
-                       msg_summary.push(format!("  [{}] tool -> {}", i, preview));
-                   } else {
-                       let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                       let preview = content.chars().take(80).collect::<String>();
-                       msg_summary.push(format!("  [{}] {}: {}", i, role, preview));
-                   }
-               }
-               logger::debug("ws", &format!("[{}] cc_payload messages:\n{}", conn_short, msg_summary.join("\n")));
-           }
+                // Debug: dump message roles and content previews
+                if let Some(msgs) = cc_payload.get("messages").and_then(|m| m.as_array()) {
+                    let mut msg_summary = Vec::new();
+                    for (i, msg) in msgs.iter().enumerate() {
+                        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                        if let Some(tc) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                            let names: Vec<&str> = tc.iter().map(|c| c.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("?")).collect();
+                            msg_summary.push(format!("  [{}] {} tool_calls:{}", i, role, names.join(",")));
+                        } else if role == "tool" {
+                            let preview = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").chars().take(80).collect::<String>();
+                            msg_summary.push(format!("  [{}] tool -> {}", i, preview));
+                        } else {
+                            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let preview = content.chars().take(80).collect::<String>();
+                            msg_summary.push(format!("  [{}] {}: {}", i, role, preview));
+                        }
+                    }
+                    logger::debug("ws", &format!("[{}] cc_payload messages:\n{}", conn_short, msg_summary.join("\n")));
+                }
+            }
 
             // Debug: diff messages vs previous turn to verify only-append semantics.
             // Logs the message count, how many are unchanged prefix, and what's new.
+            //
+            // We compare *signatures* (role + tool_call names | tool_call_id |
+            // 40-char content prefix) rather than full Values, and store only
+            // the signature vec across turns. This avoids a per-turn deep
+            // clone of the multi-MB messages array on long conversations —
+            // a significant memory churn point under high concurrency.
             {
                 let msgs = cc_payload.get("messages").and_then(|m| m.as_array());
                 if let Some(msgs) = msgs {
                     let curr_len = msgs.len();
                     let prev_len = prev_cc_msg_count;
-                    // Determine the shared prefix length
-                    let shared = if let Some(ref prev_msgs) = prev_cc_messages {
-                        let mut s = 0;
-                        for (i, pm) in prev_msgs.iter().enumerate() {
-                            if i >= curr_len { break; }
-                            // Compare by role + has_tool_calls + content prefix (fast heuristic)
-                            let cm = &msgs[i];
-                            let pm_role = pm.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                            let cm_role = cm.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                            let pm_has_tc = pm.get("tool_calls").is_some();
-                            let cm_has_tc = cm.get("tool_calls").is_some();
-                            let pm_content = pm.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                            let cm_content = cm.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                            if pm_role == cm_role && pm_has_tc == cm_has_tc
-                                && pm_content.get(..60.min(pm_content.len())) == cm_content.get(..60.min(cm_content.len()))
-                            {
-                                s = i + 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        s
-                    } else { 0 };
-                    let new_count = curr_len.saturating_sub(shared);
 
-                    // Build a compact signature of each message for hashing
+                    // Build a compact signature of each message. Two messages
+                    // with the same signature are treated as identical for
+                    // KV-prefix purposes.
                     let sig = |m: &Value| -> String {
                         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
                         if m.get("tool_calls").is_some() {
@@ -792,24 +852,46 @@ pub async fn handle_responses_ws(
                         }
                     };
 
-                    let curr_sigs: Vec<String> = msgs.iter().map(sig).collect();
+                    // Build current-turn signatures once. We need them for
+                    // storage anyway, and the diff itself reuses them.
+                    let curr_sigs: Vec<String> = msgs.iter().map(&sig).collect();
 
-                   if shared == prev_len && new_count > 0 && shared > 0 {
-                       // Pure append — ideal case
-                       let new_items: Vec<String> = curr_sigs[shared..].to_vec();
-                       logger::debug("ws", &format!(
-                           "[{}] msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
-                           conn_short, shared, new_count, curr_len, new_items.join(", ")
-                       ));
-                   } else if shared < prev_len && prev_len > 0 {
-                       // Prefix changed — KV-cache break!
-                       let removed: Vec<String> = if let Some(ref prev_msgs) = prev_cc_messages {
-                           prev_msgs[shared..].iter().map(sig).collect()
-                       } else { vec![] };
-                       let added: Vec<String> = if shared < curr_len {
-                           curr_sigs[shared..].to_vec()
-                       } else { vec![] };
-                       logger::warn("ws", &format!(
+                    // Determine the shared prefix length by signature compare.
+                    let shared = if let Some(ref prev_sigs) = prev_cc_signatures {
+                        let mut s = 0;
+                        for (i, ps) in prev_sigs.iter().enumerate() {
+                            if i >= curr_len { break; }
+                            if ps == &curr_sigs[i] {
+                                s = i + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        s
+                    } else { 0 };
+                    let new_count = curr_len.saturating_sub(shared);
+
+                    let kv_break = shared < prev_len && prev_len > 0;
+                    let debug_on = logger::is_enabled(logger::LogLevel::Debug);
+
+                    if shared == prev_len && new_count > 0 && shared > 0 {
+                        // Pure append — ideal case (debug only)
+                        if debug_on {
+                            let new_items: &[String] = &curr_sigs[shared..];
+                            logger::debug("ws", &format!(
+                                "[{}] msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
+                                conn_short, shared, new_count, curr_len, new_items.join(", ")
+                            ));
+                        }
+                    } else if kv_break {
+                        // Prefix changed — KV-cache break! Always log (warn).
+                        let removed: &[String] = if let Some(ref prev_sigs) = prev_cc_signatures {
+                            &prev_sigs[shared..]
+                        } else { &[] };
+                        let added: &[String] = if shared < curr_len {
+                            &curr_sigs[shared..]
+                        } else { &[] };
+                        logger::warn("ws", &format!(
                             "[{}] msg_diff: PREFIX CHANGED (KV-cache break!) | shared={} removed={} added={} total={}",
                             conn_short, shared, removed.len(), added.len(), curr_len
                         ));
@@ -820,11 +902,13 @@ pub async fn handle_responses_ws(
                             "[{}]   added:   [{}]", conn_short, added.join(", ")
                         ));
                     } else if prev_len == 0 {
-                        // First turn
-                        logger::debug("ws", &format!(
-                            "[{}] msg_diff: FIRST TURN | total={}", conn_short, curr_len
-                        ));
-                    } else {
+                        // First turn (debug only)
+                        if debug_on {
+                            logger::debug("ws", &format!(
+                                "[{}] msg_diff: FIRST TURN | total={}", conn_short, curr_len
+                            ));
+                        }
+                    } else if debug_on {
                         // shared == prev_len, new_count == 0 (no change?) or edge case
                         logger::debug("ws", &format!(
                             "[{}] msg_diff: no change | prev={} curr={} shared={}",
@@ -832,8 +916,9 @@ pub async fn handle_responses_ws(
                         ));
                     }
 
-                    // Store for next turn
-                    prev_cc_messages = Some(msgs.clone());
+                    // Store signatures (small) for next turn instead of
+                    // cloning the full Vec<Value> (multi-MB on long sessions).
+                    prev_cc_signatures = Some(curr_sigs);
                     prev_cc_msg_count = curr_len;
                 }
             }
@@ -870,7 +955,7 @@ pub async fn handle_responses_ws(
            logger::info("ws", &format!("[{}] WS POST {} model={} stream={}", conn_short, url, backend_model, is_stream));
             logger::info("ws", &format!("[{}] WS POST {} model={} stream={} input_items={}",
                 conn_short, url, backend_model, is_stream,
-                effective_request.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)));
+                effective_request_arc.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)));
 
             // Send the request to EricAI.  While waiting for the upstream
             // response headers (which can take 60+ seconds for large resumed
@@ -970,13 +1055,21 @@ pub async fn handle_responses_ws(
                                while let Some(rel_pos) = buffer[read_pos..].find('\n') {
                                     let pos = read_pos + rel_pos;
                                     let events = translator.process_line(&buffer[read_pos..pos]);
-                                    let _raw_line: String = buffer[read_pos..pos].chars().take(300).collect();
-                                    logger::debug("ws", &format!("[{}] ← upstream line: {}", conn_short, _raw_line));
+                                    // Hot path: only allocate the preview string when
+                                    // debug logging is actually on. With multiple codex
+                                    // clients streaming, this saves an O(n) chars().collect()
+                                    // per upstream SSE line.
+                                    if logger::is_enabled(logger::LogLevel::Debug) {
+                                        let raw_line: String = buffer[read_pos..pos].chars().take(300).collect();
+                                        logger::debug("ws", &format!("[{}] ← upstream line: {}", conn_short, raw_line));
+                                    }
                                     read_pos = pos + 1;
                                    for event in events {
                                        stream_event_count += 1;
-                                       let _preview: String = event.chars().take(500).collect();
-                                       logger::debug("ws", &format!("[{}] → codex #{} (stream): {}", conn_short, stream_event_count, _preview));
+                                       if logger::is_enabled(logger::LogLevel::Debug) {
+                                           let preview: String = event.chars().take(500).collect();
+                                           logger::debug("ws", &format!("[{}] → codex #{} (stream): {}", conn_short, stream_event_count, preview));
+                                       }
                                        // In raw JSON mode, process_line returns JSON objects directly.
                                        if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                                            break 'connection; // socket dead
@@ -1032,8 +1125,10 @@ pub async fn handle_responses_ws(
                let events = translator.process_line(&buffer[read_pos..]);
                for event in events {
                    stream_event_count += 1;
-                   let _preview: String = event.chars().take(500).collect();
-                   logger::debug("ws", &format!("[{}] → codex #{} (flush): {}", conn_short, stream_event_count, _preview));
+                   if logger::is_enabled(logger::LogLevel::Debug) {
+                       let preview: String = event.chars().take(500).collect();
+                       logger::debug("ws", &format!("[{}] → codex #{} (flush): {}", conn_short, stream_event_count, preview));
+                   }
                     if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                         break 'connection; // socket dead
                     }
@@ -1065,8 +1160,10 @@ pub async fn handle_responses_ws(
             // missing output, usage, model, and other fields.
             let done_events = translator.process_line("data: [DONE]");
             for event in done_events {
-                let _preview: String = event.chars().take(500).collect();
-                logger::debug("ws", &format!("[{}] → codex (DONE flush): {}", conn_short, _preview));
+                if logger::is_enabled(logger::LogLevel::Debug) {
+                    let preview: String = event.chars().take(500).collect();
+                    logger::debug("ws", &format!("[{}] → codex (DONE flush): {}", conn_short, preview));
+                }
                 if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                     break 'connection; // socket dead
                 }
@@ -1081,11 +1178,31 @@ pub async fn handle_responses_ws(
             // new tool results — but NOT the assistant's previous text or
             // tool calls. The LLM would not see its own prior output and
             // would re-do the same work, causing an infinite loop.
+            //
+            // Perf note: Three strong refs to the cached request Arc are
+            // alive at this point — the cache entry, `effective_request_arc`,
+            // and `translator.request_json` (an Arc clone). `Arc::make_mut`
+            // on a non-unique Arc deep-clones the inner `Value`, which for
+            // long conversations is multi-MB on EVERY turn. We avoid that
+            // by:
+            //   1. Drop translator + effective_request_arc first.
+            //   2. `remove()` the cached entry from the map (transfers
+            //      ownership; the local Arc is now the sole strong ref).
+            //   3. `Arc::make_mut` is then O(1) (uniquely owned, no clone).
+            //   4. Mutate, reinsert. `cache_insertion_order` is unchanged
+            //      (same key, just round-trips through the map).
             let output_items = translator.get_output_items();
-            logger::debug("ws", &format!("[{}] get_output_items: {} items — types: [{}]", conn_short, output_items.len(), output_items.iter().map(|item| item.get("type").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>().join(", ")));
+            if logger::is_enabled(logger::LogLevel::Debug) {
+                logger::debug("ws", &format!("[{}] get_output_items: {} items — types: [{}]", conn_short, output_items.len(), output_items.iter().map(|item| item.get("type").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>().join(", ")));
+            }
+            // Drop other strong refs to the cached request Arc BEFORE we
+            // take it out of the cache. After these drops, the Arc inside
+            // the HashMap is the only remaining strong ref.
+            drop(translator);
+            drop(effective_request_arc);
             if !output_items.is_empty() {
-                if let Some(cached_arc) = response_request_cache.get(&response_id_for_cache).cloned() {
-                    let mut cached_arc = cached_arc;
+                if let Some(mut cached_arc) = response_request_cache.remove(&response_id_for_cache) {
+                    // Now uniquely owned → make_mut is O(1) (no deep clone).
                     let cached = Arc::make_mut(&mut cached_arc);
                     if let Some(input_arr) = cached.get_mut("input").and_then(|v| v.as_array_mut()) {
                         let before_len = input_arr.len();
@@ -1095,7 +1212,9 @@ pub async fn handle_responses_ws(
                             conn_short, input_arr.len() - before_len, before_len, input_arr.len()
                         ));
                     }
-                    // Put the updated Arc back into the cache
+                    // Put the updated Arc back into the cache. The key is
+                    // already in cache_insertion_order from the earlier
+                    // insert, so order is preserved.
                     response_request_cache.insert(response_id_for_cache.clone(), cached_arc);
                 }
             }
