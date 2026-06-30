@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -67,6 +67,11 @@ static CURRENT_LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Info as u8);
 
 static CLEANER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Count of log records dropped because the channel was full.
+/// Periodically reported instead of emitting one stderr warning per drop,
+/// which under heavy load makes the problem worse than the drop itself.
+static DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Log directory captured at `init()` time, used by `error_request` to
 /// place per-request error files alongside main.log. Read-only after init.
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -107,9 +112,11 @@ pub fn init(log_dir: &str, max_total_size_mb: u64, to_stderr: bool, level_str: &
         level,
     };
 
-    // Bounded channel: 1024 in-flight records. When full, producers drop
-    // messages and emit a one-line stderr warning instead of blocking.
-    let (tx, mut rx) = mpsc::channel::<LogRecord>(1024);
+    // Bounded channel: 8192 in-flight records. Heavy debug traffic with many
+    // concurrent codex clients can easily exceed 1024 in-flight records,
+    // causing log drops. 8192 gives the writer task more headroom while
+    // still capping memory.
+    let (tx, mut rx) = mpsc::channel::<LogRecord>(8192);
 
     // Spawn the dedicated writer task that owns the File. Only this task
     // ever touches the file handle, so no mutex is needed on the hot path.
@@ -282,14 +289,20 @@ fn enqueue(level: LogLevel, module: &str, message: &str) {
             message: message.to_string(),
         };
         if sender.try_send(record).is_err() {
-            // Channel full or closed — drop and warn on stderr.
-            let _ = writeln!(
-                io::stderr(),
-                "[{}] logger: channel full, dropped {} log from {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                level.as_str(),
-                module
-            );
+            // Channel full or closed — drop and count. Emit stderr only at
+            // power-of-two drop counts (1, 2, 4, ... 1024, ...) so a flood
+            // of drops doesn't itself become a perf problem.
+            let n = DROPPED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[{}] logger: channel full, dropped {} log record(s) total (latest: {} from {})",
+                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                    n,
+                    level.as_str(),
+                    module
+                );
+            }
         }
     } else {
         // Logger not initialized — emit directly to stderr as a fallback.
@@ -308,6 +321,25 @@ fn enqueue(level: LogLevel, module: &str, message: &str) {
 /// Core log function (non-blocking).
 pub fn log(level: LogLevel, module: &str, message: &str) {
     enqueue(level, module, message);
+}
+
+/// Cheap lock-free check whether logging at `level` is enabled. Use to
+/// guard expensive log-message construction on hot paths — e.g.:
+///
+/// ```ignore
+/// if logger::is_enabled(logger::LogLevel::Debug) {
+///     let preview: String = chunk.chars().take(300).collect();
+///     logger::debug("ws", &format!("[{}] line: {}", id, preview));
+/// }
+/// ```
+///
+/// The atomic load here is the same one `enqueue` performs internally,
+/// but exposing it publicly lets callers skip building the format string
+/// and any preview/signature allocations when the record would be dropped
+/// by the level filter anyway.
+#[inline]
+pub fn is_enabled(level: LogLevel) -> bool {
+    (level as u8) <= CURRENT_LEVEL.load(Ordering::Relaxed)
 }
 
 /// Convenience macros/functions for each level
