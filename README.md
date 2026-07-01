@@ -192,7 +192,26 @@ Sequence:
 5. **Start proxy**: launch binary, write PID to `/tmp/ericai-proxy-$USER.pid`
 6. **Wait for ready**: poll `/v1/models` until responding
 7. **Catalog generation**: run `scripts/update_catalog.sh`
-8. **Background watcher** (subshell): every 3s checks `config.yaml` hash changes; every 30s runs `scripts/check_health.sh`; regenerates catalog on any change
+8. **Patch codex-acp image capability**: see [Image Capability Patch](#image-capability-patch) below
+9. **Background watcher** (subshell): every 3s checks `config.yaml` hash changes; every 30s runs `scripts/check_health.sh`; regenerates catalog + re-patches codex-acp on any change
+
+#### Image Capability Patch
+
+`codex-acp` (the ACP server that wraps Codex CLI) hardcodes `promptCapabilities.image: true` in its ACP `initialize` response. This is an agent-level capability that tells ACP clients (vscode-acp, Zed) whether to show the image attach button.
+
+Since EricAI models are typically text-only, the patch flips `image: true` to `image: false` so clients hide the attach button. The patch is **bidirectional** and **catalog-driven**:
+
+1. After catalog generation, `start.sh` checks if **any** model in `~/.codex/model_catalog.json` has `"image"` in its `input_modalities`
+2. If yes: sets `image: true` (at least one model supports images)
+3. If no: sets `image: false` (all models are text-only)
+4. This runs at startup **and** on every `config.yaml` change (via the watcher loop)
+
+**Important**: The patched value is read **once per process**. codex-acp loads `dist/index.js` at spawn time. After a config change that adds/removes a multimodal model, you must **restart codex-acp** (disconnect + reconnect in VS Code, or use `ACP: Restart Agent`) for the patched file to take effect.
+
+Per-model granularity (which specific models support images) is handled by the ACP client, not by this patch:
+
+- **vscode-acp**: reads `~/.codex/model_catalog.json` and builds a `modelImageMap` (slug to boolean). Shows/hides the attach button per active model. For Kiro CLI (which doesn't use the EricAI proxy), it uses model name pattern: `claude-*` supports images, all others are text-only.
+- **Zed**: reads the same ACP `initialize` response for the agent-level capability.
 
 #### `scripts/update_catalog.sh` — Model Catalog Generation
 
@@ -228,6 +247,7 @@ Called every 30s by the `start.sh` watcher. Exits `1` if catalog regeneration is
 - **Cached model catalog**: `~/.codex/model_catalog.json` is loaded once at startup into an `Arc<Option<Value>>` and shared across all handlers — previously it was read from disk on every request (13+ reads per WebSocket connection).
 - **Code Mode tool translation**: Codex's Code Mode uses freeform (grammar-based) tools (`exec`, `apply_patch`) that vLLM's Chat Completions API doesn't support. The proxy converts these to standard function tools with a single `input` string parameter. The `wait` tool is a regular `ToolSpec::Function` and passes through unchanged. Model catalog sets `tool_mode: "code_mode"` to enable Code Mode in Codex.
 - **apply_patch grammar in base_instructions**: Codex's `apply_patch` tool description is only 32 chars (`"Use the apply_patch tool to edit files..."`). For OpenAI's hosted GPT-5, the full patch grammar comes from the model's `base_instructions` and the Responses API's grammar-constrained decoding. Since vLLM supports neither, the proxy injects the complete patch grammar into `base_instructions` via `scripts/update_catalog.sh`. The `exec` tool description (~3000 chars) is built dynamically by codex and needs no extra injection.
+- **Image capability patch**: `codex-acp` hardcodes `promptCapabilities.image: true`. `start.sh` patches `dist/index.js` based on the model catalog: if no model supports images, flips to `false`; if any model supports images, sets to `true`. Bidirectional and re-runs on every config change. Per-model granularity is handled by the ACP client (vscode-acp reads the catalog; Kiro uses model name pattern).
 - **KV-cache prefix stability**: The proxy tracks message prefix hashes per turn and logs `KV-cache break!` when the prefix changes. Incremental requests (`previous_response_id`) merge new items into the cached request to preserve prefix stability. vLLM 0.23.0 does not return `prompt_tokens_details.cached_tokens` in API responses, so the proxy logs cache MISS per turn (will auto-detect hits if EricAI upgrades vLLM).
 
 ## Endpoints
