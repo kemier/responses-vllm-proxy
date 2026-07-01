@@ -220,13 +220,14 @@ export CATALOG PORT CONFIG_PATH="$DIR/config.yaml"
 "$DIR/scripts/update_catalog.sh" "$LAB_DIR"
 echo "Catalog written to $CATALOG"
 
-# ─── Patch codex-acp: read catalog for image capability ──────────────────────
-# codex-acp hardcodes promptCapabilities.image: true. We patch dist/index.js
-# to read ~/.codex/model_catalog.json: if NO model has "image" in
-# input_modalities, flip image -> false so ACP clients hide attach button.
-CODEX_ACP_JS="$HOME/.npm-global/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
-if [ -f "$CODEX_ACP_JS" ] && grep -q 'image: true' "$CODEX_ACP_JS" 2>/dev/null; then
-    IMAGE_SUPPORT=$(python3 -c "
+patch_codex_acp_image() {
+    # Patch codex-acp dist/index.js based on model catalog: if ANY model
+    # has "image" in input_modalities, set image -> true; otherwise false.
+    # Called at startup and on every config/catalog change.
+    local js="$HOME/.npm-global/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
+    if [ ! -f "$js" ]; then return; fi
+    local support
+    support=$(python3 -c "
 import json, os
 try:
     with open(os.path.expanduser('~/.codex/model_catalog.json')) as f:
@@ -235,13 +236,16 @@ try:
 except:
     print('true')
 " 2>/dev/null)
-    if [ "$IMAGE_SUPPORT" = "false" ]; then
-        perl -i -0pe 's/(promptCapabilities:\s*\{\s*embeddedContext:\s*true,\s*)image:\s*true/${1}image: false/s' "$CODEX_ACP_JS"
+    if [ "$support" = "false" ]; then
+        perl -i -0pe 's/(promptCapabilities:\s*\{\s*embeddedContext:\s*true,\s*)image:\s*(?:true|false)/${1}image: false/s' "$js"
         echo "Patched codex-acp: image capability -> false (no models support image in catalog)"
     else
-        echo "codex-acp: some models support image, keeping image: true"
+        perl -i -0pe 's/(promptCapabilities:\s*\{\s*embeddedContext:\s*true,\s*)image:\s*(?:true|false)/${1}image: true/s' "$js"
+        echo "Patched codex-acp: image capability -> true (at least one model supports image in catalog)"
     fi
-fi
+}
+
+patch_codex_acp_image
 
 # ─── Watch config + monitor health ──────────────────────────────────────────
 (
@@ -270,6 +274,7 @@ fi
         if [ $REBUILD -eq 1 ]; then
             "$DIR/scripts/update_catalog.sh" "$LAB_DIR"
             echo "Catalog written to $CATALOG"
+            patch_codex_acp_image
         fi
     done
 ) &
