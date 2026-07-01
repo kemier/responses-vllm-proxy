@@ -79,11 +79,11 @@ if [ "$RESTART" = true ]; then
         rm -f "$PIDFILE"
     fi
 
-    # Kill ANY process still holding the port (stray orphans, multiple PIDs)
-    STRAY_PIDS=$(lsof -ti :$PORT 2>/dev/null | sort -u | tr '
+    # Kill ANY process still LISTENING on the port (stray orphans, multiple PIDs)
+    STRAY_PIDS=$(lsof -ti :$PORT -sTCP:LISTEN 2>/dev/null | sort -u | tr '
 ' ' ')
     if [ -n "$STRAY_PIDS" ]; then
-        echo "Killing stray processes on port $PORT (PIDs: $STRAY_PIDS)..."
+        echo "Killing stray listeners on port $PORT (PIDs: $STRAY_PIDS)..."
         for pid in $STRAY_PIDS; do
             kill "$pid" 2>/dev/null
         done
@@ -95,16 +95,16 @@ if [ "$RESTART" = true ]; then
         sleep 1
     fi
 
-    # Wait for port to be fully released (max 10s)
+    # Wait for port listener to be fully released (max 10s)
     for i in $(seq 1 20); do
-        lsof -ti :$PORT 2>/dev/null | head -1 | grep -q . || break
+        lsof -ti :$PORT -sTCP:LISTEN 2>/dev/null | head -1 | grep -q . || break
         sleep 0.5
     done
 
     # Final check
-    if lsof -ti :$PORT 2>/dev/null | head -1 | grep -q .; then
+    if lsof -ti :$PORT -sTCP:LISTEN 2>/dev/null | head -1 | grep -q .; then
         echo "WARNING: Port $PORT still in use after kill attempts!"
-        echo "  Processes: $(lsof -ti :$PORT 2>/dev/null | tr '
+        echo "  Listeners: $(lsof -ti :$PORT -sTCP:LISTEN 2>/dev/null | tr '
 ' ' ')"
         echo "  Manual fix: fuser -k $PORT/tcp"
     fi
