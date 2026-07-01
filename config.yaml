@@ -23,10 +23,8 @@ openai-compatibility:
       models:
           - name: zai-org/GLM-5.1-FP8
             alias: glm-5.1
-          - name: deepseek-ai/DeepSeek-V4-Flash
-            alias: deepseek-v4-flash
-          - name: deepseek-ai/DeepSeek-V4-Pro
-            alias: deepseek-v4-pro
+          - name: Qwen/Qwen3-Coder-Next-FP8
+            alias: Qwen3-Coder
           - name: XiaomiMiMo/MiMo-V2.5-Pro
             alias: mimo-v2.5-pro
           - name: XiaomiMiMo/MiMo-V2.5
@@ -38,4 +36,6 @@ openai-compatibility:
           - name: zai-org/GLM-5.2-FP8
             alias: glm-5.2
           - name: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
-            alias: qwen3
+            alias: Qwen3
+          - name: Qwen/Qwen2.5-14B-Instruct-1M
+            alias: qwen2.5-14b-1m

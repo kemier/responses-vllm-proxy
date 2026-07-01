@@ -149,6 +149,7 @@ async fn main() {
         .route("/backend-api/codex/responses/compact", post(handle_compact))
         .route("/v1/responses/compact", post(handle_compact))
         .route("/health", get(handle_health))
+        .route("/v1/summarize-session", post(handle_summarize_session))
         .with_state(state);
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -1634,4 +1635,378 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
     });
 
     Json(response_obj).into_response()
+}
+
+// ─── POST /v1/summarize-session ────────────────────────────────────────────
+// Accepts a JSON body with `messages` (array of {role, content}) from a
+// chat session and returns a concise summary. Used by vscode-acp to add
+// another session's context as a summary in the current conversation.
+//
+// Model selection strategy:
+//   1. Query the EricAI backend /models endpoint for models with >= 1M
+//      context. Pick the first one that is loaded/healthy.
+//   2. If no 1M model is available, pick the model with the largest
+//      context_window from the cached model catalog.
+//   3. If the catalog is missing, fall back to the first model in config.
+pub async fn handle_summarize_session(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            logger::error("summarize", &format!("Invalid JSON: {}", e));
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
+        }
+    };
+
+    let messages = match request_json.get("messages").and_then(|m| m.as_array()) {
+        Some(arr) if !arr.is_empty() => arr.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Body must contain non-empty 'messages' array",
+            )
+                .into_response();
+        }
+    };
+
+    let session_title = request_json
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // ── Model selection ────────────────────────────────────────────────────
+    let summary_model = select_summary_model(&state).await;
+    logger::info(
+        "summarize",
+        &format!("Selected summary model: {}", summary_model),
+    );
+
+    // ── Build summarization prompt ─────────────────────────────────────────
+    let conversation_text = messages
+        .iter()
+        .map(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("unknown");
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            // For array content (multimodal), extract text parts
+            let content = if content.is_empty() {
+                if let Some(parts) = m.get("content").and_then(|c| c.as_array()) {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::new()
+                }
+            } else {
+                content.to_string()
+            };
+            format!("## {}:\n{}", role, content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let system_prompt =
+        "You are a conversation summarizer. Summarize the following conversation concisely. \
+Focus on: what was asked, what was done, key decisions, and the current state. \
+Keep the summary under 500 words. Do not include code blocks — describe changes in prose.";
+
+    let user_prompt = if session_title.is_empty() {
+        format!("Summarize this conversation:\n\n{}", conversation_text)
+    } else {
+        format!(
+            "Summarize this conversation (title: {}):\n\n{}",
+            session_title, conversation_text
+        )
+    };
+
+    let cc_payload = json!({
+        "model": summary_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "max_tokens": 2000,
+        "temperature": 0.3
+    });
+
+    // ── Send to EricAI backend ─────────────────────────────────────────────
+    let token = match state.token_mgr.get_token().await {
+        Ok(t) => t,
+        Err(e) => {
+            logger::error("summarize", &format!("Auth failed: {}", e));
+            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
+        }
+    };
+
+    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+    let url = format!("{}/chat/completions", base_url);
+
+    logger::info(
+        "summarize",
+        &format!("POST {} model={}", url, summary_model),
+    );
+
+    let resp = match state
+        .http_client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "text/event-stream")
+        .json(&cc_payload)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            logger::error("summarize", &format!("Upstream error: {}", e));
+            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        logger::error(
+            "summarize",
+            &format!(
+                "Upstream {}: {}",
+                status,
+                logger::extract_error_summary(&body_text, 300)
+            ),
+        );
+        return (status, body_text).into_response();
+    }
+
+    // ── Collect streamed response ──────────────────────────────────────────
+    use futures_util::StreamExt;
+    let byte_stream = resp.bytes_stream();
+    let mut stream = byte_stream;
+    let mut buffer = String::new();
+    let mut read_pos: usize = 0;
+    let mut full_text = String::new();
+    let mut finish_reason: Option<String> = None;
+
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                    let pos = read_pos + rel_pos;
+                    let line = buffer[read_pos..pos].to_string();
+                    read_pos = pos + 1;
+                    let line = line.trim_end();
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data.trim() == "[DONE]" {
+                            continue;
+                        }
+                        if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                            if let Some(choices) =
+                                chunk_json.get("choices").and_then(|c| c.as_array())
+                            {
+                                for choice in choices {
+                                    if let Some(delta) = choice.get("delta") {
+                                        if let Some(content) =
+                                            delta.get("content").and_then(|c| c.as_str())
+                                        {
+                                            full_text.push_str(content);
+                                        }
+                                    }
+                                    if let Some(fr) =
+                                        choice.get("finish_reason").and_then(|f| f.as_str())
+                                    {
+                                        finish_reason = Some(fr.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if read_pos > 0 {
+                    buffer.drain(..read_pos);
+                    read_pos = 0;
+                }
+            }
+            Err(e) => {
+                logger::error("summarize", &format!("Stream error: {}", e));
+                break;
+            }
+        }
+    }
+
+    // Flush remaining buffer
+    if read_pos < buffer.len() {
+        let remaining = buffer[read_pos..].trim();
+        if !remaining.is_empty() {
+            if let Some(data) = remaining.strip_prefix("data: ") {
+                if data.trim() != "[DONE]" {
+                    if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                        if let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array())
+                        {
+                            for choice in choices {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(content) =
+                                        delta.get("content").and_then(|c| c.as_str())
+                                    {
+                                        full_text.push_str(content);
+                                    }
+                                }
+                                if let Some(fr) =
+                                    choice.get("finish_reason").and_then(|f| f.as_str())
+                                {
+                                    finish_reason = Some(fr.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    logger::info(
+        "summarize",
+        &format!(
+            "Summary completed: {} chars (finish={:?})",
+            full_text.len(),
+            finish_reason
+        ),
+    );
+
+    let response_obj = json!({
+        "summary": if full_text.is_empty() {
+            "Unable to generate summary."
+        } else {
+            &full_text
+        },
+        "model": summary_model,
+    });
+
+    Json(response_obj).into_response()
+}
+
+/// Select the best model for summarization.
+/// 1. Query EricAI backend /models for 1M+ context models that are loaded.
+/// 2. Fall back to the largest context_window model from the catalog.
+/// 3. Fall back to the first model in config.
+async fn select_summary_model(state: &AppState) -> String {
+    // ── Strategy 1: Query backend for 1M models ───────────────────────────
+    let token = match state.token_mgr.get_token().await {
+        Ok(t) => t,
+        Err(_) => {
+            logger::warn(
+                "summarize",
+                "No token for model query — using catalog fallback",
+            );
+            return select_summary_model_from_catalog(state);
+        }
+    };
+
+    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+    let models_url = format!("{}/models", base_url);
+
+    let resp = state
+        .http_client
+        .get(&models_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await;
+
+    if let Ok(resp) = resp {
+        if resp.status().is_success() {
+            if let Ok(models_json) = resp.json::<Value>().await {
+                if let Some(data) = models_json.get("data").and_then(|d| d.as_array()) {
+                    let mut best_1m: Option<(String, u64)> = None;
+                    for m in data {
+                        let mid = m.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        // Skip tags and non-1M models
+                        if mid.starts_with("tag:") || !mid.contains("1M") || mid.contains("CLI") {
+                            continue;
+                        }
+                        let meta = m.get("rayllm_metadata");
+                        let max_tokens = meta
+                            .and_then(|m| m.get("engine_config"))
+                            .and_then(|e| e.get("max_total_tokens"))
+                            .and_then(|t| t.as_u64())
+                            .unwrap_or(0);
+                        let loaded = meta
+                            .and_then(|m| m.get("demand_status"))
+                            .and_then(|d| d.get("loaded"))
+                            .and_then(|l| l.as_bool())
+                            .unwrap_or(false);
+                        let running = meta
+                            .and_then(|m| m.get("demand_status"))
+                            .and_then(|d| d.get("running_replicas"))
+                            .and_then(|r| r.as_u64())
+                            .unwrap_or(0);
+
+                        if max_tokens >= 1_000_000 && (loaded || running > 0) {
+                            // Prefer loaded models; pick the first one found
+                            if best_1m.is_none()
+                                || (loaded && best_1m.as_ref().unwrap().1 < max_tokens)
+                            {
+                                best_1m = Some((mid.to_string(), max_tokens));
+                            }
+                        }
+                    }
+                    if let Some((model_id, max_tokens)) = best_1m {
+                        logger::info(
+                            "summarize",
+                            &format!(
+                                "Found 1M context model: {} (max_tokens={})",
+                                model_id, max_tokens
+                            ),
+                        );
+                        return model_id;
+                    }
+                }
+            }
+        }
+    }
+
+    logger::info(
+        "summarize",
+        "No 1M model found on backend — falling back to catalog",
+    );
+    select_summary_model_from_catalog(state)
+}
+
+/// Fall back: pick the model with the largest context_window from the catalog.
+fn select_summary_model_from_catalog(state: &AppState) -> String {
+    if let Some(catalog) = state.model_catalog.as_ref() {
+        if let Some(arr) = catalog.get("models").and_then(|m| m.as_array()) {
+            let mut best: Option<(String, u64)> = None;
+            for m in arr {
+                let slug = m.get("slug").and_then(|s| s.as_str()).unwrap_or("");
+                let ctx = m
+                    .get("context_window")
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(0);
+                if best.is_none() || ctx > best.as_ref().unwrap().1 {
+                    best = Some((slug.to_string(), ctx));
+                }
+            }
+            if let Some((slug, ctx)) = best {
+                logger::info(
+                    "summarize",
+                    &format!("Catalog fallback: {} (context_window={})", slug, ctx),
+                );
+                // Resolve alias to backend model ID
+                return state.cfg.resolve_model(&slug);
+            }
+        }
+    }
+
+    // Last resort: first model in config
+    let models = state.cfg.all_models();
+    if let Some((_alias, name)) = models.first() {
+        logger::warn("summarize", &format!("Last-resort fallback: {}", name));
+        return name.clone();
+    }
+
+    "Qwen/Qwen2.5-14B-Instruct-1M".to_string()
 }
