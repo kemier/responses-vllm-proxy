@@ -220,6 +220,29 @@ export CATALOG PORT CONFIG_PATH="$DIR/config.yaml"
 "$DIR/scripts/update_catalog.sh" "$LAB_DIR"
 echo "Catalog written to $CATALOG"
 
+# ─── Patch codex-acp: read catalog for image capability ──────────────────────
+# codex-acp hardcodes promptCapabilities.image: true. We patch dist/index.js
+# to read ~/.codex/model_catalog.json: if NO model has "image" in
+# input_modalities, flip image -> false so ACP clients hide attach button.
+CODEX_ACP_JS="$HOME/.npm-global/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
+if [ -f "$CODEX_ACP_JS" ] && grep -q 'image: true' "$CODEX_ACP_JS" 2>/dev/null; then
+    IMAGE_SUPPORT=$(python3 -c "
+import json, os
+try:
+    with open(os.path.expanduser('~/.codex/model_catalog.json')) as f:
+        models = json.load(f)['models']
+    print('true' if any('image' in m.get('input_modalities', []) for m in models) else 'false')
+except:
+    print('true')
+" 2>/dev/null)
+    if [ "$IMAGE_SUPPORT" = "false" ]; then
+        perl -i -0pe 's/(promptCapabilities:\s*\{\s*embeddedContext:\s*true,\s*)image:\s*true/${1}image: false/s' "$CODEX_ACP_JS"
+        echo "Patched codex-acp: image capability -> false (no models support image in catalog)"
+    else
+        echo "codex-acp: some models support image, keeping image: true"
+    fi
+fi
+
 # ─── Watch config + monitor health ──────────────────────────────────────────
 (
     LAST_HASH=$(sha256sum "$DIR/config.yaml" 2>/dev/null | cut -d' ' -f1)
