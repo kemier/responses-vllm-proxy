@@ -174,12 +174,12 @@ if [ $TOKEN_RC -eq 0 ]; then
     echo "Token synced"
 else
     echo ""
-    echo "❌ Token refresh failed — MSAL refresh token likely expired (7-day max)."
-    echo "   Re-authenticate with:"
-    echo ""
-    echo "     cd \"$LAB_DIR\" && uv run ericai login"
-    echo ""
-    echo "   Then re-run: ./start.sh"
+   echo "❌ Token refresh failed — MSAL refresh token likely expired (7-day max)."
+   echo "   Re-authenticate with:"
+   echo ""
+    echo "     cd \"$LAB_DIR\" && uv run ericai --ericsson-force-new-access-token"
+   echo ""
+   echo "   Then re-run: ./start.sh"
     exit 1
 fi
 
