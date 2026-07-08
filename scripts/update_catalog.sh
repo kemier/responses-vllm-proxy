@@ -30,7 +30,10 @@ for i in $(seq 1 10); do
     sleep 0.5
 done
 
-CATALOG="$CATALOG" PORT="$PORT" CONFIG_PATH="$CONFIG_PATH" CODEX_BIN="$CODEX_BIN" LAB_DIR="$LAB_DIR" uv run --project "$LAB_DIR" python3 << 'PYEOF'
+# NOTE: We `cd` into $LAB_DIR and use plain `uv run` (without --project) so that
+# uv picks up the project's existing .venv. `uv run --project "$LAB_DIR"` from a
+# different cwd ignores .venv and provisions a bare cpython (no pyyaml installed).
+CATALOG="$CATALOG" PORT="$PORT" CONFIG_PATH="$CONFIG_PATH" CODEX_BIN="$CODEX_BIN" LAB_DIR="$LAB_DIR" sh -c 'cd "$LAB_DIR" && uv run python3' << 'PYEOF'
 import json, os, subprocess, sys, urllib.request, tempfile
 
 CATALOG = os.environ["CATALOG"]
