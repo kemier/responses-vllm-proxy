@@ -265,13 +265,62 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 &format!("[tools]   incoming: type={} name={}", ty, nm),
             );
         }
-        let mut cc_tools: Vec<Value> = Vec::new();
-        for tool in tools {
-            let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
+       let mut cc_tools: Vec<Value> = Vec::new();
+       for tool in tools {
+           let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-            // apply_patch custom tool
-            if tool_type == "custom"
-                && tool.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
+           // Namespace tools (e.g. multi_agent_v1 with spawn_agent, send_input,
+           // close_agent, etc.) — flatten into individual function tools.
+           // The Responses API sends these as:
+           //   { "type": "namespace", "name": "multi_agent_v1",
+           //     "description": "...",
+           //     "tools": [ { "type": "function", "name": "spawn_agent", ... }, ... ] }
+           // The Chat Completions API has no namespace concept, so we flatten
+           // each sub-tool into a standalone function with a namespaced name
+           // like "multi_agent_v1__spawn_agent". The proxy translates the
+           // function call name back when sending the response to Codex.
+           if tool_type == "namespace" {
+               let ns_name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+               let ns_desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+               let sub_tools = tool.get("tools").and_then(|v| v.as_array());
+               if let Some(sub_tools) = sub_tools {
+                   for sub_tool in sub_tools {
+                       let sub_name = sub_tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                       let sub_desc = sub_tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                       let sub_params = sub_tool.get("parameters").cloned().unwrap_or(json!({}));
+                       let full_name = if ns_name.is_empty() {
+                           sub_name.to_string()
+                       } else {
+                           format!("{}__{}", ns_name, sub_name)
+                       };
+                       // Prepend namespace description to sub-tool description
+                       // for context, since the namespace grouping is lost.
+                       let full_desc = if ns_desc.is_empty() {
+                           sub_desc.to_string()
+                       } else {
+                           format!("[{}] {}", ns_desc, sub_desc)
+                       };
+                       crate::logger::debug(
+                           "translate_request",
+                           &format!("[tools]   namespace flatten: {} -> {}", ns_name, full_name),
+                       );
+                       cc_tools.push(json!({
+                           "type": "function",
+                           "function": {
+                               "name": full_name,
+                               "description": full_desc,
+                               "strict": false,
+                               "parameters": sub_params,
+                           }
+                       }));
+                   }
+               }
+               continue;
+           }
+
+           // apply_patch custom tool
+           if tool_type == "custom"
+               && tool.get("name").and_then(|v| v.as_str()) == Some("apply_patch")
             {
                 cc_tools.push(json!({
                    "type": "function",

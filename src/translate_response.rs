@@ -3,6 +3,21 @@ use std::collections::HashMap;
 
 use crate::logger;
 
+/// Split a namespaced tool name (e.g. "multi_agent_v1__spawn_agent") into
+/// (namespace, name) = ("multi_agent_v1", "spawn_agent").
+/// Returns (None, full_name) if there is no "__" separator.
+fn split_namespaced_tool_name(full_name: &str) -> (Option<String>, String) {
+    if let Some(idx) = full_name.find("__") {
+        let ns = &full_name[..idx];
+        let name = &full_name[idx + 2..];
+        if !ns.is_empty() && !name.is_empty() {
+            return (Some(ns.to_string()), name.to_string());
+        }
+    }
+    (None, full_name.to_string())
+}
+
+
 /// Return the byte length of the longest suffix of `text` that is also a
 /// prefix of `tag`. Used to detect partial tag matches at chunk boundaries.
 ///
@@ -811,6 +826,7 @@ impl ResponseTranslator {
                 }
 
                 let is_custom = is_custom_tool(&name);
+                let (ns, short_name) = split_namespaced_tool_name(&name);
                 let item = if is_custom {
                     json!({
                         "type": "response.output_item.added",
@@ -822,7 +838,8 @@ impl ResponseTranslator {
                             "status": "in_progress",
                             "input": "",
                             "call_id": new_call_id,
-                            "name": name,
+                            "name": short_name,
+                            "namespace": ns,
                         }
                     })
                 } else {
@@ -836,7 +853,8 @@ impl ResponseTranslator {
                             "status": "in_progress",
                             "arguments": "",
                             "call_id": new_call_id,
-                            "name": name,
+                            "name": short_name,
+                            "namespace": ns,
                         }
                     })
                 };
@@ -1018,6 +1036,7 @@ impl ResponseTranslator {
         };
 
         let is_custom = is_custom_tool(&name);
+        let (ns, short_name) = split_namespaced_tool_name(&name);
 
         if is_custom {
             // apply_patch uses custom_tool_call format: input field, not arguments
@@ -1059,7 +1078,8 @@ impl ResponseTranslator {
                     "status": "completed",
                     "input": input,
                     "call_id": call_id,
-                    "name": name,
+                    "name": short_name,
+                    "namespace": ns,
                 }
             });
             out.push(self.emit("response.output_item.done", item_done));
@@ -1083,7 +1103,8 @@ impl ResponseTranslator {
                     "status": "completed",
                     "arguments": args,
                     "call_id": call_id,
-                    "name": name,
+                    "name": short_name,
+                    "namespace": ns,
                 }
             });
             out.push(self.emit("response.output_item.done", item_done));
@@ -1515,6 +1536,7 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
                             .unwrap_or("")
                             .to_string();
                         let is_custom = is_custom_tool(&name);
+                        let (ns, short_name) = split_namespaced_tool_name(&name);
                         let item = if is_custom {
                             let input = extract_custom_tool_input(&args);
                             json!({
@@ -1523,7 +1545,8 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
                                 "status": "completed",
                                 "input": input,
                                 "call_id": call_id,
-                                "name": name,
+                                "name": short_name,
+                                "namespace": ns,
                             })
                         } else {
                             json!({
@@ -1532,7 +1555,8 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
                                 "status": "completed",
                                 "arguments": args,
                                 "call_id": call_id,
-                                "name": name,
+                                "name": short_name,
+                                "namespace": ns,
                             })
                         };
                         output.push(item);

@@ -35,7 +35,7 @@ openai-compatibility:
             alias: kimi-k2.6
           - name: zai-org/GLM-5.2-FP8
             alias: glm-5.2
-          - name: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
-            alias: Qwen3
+          - name: deepseek-ai/DeepSeek-V4-Pro
+            alias: deepseek-v4-pro
           - name: Qwen/Qwen2.5-14B-Instruct-1M
             alias: qwen2.5-14b-1m

@@ -106,6 +106,7 @@ AUTO_FILLED_FIELDS = {
     "additional_speed_tiers", "availability_nux", "default_verbosity",
     "service_tiers", "upgrade",
     "use_responses_lite",
+    "include_skills_usage_instructions",
 }
 
 # ── Step 2: Fetch proxy model list ──────────────────────────────────────────
