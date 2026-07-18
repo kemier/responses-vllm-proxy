@@ -1,7 +1,7 @@
 # ericai-proxy minimal configuration
 port: 8317
 host: "0.0.0.0"
-debug: false
+debug: true
 auth-dir: "~/.cli-proxy-api"
 api-keys: []
 request-retry: 3

@@ -418,6 +418,16 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
         translate_request::responses_to_chat_completions(&backend_model, &request_json, is_stream);
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
+    logger::debug("responses", &format!(
+        "[responses] cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {} | is_stream: {}",
+        cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(),
+        cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()),
+        cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()),
+        cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()),
+        cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0),
+        is_stream,
+    ));
+
     // Context size warning: estimate tokens and log if exceeds model's context window.
     // We do NOT trim here — codex has its own context management (auto-compaction
     // at 90% of context_window, tool_output_token_limit, etc.). The proxy's

@@ -360,20 +360,54 @@ impl ResponseTranslator {
                     self.completion_pending = true;
                 }
 
-                // Content (text)
+
+                // reasoning_content — some vLLM backends (DeepSeek, Qwen3) use
+                // delta.reasoning_content for reasoning tokens.
+                // reasoning — GLM-5.2 vLLM uses delta.reasoning instead.
+                // Check both keys so reasoning tokens are captured regardless
+                // of which field name the upstream uses.
+                // MUST be processed BEFORE content — GLM-5.2 sometimes sends
+                // both content and reasoning in the same delta. If content is
+                // processed first, it calls stop_reasoning() which closes the
+                // current reasoning block; then the reasoning token creates a
+                // NEW reasoning block, causing interleaved
+                // message/reasoning/message that orphans the first content
+                // chunk (e.g. a stray "There").
+                let rc = delta
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()));
+                if let Some(rc) = rc {
+                    if !rc.is_empty() {
+                        logger::debug("translate_response", &format!(
+                            "[delta] idx={} reasoning_content (len={}): {:?}",
+                            idx, rc.len(), &rc[..rc.len().min(200)]
+                        ));
+                        let events = self.handle_reasoning_content(idx, rc);
+                        out.extend(events);
+                    }
+                }
+
+                // Content (text) — processed AFTER reasoning so that reasoning
+                // tokens in the same delta are appended to the current block
+                // before content closes it via stop_reasoning().
                 if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                     if !content.is_empty() {
+                        logger::debug("translate_response", &format!(
+                            "[delta] idx={} content (len={}): {:?}",
+                            idx, content.len(), &content[..content.len().min(200)]
+                        ));
                         let events = self.handle_content(idx, content);
                         out.extend(events);
                     }
                 }
 
-                // reasoning_content
-                if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                    if !rc.is_empty() {
-                        let events = self.handle_reasoning_content(idx, rc);
-                        out.extend(events);
-                    }
+                // Log all delta keys for debugging
+                if let Some(obj) = delta.as_object() {
+                    let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                    logger::debug("translate_response", &format!(
+                        "[delta] idx={} delta_keys={:?}", idx, keys
+                    ));
                 }
 
                 // Tool calls
@@ -1466,7 +1500,10 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
         .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("reasoning_content"))
+        .and_then(|m| {
+            // Some vLLM backends use "reasoning_content", GLM-5.2 uses "reasoning"
+            m.get("reasoning_content").or_else(|| m.get("reasoning"))
+        })
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
