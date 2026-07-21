@@ -172,6 +172,76 @@ fn test_reasoning_then_text() {
 }
 
 #[test]
+fn test_interleaved_reasoning_and_content_single_block() {
+    // GLM-5.2 sometimes interleaves reasoning_content and content across
+    // multiple chunks: reasoning -> content -> reasoning -> content. Before
+    // the fix, each reasoning resumption reopened a brand-new reasoning
+    // item, producing multiple fragmented reasoning blocks (often trailing
+    // stragglers like "."). After the fix, only the FIRST reasoning segment
+    // becomes a real reasoning block; any reasoning tokens that arrive after
+    // content has started are routed into the message stream as visible
+    // text instead of reopening a new reasoning item.
+    let mut t = ResponseTranslator::new("resp_interleave", None);
+
+    // First reasoning segment
+    let e1 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"First thought"}}]}"#,
+    );
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("response.output_item.added") && e.contains("\"type\":\"reasoning\"")));
+
+    // Content arrives, closing the reasoning block
+    let e2 = t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Answer part 1"}}]}"#);
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("response.reasoning_summary_text.done")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("Answer part 1")));
+
+    // Reasoning resumes after content has already started — must NOT
+    // reopen a new reasoning item.
+    let e3 = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"stray thought"}}]}"#,
+    );
+    assert!(
+        !e3.iter()
+            .any(|e| e.contains("response.output_item.added") && e.contains("\"type\":\"reasoning\"")),
+        "must not reopen a reasoning block after it was closed for this turn"
+    );
+    // The stray reasoning tokens are routed to the message stream instead.
+    assert!(e3
+        .iter()
+        .any(|e| e.contains("response.output_text.delta") && e.contains("stray thought")));
+
+    // More content, then finish.
+    t.process_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Answer part 2"}}]}"#);
+    let finish = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    );
+
+    // Only ONE reasoning item should have been closed (from e2). No
+    // additional reasoning output_item.done should appear at finish.
+    assert!(!finish
+        .iter()
+        .any(|e| e.contains("response.output_item.done") && e.contains("\"type\":\"reasoning\"")));
+
+    let done = t.process_line("data: [DONE]");
+    let completed = done
+        .iter()
+        .find(|e| e.contains("response.completed"))
+        .unwrap();
+    // Exactly one reasoning item in the final output — not two.
+    let reasoning_item_count = completed.matches("\"type\":\"reasoning\"").count();
+    assert_eq!(reasoning_item_count, 0, "message-only completed output should not contain a second reasoning item");
+    // The message text should contain all parts merged together.
+    assert!(completed.contains("Answer part 1"));
+    assert!(completed.contains("stray thought"));
+    assert!(completed.contains("Answer part 2"));
+}
+
+#[test]
 fn test_usage_in_stream() {
     let mut t = ResponseTranslator::new("resp_test8", None);
 

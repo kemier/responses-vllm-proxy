@@ -122,6 +122,13 @@ pub struct ResponseTranslator {
     reasoning_id: Option<String>,
     reasoning_index: Option<usize>,
     reasoning_buf: String,
+    // Once content/tool_calls have closed the reasoning block for this turn,
+    // GLM-style interleaving (reasoning -> content -> reasoning -> content)
+    // must not reopen a new reasoning item — that produces multiple
+    // fragmented reasoning blocks (often trailing stragglers like ".").
+    // After the first close, any further reasoning_content is routed to the
+    // message stream as visible text instead.
+    reasoning_closed_for_turn: bool,
 
     // Message state per choice index (single HashMap instead of 5)
     msg_states: HashMap<usize, MessageState>,
@@ -192,6 +199,7 @@ impl ResponseTranslator {
             reasoning_id: None,
             reasoning_index: None,
             reasoning_buf: String::new(),
+            reasoning_closed_for_turn: false,
             msg_states: HashMap::new(),
             func_states: HashMap::new(),
             next_output_ix: 0,
@@ -670,6 +678,16 @@ impl ResponseTranslator {
     }
 
     fn handle_reasoning_content(&mut self, idx: usize, rc: &str) -> Vec<String> {
+        // If the reasoning block for this turn has already been closed by
+        // an earlier content/tool_call delta, GLM-style interleaving would
+        // otherwise reopen a brand-new reasoning item here — producing
+        // multiple fragmented reasoning blocks (often a trailing "."
+        // straggler). Once closed, route further reasoning tokens into the
+        // message stream as visible text instead.
+        if self.reasoning_closed_for_turn {
+            return self.emit_text_delta(idx, rc);
+        }
+
         let mut out = Vec::new();
 
         if self.reasoning_id.is_none() {
@@ -727,6 +745,10 @@ impl ResponseTranslator {
     fn stop_reasoning(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(rid) = self.reasoning_id.take() {
+            // Latch: once the reasoning block is closed for this turn, any
+            // further reasoning_content deltas (GLM interleaving) are routed
+            // to the content stream instead of reopening a new block.
+            self.reasoning_closed_for_turn = true;
             let rix = self.reasoning_index.take().unwrap();
 
             // Take ownership of the buffer instead of cloning it 3×.
