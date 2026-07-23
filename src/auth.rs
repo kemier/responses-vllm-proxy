@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::Mutex;
 
-const TOKEN_ENDPOINT: &str =
-    "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6b87953f/oauth2/v2.0/token";
-const CLIENT_ID: &str = "b46aa582-485a-4a7d-b30e-552dbd790b16";
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenData {
@@ -24,10 +22,12 @@ pub struct TokenManager {
     /// simultaneously after the cached token expires.
     token: Mutex<Option<TokenData>>,
     client: reqwest::Client,
+    token_endpoint: String,
+    client_id: String,
 }
 
 impl TokenManager {
-    pub fn new(auth_dir: &str) -> Self {
+    pub fn new(auth_dir: &str, token_endpoint: String, client_id: String) -> Self {
         let path = PathBuf::from(auth_dir).join("ericai-ericai-user.json");
         logger::info("auth", &format!("Token file: {:?}", path));
         let token = std::fs::read_to_string(&path)
@@ -37,6 +37,8 @@ impl TokenManager {
             auth_dir: PathBuf::from(auth_dir),
             token: Mutex::new(token),
             client: reqwest::Client::new(),
+            token_endpoint,
+            client_id,
         }
     }
 
@@ -83,9 +85,10 @@ impl TokenManager {
             .ok_or_else(|| "No refresh token".to_string())?;
 
         logger::info("auth", "Refreshing EricAI access token...");
-        let scope = format!("api://{}/API offline_access", CLIENT_ID);
+        let client_id = &self.client_id;
+        let scope = format!("api://{}/API offline_access", client_id);
         let params = [
-            ("client_id", CLIENT_ID),
+            ("client_id", client_id.as_str()),
             ("grant_type", "refresh_token"),
             ("refresh_token", &refresh_token),
             ("scope", &scope),
@@ -93,7 +96,7 @@ impl TokenManager {
 
         let resp = self
             .client
-            .post(TOKEN_ENDPOINT)
+            .post(&self.token_endpoint)
             .form(&params)
             .send()
             .await
@@ -128,12 +131,25 @@ impl TokenManager {
             last_refresh: Some(chrono::Utc::now().to_rfc3339()),
         };
 
-        // Persist to disk
+        // Persist to disk with restrictive permissions (0600)
         let path = self.auth_dir.join("ericai-ericai-user.json");
         if let Ok(json) = serde_json::to_string_pretty(&new_token) {
             let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &json).is_ok() {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                use std::io::Write;
+                let _ = f.write_all(json.as_bytes());
                 let _ = std::fs::rename(&tmp, &path);
+                let _ = std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
             }
         }
 

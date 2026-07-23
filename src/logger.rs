@@ -386,6 +386,24 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
         .map(|d| d.join(&filename))
         .unwrap_or_else(|| PathBuf::from("logs").join(&filename));
 
+    // Truncate bodies to prevent logging sensitive data (CWE-532).
+    // Request bodies may contain system prompts, credentials, PII, or
+    // tool results from .netrc / config files.
+    let max_body_len = 500;
+    let truncate = |s: &str| -> String {
+        if s.len() <= max_body_len {
+            s.to_string()
+        } else {
+            let mut end = max_body_len;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}... (truncated, {} bytes total)", &s[..end], s.len())
+        }
+    };
+    let trunc_request = truncate(request_body);
+    let trunc_response = truncate(response_body);
+
     let content = format!(
         "[{}] Error Log — {} (HTTP {})\n\
          Request ID: {}\n\
@@ -401,8 +419,8 @@ pub fn error_request(endpoint: &str, request_body: &str, response_body: &str, st
         id,
         endpoint,
         status,
-        request_body,
-        response_body,
+        trunc_request,
+        trunc_response,
     );
 
     // Write to stderr

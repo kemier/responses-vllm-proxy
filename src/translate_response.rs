@@ -261,6 +261,27 @@ impl ResponseTranslator {
             Err(_) => return vec![],
         };
 
+        // Basic schema validation: upstream SSE chunks must be JSON objects
+        // with at least one expected top-level key. This prevents forwarding
+        // malformed or unexpected data to the client (CWE-502 mitigation).
+        if !parsed.is_object() {
+            return vec![];
+        }
+        let has_expected_key = parsed.get("choices").is_some()
+            || parsed.get("usage").is_some()
+            || parsed.get("id").is_some()
+            || parsed.get("model").is_some();
+        if !has_expected_key {
+            logger::warn(
+                "translate_response",
+                &format!(
+                    "Unexpected upstream SSE data (no recognized keys), skipping: {}",
+                    &data[..data.len().min(200)]
+                ),
+            );
+            return vec![];
+        }
+
         let mut out = Vec::new();
 
         // Emit response.created on first chunk

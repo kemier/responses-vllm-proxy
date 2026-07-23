@@ -11,8 +11,16 @@ pub struct Config {
     pub debug: bool,
     pub auth_dir: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub api_keys: Vec<String>,
+    /// Azure AD token endpoint URL. Override via ERICAI_TOKEN_ENDPOINT env var.
+    #[serde(default)]
+    pub token_endpoint: String,
+    /// Azure AD client/application ID. Override via ERICAI_CLIENT_ID env var.
+    #[serde(default)]
+    pub client_id: String,
+    /// Maximum requests per minute per client IP. 0 = unlimited.
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit_per_minute: u32,
     #[serde(default)]
     pub openai_compatibility: Vec<OpenAICompatProvider>,
     #[serde(default)]
@@ -49,6 +57,9 @@ fn default_log_level() -> String {
 fn default_log_dir() -> String {
     "logs".to_string()
 }
+fn default_rate_limit() -> u32 {
+    60
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -71,13 +82,20 @@ impl Config {
         let raw = std::fs::read_to_string(path)?;
         let mut cfg: Config = serde_yaml::from_str(&raw)?;
         if cfg.host.is_empty() {
-            cfg.host = "0.0.0.0".to_string();
+            cfg.host = "127.0.0.1".to_string();
         }
         if cfg.auth_dir.starts_with('~') {
             cfg.auth_dir = shellexpand::tilde(&cfg.auth_dir).to_string();
         }
         if cfg.log_dir.starts_with('~') {
             cfg.log_dir = shellexpand::tilde(&cfg.log_dir).to_string();
+        }
+        // Override credentials from environment variables (more secure than config file)
+        if let Ok(ep) = std::env::var("ERICAI_TOKEN_ENDPOINT") {
+            cfg.token_endpoint = ep;
+        }
+        if let Ok(cid) = std::env::var("ERICAI_CLIENT_ID") {
+            cfg.client_id = cid;
         }
         if cfg.debug {
             cfg.log_level = "debug".to_string();

@@ -1,9 +1,18 @@
 # ericai-proxy minimal configuration
 port: 8317
-host: "0.0.0.0"
+host: "127.0.0.1"
 debug: false
 auth-dir: "~/.cli-proxy-api"
+# API keys for client authentication. When non-empty, all requests must
+# include a valid Bearer token. When empty, authentication is disabled.
+# Generate with: openssl rand -hex 32
 api-keys: []
+# Azure AD credentials — can also be set via env vars (preferred):
+#   ERICAI_TOKEN_ENDPOINT, ERICAI_CLIENT_ID
+token-endpoint: "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6b87953f/oauth2/v2.0/token"
+client-id: "b46aa582-485a-4a7d-b30e-552dbd790b16"
+# Max requests per minute per client IP (0 = unlimited)
+rate-limit-per-minute: 60
 request-retry: 3
 
 # Logging

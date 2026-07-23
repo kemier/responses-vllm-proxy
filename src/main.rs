@@ -12,11 +12,13 @@ pub mod translate_response;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    http::{header::AUTHORIZATION, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json,
 };
+use axum::extract::Request;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -35,11 +37,47 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub model_catalog: ModelCatalog,
     pub shutdown: tokio_util::sync::CancellationToken,
+    pub rate_limiter: Arc<RateLimiter>,
 }
 
 /// Pre-allocated SSE keepalive comment bytes — avoids allocating a new
 /// String on every 15-second keepalive tick.
 static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": keepalive\n\n");
+
+/// Simple per-IP rate limiter using a fixed window.
+/// Prevents abuse when the proxy is network-exposed (CWE-770).
+pub struct RateLimiter {
+    buckets: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+    max_per_minute: u32,
+}
+
+impl RateLimiter {
+    pub fn new(max_per_minute: u32) -> Self {
+        Self {
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_per_minute,
+        }
+    }
+
+    pub fn check(&self, client_ip: &str) -> bool {
+        if self.max_per_minute == 0 {
+            return true;
+        }
+        let mut buckets = self.buckets.lock().unwrap();
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(60);
+
+        let entry = buckets.entry(client_ip.to_string()).or_insert((now, 0));
+
+        if now.duration_since(entry.0) > window {
+            *entry = (now, 1);
+            true
+        } else {
+            entry.1 += 1;
+            entry.1 <= self.max_per_minute
+        }
+    }
+}
 
 /// Look up a model's context_window from the cached catalog.
 /// Falls back to 196608 (192K) if the catalog isn't loaded or the model
@@ -85,7 +123,12 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let token_mgr = Arc::new(auth::TokenManager::new(&cfg.auth_dir));
+    let token_mgr = Arc::new(auth::TokenManager::new(
+        &cfg.auth_dir,
+        cfg.token_endpoint.clone(),
+        cfg.client_id.clone(),
+    ));
+    let rate_limiter = Arc::new(RateLimiter::new(cfg.rate_limit_per_minute));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(128)
@@ -123,6 +166,7 @@ async fn main() {
         http_client,
         model_catalog,
         shutdown: shutdown_token.clone(),
+        rate_limiter,
     };
 
     let app = axum::Router::new()
@@ -137,6 +181,7 @@ async fn main() {
         // limit is 2MB, which causes "413 Payload Too Large" errors that
         // manifest as "stream disconnected before completion" in codex.
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         // Fallback routes for codex's hardcoded ChatGPT-style base URL
         // (https://chatgpt.com/backend-api/codex). Only used if someone
         // configures base_url as http://localhost:8317/backend-api/codex
@@ -219,7 +264,10 @@ async fn main() {
             token.cancel();
         }
     });
-    axum::serve(listener, app)
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(async move {
             shutdown_token.cancelled().await;
         })
@@ -360,6 +408,74 @@ fn json_byte_len(v: &Value) -> usize {
                 }
             }
             len
+        }
+    }
+}
+
+// ─── Auth & Rate Limiting Middleware ─────────────────────────────────────────
+/// Validates the API key from the Authorization header against the configured
+/// list. Skips authentication for /health. If no API keys are configured,
+/// authentication is disabled (backward compatibility). Also enforces per-IP
+/// rate limiting.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+
+    // Skip auth for health checks
+    if path == "/health" {
+        return next.run(request).await;
+    }
+
+    // Extract client IP for rate limiting
+    let client_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Rate limit check
+    if !state.rate_limiter.check(&client_ip) {
+        logger::warn(
+            "auth",
+            &format!("Rate limit exceeded for IP: {}", client_ip),
+        );
+        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+    }
+
+    // If no API keys configured, allow all (backward compatibility)
+    if state.cfg.api_keys.is_empty() {
+        return next.run(request).await;
+    }
+
+    // Validate API key from Authorization header
+    let auth_header = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(header) if header.starts_with("Bearer ") => {
+            let key = &header[7..];
+            if state.cfg.api_keys.iter().any(|k| k == key) {
+                next.run(request).await
+            } else {
+                logger::warn(
+                    "auth",
+                    &format!("Invalid API key from IP: {}", client_ip),
+                );
+                (StatusCode::UNAUTHORIZED, "Invalid API key").into_response()
+            }
+        }
+        _ => {
+            logger::warn(
+                "auth",
+                &format!("Missing Authorization header from IP: {}", client_ip),
+            );
+            (StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header")
+                .into_response()
         }
     }
 }

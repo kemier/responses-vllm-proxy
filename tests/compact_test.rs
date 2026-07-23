@@ -120,7 +120,11 @@ openai-compatibility:
     std::fs::write(&config_path, &config_yaml).unwrap();
 
     let cfg = Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
-    let token_mgr = Arc::new(TokenManager::new(auth_dir.to_str().unwrap()));
+    let token_mgr = Arc::new(TokenManager::new(
+        auth_dir.to_str().unwrap(),
+        "https://login.microsoftonline.com/test/oauth2/v2.0/token".to_string(),
+        "test-client-id".to_string(),
+    ));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -132,6 +136,7 @@ openai-compatibility:
         http_client,
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
+        rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
     };
 
     use axum::routing::post;
@@ -206,7 +211,11 @@ openai-compatibility:
     std::fs::write(&config_path, &config_yaml).unwrap();
 
     let cfg = Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
-    let token_mgr = Arc::new(TokenManager::new(auth_dir.to_str().unwrap()));
+    let token_mgr = Arc::new(TokenManager::new(
+        auth_dir.to_str().unwrap(),
+        "https://login.microsoftonline.com/test/oauth2/v2.0/token".to_string(),
+        "test-client-id".to_string(),
+    ));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -218,6 +227,7 @@ openai-compatibility:
         http_client,
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
+        rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
     };
 
     use axum::routing::post;
