@@ -498,13 +498,24 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
         .all_models()
         .iter()
         .map(|(alias, name)| {
-            json!({
+            // Look up the optional context_length from the config model entry.
+            let context_length = state
+                .cfg
+                .ericai_provider()
+                .and_then(|p| {
+                    p.models.iter().find(|m| m.alias == *alias).and_then(|m| m.context_length)
+                });
+            let mut entry = json!({
                 "id": alias,
                 "object": "model",
                 "created": 1700000000,
                 "owned_by": "ericai",
                 "ericai_backend_id": name,
-            })
+            });
+            if let Some(ctx) = context_length {
+                entry["context_length"] = json!(ctx);
+            }
+            entry
         })
         .collect();
 

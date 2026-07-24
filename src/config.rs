@@ -75,6 +75,8 @@ pub struct OpenAICompatProvider {
 pub struct OpenAICompatModel {
     pub name: String,
     pub alias: String,
+    #[serde(default)]
+    pub context_length: Option<u64>,
 }
 
 impl Config {

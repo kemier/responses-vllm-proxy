@@ -32,34 +32,50 @@ openai-compatibility:
       models:
           - name: zai-org/GLM-5.1-FP8
             alias: glm-5.1
+            context-length: 131072
           - name: Qwen/Qwen3-Coder-Next-FP8
             alias: Qwen3-Coder
+            context-length: 262144
           - name: XiaomiMiMo/MiMo-V2.5-Pro
             alias: mimo-v2.5-pro
+            context-length: 131072
           - name: XiaomiMiMo/MiMo-V2.5
             alias: mimo-v2.5
+            context-length: 131072
           - name: moonshotai/Kimi-K2.7-Code
             alias: kimi-k2.7-code
+            context-length: 262144
           - name: moonshotai/Kimi-K2.6
             alias: kimi-k2.6
+            context-length: 262144
           - name: zai-org/GLM-5.2-FP8
             alias: glm-5.2
+            context-length: 131072
           - name: deepseek-ai/DeepSeek-V4-Pro
             alias: deepseek-v4-pro
+            context-length: 131072
           - name: Qwen/Qwen2.5-14B-Instruct-1M
             alias: qwen2.5-14b-1m
+            context-length: 1048576
           # Claude Code compatibility aliases
           - name: zai-org/GLM-5.2-FP8
             alias: claude-opus-4-8
+            context-length: 131072
           - name: zai-org/GLM-5.2-FP8
             alias: claude-sonnet-4-20250514
+            context-length: 131072
           - name: zai-org/GLM-5.2-FP8
             alias: claude-sonnet-4
+            context-length: 131072
           - name: zai-org/GLM-5.2-FP8
             alias: claude-3-5-sonnet
+            context-length: 131072
           - name: zai-org/GLM-5.2-FP8
             alias: claude-3-5-haiku
+            context-length: 131072
           - name: zai-org/GLM-5.2-FP8
             alias: claude-haiku-4
+            context-length: 131072
           - name: zai-org/GLM-5.2-FP8
             alias: claude-opus-4
+            context-length: 131072
