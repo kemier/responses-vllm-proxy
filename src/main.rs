@@ -95,7 +95,7 @@ pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
             }
         }
     }
-    200_000
+    196_608
 }
 
 #[tokio::main]

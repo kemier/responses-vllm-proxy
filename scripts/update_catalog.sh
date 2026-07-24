@@ -117,7 +117,7 @@ try:
     # Build a map of model-id -> context_length from the proxy config.
     # This is the authoritative source (set per-model in config.yaml),
     # preferred over the backend's max_total_tokens which can be wrong
-    # (e.g. GLM-5.2 reports 196608 but real usable context is 131072).
+    # (e.g. GLM-5.2 reports 196608 which is the correct usable context).
     proxy_context_lengths = {}
     for m in proxy_data.get("data", []):
         cl = m.get("context_length")

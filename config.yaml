@@ -50,7 +50,7 @@ openai-compatibility:
             context_length: 262144
           - name: zai-org/GLM-5.2-FP8
             alias: glm-5.2
-            context_length: 131072
+            context_length: 196608
           - name: deepseek-ai/DeepSeek-V4-Pro
             alias: deepseek-v4-pro
             context_length: 131072
@@ -60,22 +60,22 @@ openai-compatibility:
           # Claude Code compatibility aliases
           - name: zai-org/GLM-5.2-FP8
             alias: claude-opus-4-8
-            context_length: 131072
+            context_length: 196608
           - name: zai-org/GLM-5.2-FP8
             alias: claude-sonnet-4-20250514
-            context_length: 131072
+            context_length: 196608
           - name: zai-org/GLM-5.2-FP8
             alias: claude-sonnet-4
-            context_length: 131072
+            context_length: 196608
           - name: zai-org/GLM-5.2-FP8
             alias: claude-3-5-sonnet
-            context_length: 131072
+            context_length: 196608
           - name: zai-org/GLM-5.2-FP8
             alias: claude-3-5-haiku
-            context_length: 131072
+            context_length: 196608
           - name: zai-org/GLM-5.2-FP8
             alias: claude-haiku-4
-            context_length: 131072
+            context_length: 196608
           - name: zai-org/GLM-5.2-FP8
             alias: claude-opus-4
-            context_length: 131072
+            context_length: 196608
