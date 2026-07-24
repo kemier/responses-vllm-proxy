@@ -1483,6 +1483,23 @@ pub async fn handle_chat_completions(
     // Resolve alias in the request
     request_json["model"] = json!(backend_model);
 
+    // Inject thinking-disable for CCR / Claude Code compatibility.
+    // GLM-5.x in thinking mode returns output via the `reasoning` field,
+    // leaving `content` empty. CCR's OpenAI parser only reads `content`,
+    // so it sees an empty response and returns 502 "no text output".
+    // Disabling thinking forces GLM to put its output in `content`.
+    // This only affects the chat/completions passthrough (used by CCR);
+    // the /v1/responses handler uses inject_thinking() which keeps
+    // thinking enabled (codex handles reasoning blocks natively).
+    if let Some(obj) = request_json.as_object_mut() {
+        let kwargs = obj
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| json!({}));
+        if let Some(kw) = kwargs.as_object_mut() {
+            kw.entry("enable_thinking").or_insert(json!(false));
+        }
+    }
+
     let token = match state.token_mgr.get_token().await {
         Ok(t) => t,
         Err(e) => {
