@@ -129,8 +129,17 @@ async fn main() {
         cfg.client_id.clone(),
     ));
     let rate_limiter = Arc::new(RateLimiter::new(cfg.rate_limit_per_minute));
+    // NOTE: We do NOT set a global .timeout() on the client because reqwest's
+    // timeout applies to the ENTIRE request including the streaming body.
+    // For long conversations with large contexts, the upstream may take 5+
+    // minutes to stream the full response. A 300s timeout would kill active
+    // streams mid-generation, causing "Conversation interrupted" in Claude
+    // Code and "stream disconnected" in codex.
+    //
+    // Instead, we rely on per-request timeouts (set via .timeout() on
+    // individual RequestBuilders where needed) and SSE keepalive comments
+    // to prevent idle connection drops.
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(128)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
         .build()
@@ -1459,6 +1468,55 @@ pub async fn handle_responses_ws(
     })
 }
 
+/// Rewrite `delta.reasoning` → `delta.content` in an SSE line.
+///
+/// GLM-5.2 with thinking enabled streams output via `delta.reasoning`
+/// instead of `delta.content`. CCR's OpenAI parser only reads `content`,
+/// so we rewrite the SSE data to move reasoning into content.
+///
+/// This is a lightweight line-level transform — it parses each `data: `
+/// line as JSON, checks for `delta.reasoning`, and if present, moves it
+/// to `delta.content` (removing the `reasoning` key). Non-data lines
+/// (comments, empty lines, `[DONE]`) are passed through unchanged.
+fn rewrite_reasoning_to_content(line: &str) -> String {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("data: ") || trimmed == "data: [DONE]" {
+        return line.to_string();
+    }
+
+    let json_str = &trimmed[6..];
+    let mut v: Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return line.to_string(), // not valid JSON, pass through
+    };
+
+    // Check if any choice has a delta with reasoning
+    let mut changed = false;
+    if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices.iter_mut() {
+            if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                if let Some(reasoning) = delta.remove("reasoning") {
+                    // Move reasoning → content (append if content already exists)
+                    let existing = delta
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let reasoning_str = reasoning.as_str().unwrap_or("");
+                    let combined = format!("{}{}", existing, reasoning_str);
+                    delta.insert("content".to_string(), json!(combined));
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        format!("data: {}\n", v)
+    } else {
+        line.to_string()
+    }
+}
+
 // ─── POST /v1/chat/completions (passthrough) ───────────────────────────────
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
@@ -1483,20 +1541,63 @@ pub async fn handle_chat_completions(
     // Resolve alias in the request
     request_json["model"] = json!(backend_model);
 
-    // Inject thinking-disable for CCR / Claude Code compatibility.
-    // GLM-5.x in thinking mode returns output via the `reasoning` field,
-    // leaving `content` empty. CCR's OpenAI parser only reads `content`,
-    // so it sees an empty response and returns 502 "no text output".
-    // Disabling thinking forces GLM to put its output in `content`.
-    // This only affects the chat/completions passthrough (used by CCR);
-    // the /v1/responses handler uses inject_thinking() which keeps
-    // thinking enabled (codex handles reasoning blocks natively).
-    if let Some(obj) = request_json.as_object_mut() {
-        let kwargs = obj
-            .entry("chat_template_kwargs")
-            .or_insert_with(|| json!({}));
-        if let Some(kw) = kwargs.as_object_mut() {
-            kw.entry("enable_thinking").or_insert(json!(false));
+    // Translate reasoning_effort → chat_template_kwargs for GLM models.
+    // CCR / Claude Code sends effort via the request body (e.g. from --effort flag).
+    // GLM-5.x in thinking mode returns output via the `reasoning` field, leaving
+    // `content` empty. CCR's OpenAI parser only reads `content`, so it sees an
+    // empty response and returns 502 "no text output".
+    //
+    // For the chat/completions passthrough (used by CCR), we need thinking
+    // DISABLED by default so content goes into the `content` field. But if the
+    // user explicitly selects an effort level (low/medium/high/xhigh/max), we
+    // enable thinking and set the appropriate reasoning_effort — the CCR
+    // adapter can then extract the reasoning content.
+    //
+    // The /v1/responses handler uses inject_thinking() which handles this
+    // properly for codex (codex handles reasoning blocks natively).
+    let thinking_enabled;
+    {
+        let lower_model = backend_model.to_lowercase();
+        let mut effort = request_json
+            .get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
+
+        // Remove reasoning_effort if it's not a recognized value
+        if let Some(ref e) = effort {
+            match e.as_str() {
+                "low" | "medium" | "high" | "xhigh" | "max" => {}
+                _ => {
+                    request_json
+                        .as_object_mut()
+                        .map(|o| o.remove("reasoning_effort"));
+                    effort = None;
+                }
+            }
+        }
+
+        thinking_enabled = effort.is_some();
+
+        if let Some(obj) = request_json.as_object_mut() {
+            let kwargs = obj
+                .entry("chat_template_kwargs")
+                .or_insert_with(|| json!({}));
+            if let Some(kw) = kwargs.as_object_mut() {
+                if let Some(ref effort) = effort {
+                    // User selected an effort level — enable thinking
+                    if lower_model.contains("glm") {
+                        let enable = effort != "low";
+                        kw.entry("enable_thinking").or_insert(json!(enable));
+                    } else if lower_model.contains("qwen3") || lower_model.contains("qwen-3") {
+                        let enable = matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh");
+                        kw.entry("enable_thinking").or_insert(json!(enable));
+                    }
+                } else {
+                    // No effort specified — disable thinking (default behavior
+                    // for CCR compatibility, so content goes to `content` field)
+                    kw.entry("enable_thinking").or_insert(json!(false));
+                }
+            }
         }
     }
 
@@ -1535,8 +1636,88 @@ pub async fn handle_chat_completions(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
+                // When thinking is enabled (reasoning_effort set), GLM-5.2
+                // streams output via `delta.reasoning` instead of
+                // `delta.content`. CCR's OpenAI parser only reads `content`,
+                // so it sees an empty response → 502.
+                //
+                // We intercept the SSE stream and rewrite `delta.reasoning`
+                // → `delta.content` so CCR can read the output. We also
+                // handle non-streaming responses the same way (below).
                 let stream = r.bytes_stream();
-                let body = Body::from_stream(stream);
+
+                // Both the thinking-enabled and passthrough paths use a
+                // channel-based stream so we can inject SSE keepalive
+                // comments every 15 seconds. Without keepalive, CCR may
+                // time out while waiting for GLM-5.2 to start generating
+                // on large contexts (prefill can take 30-60+ seconds),
+                // causing "Conversation interrupted" in Claude Code.
+                use tokio::sync::mpsc;
+                let (tx, rx) =
+                    mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
+
+                tokio::spawn(async move {
+                    let mut stream = stream;
+                    let mut buffer = String::new();
+                    let mut read_pos: usize = 0;
+                    let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
+                    sse_keepalive.tick().await; // consume immediate first tick
+
+                    loop {
+                        tokio::select! {
+                            chunk_result = stream.next() => {
+                                match chunk_result {
+                                    Some(Ok(chunk)) => {
+                                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                        while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                            let pos = read_pos + rel_pos;
+                                            let line = &buffer[read_pos..pos];
+                                            read_pos = pos + 1;
+                                            let output = if thinking_enabled {
+                                                rewrite_reasoning_to_content(line)
+                                            } else {
+                                                line.to_string()
+                                            };
+                                            if tx.send(Ok(axum::body::Bytes::from(output))).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        if read_pos > 0 {
+                                            buffer.drain(..read_pos);
+                                            read_pos = 0;
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        logger::error("chat", &format!("Stream error: {}", e));
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = sse_keepalive.tick() => {
+                                if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    // Flush remaining buffer
+                    if read_pos < buffer.len() {
+                        let remaining = &buffer[read_pos..];
+                        if !remaining.trim().is_empty() {
+                            let output = if thinking_enabled {
+                                rewrite_reasoning_to_content(remaining)
+                            } else {
+                                remaining.to_string()
+                            };
+                            let _ = tx.send(Ok(axum::body::Bytes::from(output))).await;
+                        }
+                    }
+                });
+
+                let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                let body = Body::from_stream(translated_stream);
+
                 let mut response = Response::builder()
                     .status(status)
                     .header("content-type", "text/event-stream");
@@ -1547,14 +1728,40 @@ pub async fn handle_chat_completions(
                 }
                 response.body(body).unwrap()
             } else {
-                let body = r.bytes().await.unwrap_or_default();
+                // Non-streaming: if thinking was enabled, GLM-5.2 may return
+                // content in `reasoning` field with empty `content`. Move it.
+                let body_bytes = r.bytes().await.unwrap_or_default();
+                let body_bytes = if thinking_enabled {
+                    if let Ok(mut v) = serde_json::from_slice::<Value>(&body_bytes) {
+                        if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                            for choice in choices.iter_mut() {
+                                if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
+                                    let content_empty = msg.get("content")
+                                        .and_then(|c| c.as_str())
+                                        .map(|s| s.is_empty())
+                                        .unwrap_or(true);
+                                    if content_empty {
+                                        if let Some(reasoning) = msg.remove("reasoning") {
+                                            msg.insert("content".to_string(), reasoning);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        serde_json::to_vec(&v).unwrap_or_else(|_| body_bytes.to_vec())
+                    } else {
+                        body_bytes.to_vec()
+                    }
+                } else {
+                    body_bytes.to_vec()
+                };
                 let mut response = Response::builder().status(status);
                 for (k, v) in &headers {
                     if k != "content-encoding" && k != "transfer-encoding" {
                         response = response.header(k, v);
                     }
                 }
-                response.body(Body::from(body)).unwrap()
+                response.body(Body::from(body_bytes)).unwrap()
             }
         }
         Err(e) => {
