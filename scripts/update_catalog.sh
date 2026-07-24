@@ -114,9 +114,19 @@ try:
     with urllib.request.urlopen(f"http://localhost:{PORT}/v1/models") as resp:
         proxy_data = json.loads(resp.read())
     proxy_ids = sorted(set(m["id"] for m in proxy_data["data"] if not m["id"].startswith("ericai/")))
+    # Build a map of model-id -> context_length from the proxy config.
+    # This is the authoritative source (set per-model in config.yaml),
+    # preferred over the backend's max_total_tokens which can be wrong
+    # (e.g. GLM-5.2 reports 196608 but real usable context is 131072).
+    proxy_context_lengths = {}
+    for m in proxy_data.get("data", []):
+        cl = m.get("context_length")
+        if isinstance(cl, int) and cl > 0:
+            proxy_context_lengths[m["id"]] = cl
 except Exception as e:
     print(f"Warning: could not fetch proxy models: {e}")
     proxy_ids = []
+    proxy_context_lengths = {}
 
 # ── Base instructions: teach LLM to emit clickable link formats ─────────────
 BASE_INSTRUCTIONS = """When referencing code locations, use clickable links so the user can jump directly to source. Links must work in BOTH Zed and VS Code.
@@ -387,7 +397,13 @@ for i, slug in enumerate(proxy_ids):
     if slug in alias_map and backend_id not in ericai_meta:
         print(f"  ⚠️  {slug} (backend {backend_id} not loaded/healthy) — including with defaults")
     levels, default_effort = get_reasoning(slug)
-    context_window = meta.get("max_total_tokens", 200000) or 200000
+    # Prefer the proxy config's context_length (authoritative, per-model),
+    # fall back to the backend metadata, then to 200000.
+    context_window = (
+        proxy_context_lengths.get(slug)
+        or meta.get("max_total_tokens")
+        or 200000
+    )
 
     # Build entry with ONLY fields codex recognizes.
     # Codex auto-fills missing optional fields (see AUTO_FILLED_FIELDS).

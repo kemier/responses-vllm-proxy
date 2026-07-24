@@ -81,7 +81,7 @@ impl RateLimiter {
 }
 
 /// Look up a model's context_window from the cached catalog.
-/// Falls back to 196608 (192K) if the catalog isn't loaded or the model
+/// Falls back to 200000 (200K) if the catalog isn't loaded or the model
 /// isn't found.
 pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
     if let Some(c) = catalog.as_ref() {
@@ -95,7 +95,7 @@ pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
             }
         }
     }
-    196608
+    200_000
 }
 
 #[tokio::main]
@@ -162,7 +162,7 @@ async fn main() {
     } else {
         logger::warn(
             "main",
-            "Model catalog not found — using default context_window=196608",
+            "Model catalog not found — using default context_window=200000",
         );
     }
 
@@ -1863,12 +1863,60 @@ pub async fn handle_messages(
         "messages",
         &format!("POST {} model={} stream={}", url, backend_model, is_stream),
     );
-    logger::debug(
-        "messages",
-        &format!("cc_request keys: {} | stream_options: {}",
-            cc_request.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(),
-            cc_request.get("stream_options").map(|v| v.to_string()).unwrap_or("MISSING".to_string())),
-    );
+
+    // Turn-debug: log request size breakdown to diagnose rapid context growth.
+    if state.cfg.log_turn_debug {
+        let system_len = request_json
+            .get("system")
+            .map(|s| serde_json::to_string(s).unwrap_or_default().len())
+            .unwrap_or(0);
+        let anthropic_msg_count = request_json
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let openai_msg_count = cc_request
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let msgs_bytes = serde_json::to_string(&cc_request["messages"]).unwrap_or_default().len();
+        let tools_count = cc_request
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let tools_bytes = cc_request
+            .get("tools")
+            .map(|t| serde_json::to_string(t).unwrap_or_default().len())
+            .unwrap_or(0);
+        let total_req_bytes = serde_json::to_string(&cc_request).unwrap_or_default().len();
+        let estimated_tokens = estimate_tokens(&cc_request);
+        let context_window = get_context_window(&state.model_catalog, &model);
+        logger::info(
+            "messages",
+            &format!(
+                "[turn-debug] model={} | system_bytes={} | anthropic_msgs={} | openai_msgs={} | msgs_bytes={} | tools_count={} | tools_bytes={} | total_req_bytes={} | ~est_tokens={} | context_window={}",
+                backend_model,
+                system_len,
+                anthropic_msg_count,
+                openai_msg_count,
+                msgs_bytes,
+                tools_count,
+                tools_bytes,
+                total_req_bytes,
+                estimated_tokens,
+                context_window,
+            ),
+        );
+    } else {
+        logger::debug(
+            "messages",
+            &format!("cc_request keys: {} | stream_options: {}",
+                cc_request.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(),
+                cc_request.get("stream_options").map(|v| v.to_string()).unwrap_or("MISSING".to_string())),
+        );
+    }
 
     let resp = state
         .http_client
