@@ -322,6 +322,7 @@ reasoning_profiles = {
     "glm": {
         "levels": [
             {"effort": "low", "description": "Disable deep thinking (enable_thinking: false)"},
+            {"effort": "medium", "description": "Standard thinking mode"},
             {"effort": "high", "description": "Deep thinking enabled (default)"},
         ],
         "default": "high",
@@ -382,11 +383,9 @@ models = []
 for i, slug in enumerate(proxy_ids):
     backend_id = alias_map.get(slug, slug)
 
-    if slug in alias_map and backend_id not in ericai_meta:
-        print(f"  Skipping {slug} (backend {backend_id} not loaded/healthy)")
-        continue
-
     meta = ericai_meta.get(backend_id, {})
+    if slug in alias_map and backend_id not in ericai_meta:
+        print(f"  ⚠️  {slug} (backend {backend_id} not loaded/healthy) — including with defaults")
     levels, default_effort = get_reasoning(slug)
     context_window = meta.get("max_total_tokens", 200000) or 200000
 
