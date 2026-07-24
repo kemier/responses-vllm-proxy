@@ -1,7 +1,7 @@
 # ericai-proxy minimal configuration
 port: 8317
 host: "127.0.0.1"
-debug: true
+debug: false
 auth-dir: "~/.cli-proxy-api"
 # API keys for client authentication. When non-empty, all requests must
 # include a valid Bearer token. When empty, authentication is disabled.
