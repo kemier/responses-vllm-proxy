@@ -5,6 +5,7 @@ pub mod config;
 #[allow(clippy::duplicate_mod)]
 pub mod logger;
 #[allow(clippy::duplicate_mod)]
+pub mod translate_anthropic;
 pub mod translate_request;
 #[allow(clippy::duplicate_mod)]
 pub mod translate_response;
@@ -185,6 +186,7 @@ async fn main() {
             post(handle_responses).get(handle_responses_ws),
         )
         .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/messages", post(handle_messages))
         // Codex can send very large request bodies (up to ~30MB for long
         // conversation contexts with 196K+ tokens). Axum's default body
         // limit is 2MB, which causes "413 Payload Too Large" errors that
@@ -1767,6 +1769,209 @@ pub async fn handle_chat_completions(
         Err(e) => {
             logger::error("chat", &format!("Upstream error: {}", e));
             (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response()
+        }
+    }
+}
+
+// ─── POST /v1/messages (Anthropic Messages API → OpenAI Chat Completions) ───
+/// Native Anthropic Messages API endpoint. Translates Anthropic format to
+/// OpenAI Chat Completions internally, then translates the response back.
+/// This bypasses CCR (Claude Code Router) entirely, fixing broken streaming.
+pub async fn handle_messages(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            logger::error("messages", &format!("Invalid JSON: {}", e));
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
+        }
+    };
+
+    let model = request_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let backend_model = state.cfg.resolve_model(&model);
+    let is_stream = request_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Translate Anthropic → OpenAI Chat Completions
+    let mut cc_request = translate_anthropic::anthropic_to_chat_completions(
+        &backend_model,
+        &request_json,
+        is_stream,
+    );
+
+    // Inject enable_thinking for GLM models (same logic as handle_chat_completions)
+    let lower_model = backend_model.to_lowercase();
+    let effort = cc_request
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase())
+        .filter(|e| matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max"));
+
+    if let Some(obj) = cc_request.as_object_mut() {
+        let kwargs = obj
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| json!({}));
+        if let Some(kw) = kwargs.as_object_mut() {
+            if let Some(ref effort) = effort {
+                if lower_model.contains("glm") {
+                    let enable = effort != "low";
+                    kw.entry("enable_thinking").or_insert(json!(enable));
+                } else if lower_model.contains("qwen3") || lower_model.contains("qwen-3") {
+                    let enable = matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh");
+                    kw.entry("enable_thinking").or_insert(json!(enable));
+                }
+            } else {
+                kw.entry("enable_thinking").or_insert(json!(false));
+            }
+        }
+    }
+
+    let token = match state.token_mgr.get_token().await {
+        Ok(t) => t,
+        Err(e) => {
+            logger::error("messages", &format!("Auth failed: {}", e));
+            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
+        }
+    };
+
+    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+    let url = format!("{}/chat/completions", base_url);
+
+    logger::info(
+        "messages",
+        &format!("POST {} model={} stream={}", url, backend_model, is_stream),
+    );
+    logger::debug(
+        "messages",
+        &format!("cc_request keys: {} | stream_options: {}",
+            cc_request.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(),
+            cc_request.get("stream_options").map(|v| v.to_string()).unwrap_or("MISSING".to_string())),
+    );
+
+    let resp = state
+        .http_client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "text/event-stream")
+        .json(&cc_request)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+
+            if is_stream {
+                let stream = r.bytes_stream();
+                use tokio::sync::mpsc;
+                let (tx, rx) =
+                    mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
+
+                let model_for_translator = backend_model.clone();
+                tokio::spawn(async move {
+                    let mut translator =
+                        translate_anthropic::AnthropicStreamTranslator::new(&model_for_translator);
+                    let mut stream = stream;
+                    let mut buffer = String::new();
+                    let mut read_pos: usize = 0;
+                    let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
+                    sse_keepalive.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            chunk_result = stream.next() => {
+                                match chunk_result {
+                                    Some(Ok(chunk)) => {
+                                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                        while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                            let pos = read_pos + rel_pos;
+                                            let line = &buffer[read_pos..pos];
+                                            read_pos = pos + 1;
+                                            let events = translator.translate_line(line);
+                                            for event in events {
+                                                if tx.send(Ok(axum::body::Bytes::from(event))).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        if read_pos > 0 {
+                                            buffer.drain(..read_pos);
+                                            read_pos = 0;
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        logger::error("messages", &format!("Stream error: {}", e));
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = sse_keepalive.tick() => {
+                                if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if read_pos < buffer.len() {
+                        let remaining = &buffer[read_pos..];
+                        if !remaining.trim().is_empty() {
+                            let events = translator.translate_line(remaining);
+                            for event in events {
+                                let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                            }
+                        }
+                    }
+                    let finish_events = translator.translate_line("data: [DONE]");
+                    for event in finish_events {
+                        let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                    }
+                });
+
+                let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                let body = Body::from_stream(translated_stream);
+
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "text/event-stream")
+                    .body(body)
+                    .unwrap()
+            } else {
+                let body_bytes = r.bytes().await.unwrap_or_default();
+                let cc_response: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!({}));
+                let anthropic_response =
+                    translate_anthropic::chat_completions_to_anthropic(&backend_model, &cc_response);
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&anthropic_response).unwrap_or_default()))
+                    .unwrap()
+            }
+        }
+        Err(e) => {
+            logger::error("messages", &format!("Upstream error: {}", e));
+            let error = json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": format!("Upstream error: {}", e)
+                }
+            });
+            (
+                StatusCode::BAD_GATEWAY,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                serde_json::to_vec(&error).unwrap_or_default(),
+            )
+                .into_response()
         }
     }
 }

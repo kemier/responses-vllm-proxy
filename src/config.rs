@@ -143,6 +143,12 @@ impl Config {
         if let Some(stripped) = alias.strip_prefix("ericai/") {
             return stripped.to_string();
         }
+        // Claude Code compatibility: map any unmapped claude-* model to glm-5.2
+        if alias.starts_with("claude-") {
+            if let Some(name) = self.model_lookup.get("glm-5.2") {
+                return name.clone();
+            }
+        }
         alias.to_string()
     }
 }

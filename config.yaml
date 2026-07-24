@@ -1,7 +1,7 @@
 # ericai-proxy minimal configuration
 port: 8317
 host: "127.0.0.1"
-debug: false
+debug: true
 auth-dir: "~/.cli-proxy-api"
 # API keys for client authentication. When non-empty, all requests must
 # include a valid Bearer token. When empty, authentication is disabled.
@@ -48,3 +48,18 @@ openai-compatibility:
             alias: deepseek-v4-pro
           - name: Qwen/Qwen2.5-14B-Instruct-1M
             alias: qwen2.5-14b-1m
+          # Claude Code compatibility aliases
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-opus-4-8
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-sonnet-4-20250514
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-sonnet-4
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-3-5-sonnet
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-3-5-haiku
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-haiku-4
+          - name: zai-org/GLM-5.2-FP8
+            alias: claude-opus-4

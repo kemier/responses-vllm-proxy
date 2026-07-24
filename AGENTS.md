@@ -22,6 +22,7 @@ Codex CLI / vscode-acp / Zed codex-acp
           ├─ POST /v1/responses        → HTTP streaming SSE translation
           ├─ GET  /v1/responses        → WebSocket streaming translation
           ├─ POST /v1/chat/completions → passthrough
+          |- POST /v1/messages       -> Anthropic Messages API (Claude Code)
           ├─ POST /v1/responses/compact → compaction wrapper
           └─ GET  /v1/models           → model list from config
               └─ EricAI vLLM (https://ray.sero.gic.ericsson.se/backendsso/v1)
@@ -34,6 +35,7 @@ Codex CLI / vscode-acp / Zed codex-acp
 | `src/main.rs` | HTTP/WebSocket routes, request handling, incremental request merging, KV-cache prefix tracking |
 | `src/translate_request.rs` | Responses API → Chat Completions translation (messages, tools, thinking injection) |
 | `src/translate_response.rs` | Chat Completions streaming → Responses API SSE events (content, tool_calls, reasoning, usage) |
+| src/translate_anthropic.rs | Anthropic Messages API <-> OpenAI Chat Completions translation (request + streaming response, used by Claude Code) |
 | `src/auth.rs` | Microsoft SSO token management (refresh, caching) |
 | `src/config.rs` | YAML config parsing |
 | `src/logger.rs` | Custom async logger with file rotation and size limits |
