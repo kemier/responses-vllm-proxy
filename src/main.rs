@@ -1513,7 +1513,7 @@ fn rewrite_reasoning_to_content(line: &str) -> String {
     }
 
     if changed {
-        format!("data: {}\n", v)
+        format!("data: {}", v)
     } else {
         line.to_string()
     }
@@ -1671,19 +1671,20 @@ pub async fn handle_chat_completions(
                                 match chunk_result {
                                     Some(Ok(chunk)) => {
                                         buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                        while let Some(rel_pos) = buffer[read_pos..].find('\n') {
-                                            let pos = read_pos + rel_pos;
-                                            let line = &buffer[read_pos..pos];
-                                            read_pos = pos + 1;
-                                            let output = if thinking_enabled {
-                                                rewrite_reasoning_to_content(line)
-                                            } else {
-                                                line.to_string()
-                                            };
-                                            if tx.send(Ok(axum::body::Bytes::from(output))).await.is_err() {
-                                                return;
-                                            }
-                                        }
+                                       while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                           let pos = read_pos + rel_pos;
+                                           let line = &buffer[read_pos..pos];
+                                           read_pos = pos + 1;
+                                           let output = if thinking_enabled {
+                                               rewrite_reasoning_to_content(line)
+                                           } else {
+                                               line.to_string()
+                                           };
+                                            let framed = format!("{}\n", output);
+                                            if tx.send(Ok(axum::body::Bytes::from(framed))).await.is_err() {
+                                               return;
+                                           }
+                                       }
                                         if read_pos > 0 {
                                             buffer.drain(..read_pos);
                                             read_pos = 0;
@@ -1704,17 +1705,18 @@ pub async fn handle_chat_completions(
                         }
                     }
                     // Flush remaining buffer
-                    if read_pos < buffer.len() {
-                        let remaining = &buffer[read_pos..];
-                        if !remaining.trim().is_empty() {
-                            let output = if thinking_enabled {
-                                rewrite_reasoning_to_content(remaining)
-                            } else {
-                                remaining.to_string()
-                            };
-                            let _ = tx.send(Ok(axum::body::Bytes::from(output))).await;
-                        }
-                    }
+                   if read_pos < buffer.len() {
+                       let remaining = &buffer[read_pos..];
+                       if !remaining.trim().is_empty() {
+                           let output = if thinking_enabled {
+                               rewrite_reasoning_to_content(remaining)
+                           } else {
+                               remaining.to_string()
+                           };
+                            let framed = format!("{}\n", output);
+                            let _ = tx.send(Ok(axum::body::Bytes::from(framed))).await;
+                       }
+                   }
                 });
 
                 let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
