@@ -722,32 +722,59 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
                 }
             }
 
-            // Flush remaining buffer
-            if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
-                let events = translator.process_line(&buffer[read_pos..]);
-                for event in events {
-                    if tx
-                        .send(Ok(axum::body::Bytes::from(event.into_bytes())))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
+           // Flush remaining buffer
+           if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
+               let events = translator.process_line(&buffer[read_pos..]);
+               for event in events {
+                   if tx
+                       .send(Ok(axum::body::Bytes::from(event.into_bytes())))
+                       .await
+                       .is_err()
+                   {
+                       return;
+                   }
+               }
+           }
 
-            // Send [DONE]
-            let events = translator.process_line("data: [DONE]");
-            for event in events {
-                if tx
-                    .send(Ok(axum::body::Bytes::from(event.into_bytes())))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
+           // If the translator detected an in-stream upstream error (e.g.
+           // vLLM returned `{"message":"upstream error","code":503}` as a
+           // `data:` line), surface it as an error event instead of letting
+           // the [DONE] flush emit a successful response.completed. Without
+           // this, codex treats the turn as completed-but-empty (end_turn,
+           // 0 tokens, usage 0%) and the user sees no response.
+           if let Some((code, msg)) = translator.upstream_error() {
+               logger::error("responses", &format!(
+                   "Upstream in-stream error (code={}) — sending error event instead of response.completed: {}",
+                   code, &msg[..msg.len().min(300)]
+               ));
+               let err_payload = json!({
+                   "type": "error",
+                   "status": code,
+                   "error": {
+                       "message": format!("Upstream error ({}): {}", code, msg)
+                   }
+               });
+               let err_event = format!("event: error\ndata: {}\n\n", err_payload);
+               if tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await.is_err() {
+                   return;
+               }
+               // Do NOT send [DONE] / response.completed — the error event
+               // above signals codex to retry/fallback.
+               return;
+           }
+
+           // Send [DONE]
+           let events = translator.process_line("data: [DONE]");
+           for event in events {
+               if tx
+                   .send(Ok(axum::body::Bytes::from(event.into_bytes())))
+                   .await
+                   .is_err()
+               {
+                   return;
+               }
+           }
+       });
 
         // Convert the receiver into a stream for the response body.
         // When the client disconnects, Axum drops the Body, which drops rx,
@@ -1356,25 +1383,49 @@ pub async fn handle_responses_ws(
                 }
             }
 
-            // If the upstream stream errored, send an error event — NOT response.completed.
-            // Codex's parse_wrapped_websocket_error_event will map this to ApiError and
-            // trigger proper retry/fallback logic.
-            if stream_errored {
-                let err_payload = json!({
-                    "type": "error",
-                    "status": 502,
-                    "error": {
-                        "message": "Upstream stream error — connection terminated before response completed"
-                    }
-                });
-                let _ = socket.send(axum::extract::ws::Message::Text(
-                    err_payload.to_string()
-                )).await;
-                continue 'connection;
-            }
+           // If the upstream stream errored, send an error event — NOT response.completed.
+           // Codex's parse_wrapped_websocket_error_event will map this to ApiError and
+           // trigger proper retry/fallback logic.
+           if stream_errored {
+               let err_payload = json!({
+                   "type": "error",
+                   "status": 502,
+                   "error": {
+                       "message": "Upstream stream error — connection terminated before response completed"
+                   }
+               });
+               let _ = socket.send(axum::extract::ws::Message::Text(
+                   err_payload.to_string()
+               )).await;
+               continue 'connection;
+           }
 
-            // Flush remaining buffer
-           if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
+           // If the translator detected an in-stream upstream error (e.g.
+           // vLLM returned `{"message":"upstream error","code":503}` as a
+           // `data:` line), surface it as an error event instead of letting
+           // the [DONE] flush emit a successful response.completed. Without
+           // this, codex treats the turn as completed-but-empty (end_turn,
+           // 0 tokens, usage 0%) and the user sees no response.
+           if let Some((code, msg)) = translator.upstream_error() {
+               logger::error("ws", &format!(
+                   "[{}] Upstream in-stream error (code={}) — sending error event instead of response.completed: {}",
+                   conn_short, code, &msg[..msg.len().min(300)]
+               ));
+               let err_payload = json!({
+                   "type": "error",
+                   "status": code,
+                   "error": {
+                       "message": format!("Upstream error ({}): {}", code, msg)
+                   }
+               });
+               let _ = socket.send(axum::extract::ws::Message::Text(
+                   err_payload.to_string()
+               )).await;
+               continue 'connection;
+           }
+
+           // Flush remaining buffer
+          if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
                let events = translator.process_line(&buffer[read_pos..]);
                for event in events {
                    stream_event_count += 1;

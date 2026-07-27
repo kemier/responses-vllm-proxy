@@ -161,6 +161,14 @@ pub struct ResponseTranslator {
 
     // Original request for completed event
     request_json: Option<std::sync::Arc<Value>>,
+
+    // Upstream error detection: when the vLLM backend returns an in-stream
+    // error (e.g. `{"message":"upstream error","code":503}`) it arrives as a
+    // `data:` line with none of the expected keys (choices/usage/id/model).
+    // Without this flag, process_data silently drops it and flush_and_complete
+    // emits a successful response.completed — causing codex to treat the turn
+    // as a completed-but-empty response (end_turn, 0 tokens, usage 0%).
+    upstream_error: Option<(u16, String)>,
 }
 
 impl ResponseTranslator {
@@ -213,6 +221,7 @@ impl ResponseTranslator {
             think_pending: String::new(),
             raw_json,
             request_json,
+            upstream_error: None,
         }
     }
 
@@ -267,6 +276,31 @@ impl ResponseTranslator {
         if !parsed.is_object() {
             return vec![];
         }
+
+        // Upstream error detection: vLLM / TGI backends sometimes return
+        // in-stream error objects like `{"message":"upstream error","code":503}`
+        // or `{"error":{"message":"...","code":429}}`. These arrive as `data:`
+        // lines with no `choices`/`usage`/`id`/`model` keys. Without this
+        // check, they'd be silently skipped and the subsequent [DONE] would
+        // emit response.completed — making codex believe the turn succeeded
+        // with empty output (end_turn, 0 tokens, usage 0%).
+        //
+        // When detected, we stash the error and return empty events. The
+        // caller (main.rs) checks has_upstream_error() after the stream ends
+        // and sends a proper error event instead of response.completed.
+        if let Some((code, msg)) = extract_upstream_error(&parsed) {
+            logger::error(
+                "translate_response",
+                &format!(
+                    "Upstream in-stream error detected (code={}): {}",
+                    code,
+                    &msg[..msg.len().min(300)]
+                ),
+            );
+            self.upstream_error = Some((code, msg));
+            return vec![];
+        }
+
         let has_expected_key = parsed.get("choices").is_some()
             || parsed.get("usage").is_some()
             || parsed.get("id").is_some()
@@ -1461,6 +1495,61 @@ impl ResponseTranslator {
             format!("event: {}\ndata: {}\n\n", event, payload)
         }
     }
+
+    /// Returns the upstream in-stream error (code, message) if one was
+    /// detected during `process_line`. Callers should check this after the
+    /// stream ends and send an error event instead of response.completed.
+    pub fn upstream_error(&self) -> Option<(u16, String)> {
+        self.upstream_error.clone()
+    }
+
+    /// Returns true if the translator detected an upstream in-stream error.
+    pub fn has_upstream_error(&self) -> bool {
+        self.upstream_error.is_some()
+    }
+}
+
+/// Detect upstream error objects embedded in SSE streams.
+///
+/// vLLM / TGI backends return errors in several shapes:
+///   1. `{"message":"upstream error","code":503}` (flat)
+///   2. `{"error":{"message":"...","code":429}}` (nested)
+///   3. `{"error":"rate limit exceeded"}` (string)
+///   4. `{"detail":"Service Unavailable"}` (FastAPI style)
+///
+/// Returns `Some((code, message))` if the parsed JSON looks like an upstream
+/// error object, `None` otherwise.
+fn extract_upstream_error(parsed: &Value) -> Option<(u16, String)> {
+    // Shape 2: {"error":{"message":"...","code":NNN}}
+    if let Some(err_obj) = parsed.get("error").and_then(|e| e.as_object()) {
+        let msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let code = err_obj.get("code").and_then(|c| c.as_u64()).unwrap_or(0) as u16;
+        if !msg.is_empty() || code > 0 {
+            return Some((if code == 0 { 502 } else { code }, msg.to_string()));
+        }
+    }
+
+    // Shape 3: {"error":"rate limit exceeded"}
+    if let Some(err_str) = parsed.get("error").and_then(|e| e.as_str()) {
+        if !err_str.is_empty() {
+            return Some((502, err_str.to_string()));
+        }
+    }
+
+    // Shape 1: {"message":"upstream error","code":503}
+    // Shape 4: {"detail":"Service Unavailable"}
+    let has_code = parsed.get("code").and_then(|c| c.as_u64()).is_some();
+    let msg = parsed
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| parsed.get("detail").and_then(|d| d.as_str()));
+    if has_code {
+        let code = parsed.get("code").and_then(|c| c.as_u64()).unwrap_or(0) as u16;
+        let message = msg.unwrap_or("upstream error");
+        return Some((if code == 0 { 502 } else { code }, message.to_string()));
+    }
+
+    None
 }
 
 /// Convert a non-streaming chat completions response to a Responses API response object.
