@@ -83,25 +83,3 @@ openai-compatibility:
             alias: Qwen3.6-35B-A3B
             context_length: 131072
             tags: [fast, multimodal, coding]
-          # Claude Code compatibility aliases
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-opus-4-8
-            context_length: 196608
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-sonnet-4-20250514
-            context_length: 196608
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-sonnet-4
-            context_length: 196608
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-3-5-sonnet
-            context_length: 196608
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-3-5-haiku
-            context_length: 196608
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-haiku-4
-            context_length: 196608
-          - name: zai-org/GLM-5.2-FP8
-            alias: claude-opus-4
-            context_length: 196608

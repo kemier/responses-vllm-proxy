@@ -119,14 +119,19 @@ try:
     # preferred over the backend's max_total_tokens which can be wrong
     # (e.g. GLM-5.2 reports 196608 which is the correct usable context).
     proxy_context_lengths = {}
+    proxy_tags = {}
     for m in proxy_data.get("data", []):
         cl = m.get("context_length")
         if isinstance(cl, int) and cl > 0:
             proxy_context_lengths[m["id"]] = cl
+        tags = m.get("tags", [])
+        if isinstance(tags, list) and tags:
+            proxy_tags[m["id"]] = [str(t) for t in tags]
 except Exception as e:
     print(f"Warning: could not fetch proxy models: {e}")
     proxy_ids = []
     proxy_context_lengths = {}
+    proxy_tags = {}
 
 # ── Base instructions: teach LLM to emit clickable link formats ─────────────
 BASE_INSTRUCTIONS = """
@@ -332,6 +337,44 @@ def normalize_display_name(slug):
         return slug[slug.rfind("/")+1:]
     return slug
 
+# ── Tag-based model descriptions and service tiers ──────────────────────────
+# The proxy serves capability tags (fast, coding, sota, near_sota, thinking,
+# multimodal) from config.yaml / backend metadata. We translate these into
+# human-readable descriptions the LLM sees in the spawn_agent tool schema, so
+# it can pick fast/cheap models for subagents instead of always inheriting the
+# expensive default.
+
+TAG_DESCRIPTIONS = {
+    "fast": "Fast and cost-efficient",
+    "coding": "optimized for code generation",
+    "sota": "frontier-grade reasoning",
+    "near_sota": "near-frontier reasoning",
+    "thinking": "deep thinking (slower)",
+    "multimodal": "supports vision/images",
+    "1M": "1M token context",
+}
+
+def build_description(slug, tags):
+    """Build a cost/speed-aware description from tags."""
+    if not tags:
+        return f"{slug} via EricAI"
+    parts = []
+    for tag in tags:
+        desc = TAG_DESCRIPTIONS.get(tag)
+        if desc:
+            parts.append(desc)
+    if not parts:
+        return f"{slug} via EricAI"
+    return f"{slug} — {', '.join(parts)}"
+
+def build_service_tiers(tags):
+    """Fast-tagged models get a 'priority' (Fast) service tier so the LLM
+    can pass service_tier='priority' when spawning subagents."""
+    if tags and "fast" in tags:
+        return [{"id": "priority", "name": "Fast", "description": "Fast, cost-efficient tier for subagents"}]
+    return []
+
+
 models = []
 for i, slug in enumerate(proxy_ids):
     backend_id = alias_map.get(slug, slug)
@@ -353,7 +396,7 @@ for i, slug in enumerate(proxy_ids):
     entry = {
         "slug": slug,
         "display_name": normalize_display_name(slug),
-        "description": f"{slug} via EricAI",
+        "description": build_description(slug, proxy_tags.get(slug, [])),
         "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": True,
@@ -383,6 +426,12 @@ for i, slug in enumerate(proxy_ids):
     # Mode. Setting tool_mode="code_mode" suppresses codex's
     # "model does not advertise Code Mode support" warning and enables
     # the Code Mode tool surface (exec + wait) instead of direct tools.
+    # Add service tiers for fast-tagged models so the LLM sees them
+    # in the spawn_agent tool schema and can pick them for subagents.
+    tiers = build_service_tiers(proxy_tags.get(slug, []))
+    if tiers:
+        entry["service_tiers"] = tiers
+
     entry["tool_mode"] = "code_mode"
 
     if levels:
