@@ -33,30 +33,56 @@ openai-compatibility:
           - name: zai-org/GLM-5.1-FP8
             alias: glm-5.1
             context_length: 131072
+            tags: [sota, near_sota, thinking]
           - name: Qwen/Qwen3-Coder-Next-FP8
             alias: Qwen3-Coder
             context_length: 262144
+            tags: [fast, coding]
           - name: XiaomiMiMo/MiMo-V2.5-Pro
             alias: mimo-v2.5-pro
             context_length: 131072
+            tags: [sota, near_sota]
           - name: XiaomiMiMo/MiMo-V2.5
             alias: mimo-v2.5
             context_length: 131072
+            tags: [near_sota]
           - name: moonshotai/Kimi-K2.7-Code
             alias: kimi-k2.7-code
             context_length: 262144
+            tags: [sota, near_sota, multimodal]
           - name: moonshotai/Kimi-K2.6
             alias: kimi-k2.6
             context_length: 262144
+            tags: [sota, near_sota, multimodal]
           - name: zai-org/GLM-5.2-FP8
             alias: glm-5.2
             context_length: 196608
+            tags: [sota, near_sota, thinking]
           - name: deepseek-ai/DeepSeek-V4-Pro
             alias: deepseek-v4-pro
             context_length: 131072
+            tags: [near_sota, sota]
           - name: Qwen/Qwen2.5-14B-Instruct-1M
             alias: qwen2.5-14b-1m
             context_length: 1048576
+            tags: [1M]
+          # Fast / coding models for subagents (tag:fast resolution)
+          - name: openai/gpt-oss-120b
+            alias: gpt-oss-120b
+            context_length: 131072
+            tags: [fast]
+          - name: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
+            alias: Qwen3-Coder-480B
+            context_length: 262144
+            tags: [fast, coding]
+          - name: Qwen/Qwen3.6-27B-FP8
+            alias: Qwen3.6-27B
+            context_length: 131072
+            tags: [fast, multimodal, coding]
+          - name: Qwen/Qwen3.6-35B-A3B-FP8
+            alias: Qwen3.6-35B-A3B
+            context_length: 131072
+            tags: [fast, multimodal, coding]
           # Claude Code compatibility aliases
           - name: zai-org/GLM-5.2-FP8
             alias: claude-opus-4-8

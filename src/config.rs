@@ -77,6 +77,13 @@ pub struct OpenAICompatModel {
     pub alias: String,
     #[serde(default)]
     pub context_length: Option<u64>,
+    /// Capability tags for routing (e.g. ["fast", "coding"]). Used by ericli
+    /// to resolve `tag:fast` / `tag:coding` to concrete models when the proxy
+    /// is in the path (the proxy strips rayllm_metadata from /v1/models).
+    /// Without this, subagents fall back to the session's default model
+    /// (often an expensive thinking model) because tag resolution fails.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 impl Config {
@@ -122,6 +129,13 @@ impl Config {
         self.openai_compatibility
             .iter()
             .find(|p| p.name == "ericai")
+    }
+
+    /// Get tags for a model alias (for /v1/models metadata response).
+    pub fn model_tags(&self, alias: &str) -> Option<&[String]> {
+        self.ericai_provider()
+            .and_then(|p| p.models.iter().find(|m| m.alias == alias))
+            .and_then(|m| m.tags.as_deref())
     }
 
     pub fn all_models(&self) -> Vec<(String, String)> {

@@ -31,6 +31,17 @@ use tokio::time::{interval, Duration};
 /// incremental requests. Now it's loaded once and shared via Arc.
 pub type ModelCatalog = Arc<Option<Value>>;
 
+/// Cached backend metadata (routing_tags, lifecycle) fetched from
+/// `ericai api models.list` at startup and refreshed every 5 minutes.
+/// Keyed by backend model ID (e.g. "zai-org/GLM-5.2-FP8").
+type BackendMetaCache = Arc<tokio::sync::RwLock<std::collections::HashMap<String, ModelBackendMeta>>>;
+
+#[derive(Clone, Debug, Default)]
+pub struct ModelBackendMeta {
+    pub routing_tags: Vec<String>,
+    pub lifecycle: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<config::Config>,
@@ -39,11 +50,119 @@ pub struct AppState {
     pub model_catalog: ModelCatalog,
     pub shutdown: tokio_util::sync::CancellationToken,
     pub rate_limiter: Arc<RateLimiter>,
+    pub backend_meta: BackendMetaCache,
 }
 
 /// Pre-allocated SSE keepalive comment bytes — avoids allocating a new
 /// String on every 15-second keepalive tick.
 static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": keepalive\n\n");
+
+/// Fetch model metadata (routing_tags, lifecycle) from the EricAI backend
+/// via `ericai api models.list`. Returns a map keyed by backend model ID.
+/// Used to populate the `tags` field in /v1/models so ericli can resolve
+/// tag:fast / tag:coding without needing rayllm_metadata (which the proxy
+/// strips). Falls back to config.yaml `tags` field when the backend is
+/// unreachable.
+async fn fetch_backend_meta() -> std::collections::HashMap<String, ModelBackendMeta> {
+    let mut map = std::collections::HashMap::new();
+    let ericai_bin = std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{}/.local/bin/ericai", h))
+        .unwrap_or_else(|| "ericai".to_string());
+
+    let result = tokio::process::Command::new(&ericai_bin)
+        .args(["api", "models.list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    let output = match result {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            logger::warn("backend_meta", "Could not fetch ericai api models.list — using config.yaml tags only");
+            return map;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output);
+    // The output is a stream of JSON objects (not a JSON array).
+    // Split on }{ boundaries and parse each.
+    let mut buf = String::new();
+    for line in stdout.lines() {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    // Try parsing as a single JSON first (some versions return {"data":[...]})
+    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
+        let models = parsed.get("data").and_then(|d| d.as_array())
+            .or_else(|| parsed.as_array());
+        if let Some(models) = models {
+            for m in models {
+                extract_meta(m, &mut map);
+            }
+            return map;
+        }
+    }
+    // Fallback: split on object boundaries
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let bytes = buf.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => { if depth == 0 { start = i; } depth += 1; }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Ok(obj) = serde_json::from_slice::<Value>(&bytes[start..=i]) {
+                        extract_meta(&obj, &mut map);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
+fn extract_meta(m: &Value, map: &mut std::collections::HashMap<String, ModelBackendMeta>) {
+    let mid = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if mid.is_empty() || mid.starts_with("tag:") { return; }
+    let rayllm = m.get("rayllm_metadata");
+    let engine = rayllm.and_then(|r| r.get("engine_config"));
+    let tags: Vec<String> = engine
+        .and_then(|e| e.get("routing_tags"))
+        .and_then(|t| t.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let lifecycle = engine
+        .and_then(|e| e.get("lifecycle"))
+        .and_then(|l| l.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !tags.is_empty() || !lifecycle.is_empty() {
+        map.insert(mid.to_string(), ModelBackendMeta { routing_tags: tags, lifecycle });
+    }
+}
+
+/// Background task that refreshes backend metadata every 5 minutes.
+async fn backend_meta_refresh_loop(cache: BackendMetaCache, shutdown: tokio_util::sync::CancellationToken) {
+    loop {
+        let new_meta = fetch_backend_meta().await;
+        if !new_meta.is_empty() {
+            let count = new_meta.len();
+            let mut w = cache.write().await;
+            *w = new_meta;
+            drop(w);
+            logger::info("backend_meta", &format!("Fetched {} models with routing_tags from backend", count));
+        }
+        // Wait 5 minutes or until shutdown
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
 
 /// Simple per-IP rate limiter using a fixed window.
 /// Prevents abuse when the proxy is network-exposed (CWE-770).
@@ -170,6 +289,18 @@ async fn main() {
     // handlers can close their connections gracefully.
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
+    // Backend metadata cache — fetches routing_tags from `ericai api models.list`
+    // at startup and refreshes every 5 minutes. Used to populate the `tags`
+    // field in /v1/models so ericli can resolve tag:fast / tag:coding.
+    let backend_meta: BackendMetaCache = Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::new()
+    ));
+    {
+        let bm = backend_meta.clone();
+        let st = shutdown_token.clone();
+        tokio::spawn(async move { backend_meta_refresh_loop(bm, st).await; });
+    }
+
     let state = AppState {
         cfg: cfg.clone(),
         token_mgr,
@@ -177,6 +308,7 @@ async fn main() {
         model_catalog,
         shutdown: shutdown_token.clone(),
         rate_limiter,
+        backend_meta,
     };
 
     let app = axum::Router::new()
@@ -493,17 +625,16 @@ async fn auth_middleware(
 
 // ─── GET /v1/models ─────────────────────────────────────────────────────────
 pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
-    let models: Vec<Value> = state
-        .cfg
-        .all_models()
-        .iter()
-        .map(|(alias, name)| {
+    let all_models = state.cfg.all_models();
+    let backend_meta = state.backend_meta.read().await;
+    let mut models: Vec<Value> = Vec::with_capacity(all_models.len());
+    for (alias, name) in &all_models {
             // Look up the optional context_length from the config model entry.
             let context_length = state
                 .cfg
                 .ericai_provider()
                 .and_then(|p| {
-                    p.models.iter().find(|m| m.alias == *alias).and_then(|m| m.context_length)
+                    p.models.iter().find(|m| &m.alias == alias).and_then(|m| m.context_length)
                 });
             let mut entry = json!({
                 "id": alias,
@@ -515,9 +646,19 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
             if let Some(ctx) = context_length {
                 entry["context_length"] = json!(ctx);
             }
-            entry
-        })
-        .collect();
+            // Pass capability tags so ericli can resolve tag:fast / tag:coding.
+            // Priority: 1) live backend metadata (routing_tags from ericai api models.list)
+            //           2) config.yaml `tags` field (static fallback)
+            let backend_name = state.cfg.resolve_model(alias);
+            let backend_tags = backend_meta.get(&backend_name).map(|m| m.routing_tags.clone());
+            if let Some(tags) = backend_tags.filter(|t| !t.is_empty()) {
+                entry["tags"] = json!(tags);
+            } else if let Some(tags) = state.cfg.model_tags(alias) {
+                entry["tags"] = json!(tags);
+            }
+            models.push(entry);
+    }
+    drop(backend_meta);
 
     Json(json!({"object": "list", "data": models}))
 }
