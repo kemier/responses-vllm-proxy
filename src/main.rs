@@ -1862,65 +1862,116 @@ pub async fn handle_chat_completions(
                     mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
 
                 tokio::spawn(async move {
-                    let mut stream = stream;
-                    let mut buffer = String::new();
-                    let mut read_pos: usize = 0;
-                    let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
-                    sse_keepalive.tick().await; // consume immediate first tick
+                   let mut stream = stream;
+                   let mut buffer = String::new();
+                   let mut read_pos: usize = 0;
+                   let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
+                   sse_keepalive.tick().await; // consume immediate first tick
+                   // In-stream error detection: vLLM/TGI backends sometimes return
+                   // error objects (e.g. {"error":{"message":"...","code":429}}) as
+                   // `data:` lines with no `choices` key. Without this, the
+                   // passthrough forwards them verbatim and the client (ericli)
+                   // silently skips them, then treats the stream end as a successful
+                   // empty response → premature end_turn. When detected, we inject
+                   // an SSE error event so the client can retry/fallback.
+                   let mut upstream_error: Option<(u16, String)> = None;
 
-                    loop {
-                        tokio::select! {
-                            chunk_result = stream.next() => {
-                                match chunk_result {
-                                    Some(Ok(chunk)) => {
-                                        buffer.push_str(&String::from_utf8_lossy(&chunk));
-                                       while let Some(rel_pos) = buffer[read_pos..].find('\n') {
-                                           let pos = read_pos + rel_pos;
-                                           let line = &buffer[read_pos..pos];
-                                           read_pos = pos + 1;
-                                           let output = if thinking_enabled {
-                                               rewrite_reasoning_to_content(line)
-                                           } else {
-                                               line.to_string()
-                                           };
-                                            let framed = format!("{}\n", output);
-                                            if tx.send(Ok(axum::body::Bytes::from(framed))).await.is_err() {
-                                               return;
-                                           }
+                   loop {
+                       tokio::select! {
+                           chunk_result = stream.next() => {
+                               match chunk_result {
+                                   Some(Ok(chunk)) => {
+                                       buffer.push_str(&String::from_utf8_lossy(&chunk));
+                                      while let Some(rel_pos) = buffer[read_pos..].find('\n') {
+                                          let pos = read_pos + rel_pos;
+                                          let line = &buffer[read_pos..pos];
+                                          read_pos = pos + 1;
+                                          // Check for in-stream upstream errors BEFORE
+                                          // forwarding the line. This mirrors the
+                                          // /v1/responses path's extract_upstream_error
+                                          // detection so ericli (which uses this
+                                          // passthrough) gets the same error surfacing
+                                          // as codex-acp.
+                                          if upstream_error.is_none() {
+                                              if let Some(stripped) = line.trim().strip_prefix("data: ") {
+                                                  if stripped != "[DONE]" {
+                                                      if let Ok(parsed) = serde_json::from_str::<Value>(stripped) {
+                                                          if let Some((code, msg)) = translate_response::extract_upstream_error(&parsed) {
+                                                              logger::error(
+                                                                  "chat",
+                                                                  &format!(
+                                                                      "Upstream in-stream error (code={}) — injecting SSE error event: {}",
+                                                                      code, &msg[..msg.len().min(300)]
+                                                                  ),
+                                                              );
+                                                              upstream_error = Some((code, msg));
+                                                              // Don't forward the error object — the
+                                                              // client would skip it (no `choices`).
+                                                              continue;
+                                                          }
+                                                      }
+                                                  }
+                                              }
+                                          }
+                                          let output = if thinking_enabled {
+                                              rewrite_reasoning_to_content(line)
+                                          } else {
+                                              line.to_string()
+                                          };
+                                           let framed = format!("{}\n", output);
+                                           if tx.send(Ok(axum::body::Bytes::from(framed))).await.is_err() {
+                                              return;
+                                          }
+                                      }
+                                       if read_pos > 0 {
+                                           buffer.drain(..read_pos);
+                                           read_pos = 0;
                                        }
-                                        if read_pos > 0 {
-                                            buffer.drain(..read_pos);
-                                            read_pos = 0;
-                                        }
-                                    }
-                                    Some(Err(e)) => {
-                                        logger::error("chat", &format!("Stream error: {}", e));
-                                        break;
-                                    }
-                                    None => break,
-                                }
-                            }
-                            _ = sse_keepalive.tick() => {
-                                if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    // Flush remaining buffer
-                   if read_pos < buffer.len() {
-                       let remaining = &buffer[read_pos..];
-                       if !remaining.trim().is_empty() {
-                           let output = if thinking_enabled {
-                               rewrite_reasoning_to_content(remaining)
-                           } else {
-                               remaining.to_string()
-                           };
-                            let framed = format!("{}\n", output);
-                            let _ = tx.send(Ok(axum::body::Bytes::from(framed))).await;
+                                   }
+                                   Some(Err(e)) => {
+                                       logger::error("chat", &format!("Stream error: {}", e));
+                                       break;
+                                   }
+                                   None => break,
+                               }
+                           }
+                           _ = sse_keepalive.tick() => {
+                               if tx.send(Ok(KEEPALIVE_BYTES.clone())).await.is_err() {
+                                   return;
+                               }
+                           }
                        }
                    }
-                });
+                   // Flush remaining buffer
+                  if read_pos < buffer.len() {
+                      let remaining = &buffer[read_pos..];
+                      if !remaining.trim().is_empty() {
+                          let output = if thinking_enabled {
+                              rewrite_reasoning_to_content(remaining)
+                          } else {
+                              remaining.to_string()
+                          };
+                           let framed = format!("{}\n", output);
+                           let _ = tx.send(Ok(axum::body::Bytes::from(framed))).await;
+                      }
+                  }
+                  // If an in-stream upstream error was detected, send an SSE
+                  // error event instead of letting the stream end silently.
+                  // Without this, the client sees a clean stream end with no
+                  // content and treats it as a successful empty response.
+                  if let Some((code, msg)) = upstream_error {
+                      let err_payload = json!({
+                          "type": "error",
+                          "status": code,
+                          "error": {
+                              "message": format!("Upstream error ({}): {}", code, msg)
+                          }
+                      });
+                      let err_event = format!("event: error\ndata: {}\n\n", err_payload);
+                      let _ = tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await;
+                      return;
+                  }
+               });
 
                 let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
                 let body = Body::from_stream(translated_stream);

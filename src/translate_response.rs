@@ -1519,7 +1519,7 @@ impl ResponseTranslator {
 ///
 /// Returns `Some((code, message))` if the parsed JSON looks like an upstream
 /// error object, `None` otherwise.
-fn extract_upstream_error(parsed: &Value) -> Option<(u16, String)> {
+pub fn extract_upstream_error(parsed: &Value) -> Option<(u16, String)> {
     // Shape 2: {"error":{"message":"...","code":NNN}}
     if let Some(err_obj) = parsed.get("error").and_then(|e| e.as_object()) {
         let msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("");
