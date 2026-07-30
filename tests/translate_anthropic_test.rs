@@ -5,7 +5,7 @@
 //   - AnthropicStreamTranslator (streaming SSE translation)
 //   - chat_completions_to_anthropic (non-streaming response translation)
 
-use ericai_proxy::translate_anthropic::{
+use ericai_proxy::main::translate_anthropic::{
     anthropic_to_chat_completions, chat_completions_to_anthropic, AnthropicStreamTranslator,
 };
 use serde_json::{json, Value};
@@ -454,4 +454,96 @@ fn test_non_streaming_anthropic_finish_reason_length() {
     });
     let resp = chat_completions_to_anthropic("glm-5.2", &raw);
     assert_eq!(resp["stop_reason"], "max_tokens");
+}
+
+// ─── Reasoning-only fallback ───────────────────────────────────────────────
+// GLM-5.2 with thinking enabled may emit the entire response via
+// delta.reasoning / message.reasoning with empty content. Without a text
+// content block, Claude Code CLI's /compact fails with "no assistant message
+// in summarization response". These tests verify the proxy promotes
+// reasoning-only output to a text block in both the streaming and
+// non-streaming Anthropic paths.
+
+#[test]
+fn test_stream_reasoning_only_synthesizes_text_block() {
+    let mut t = AnthropicStreamTranslator::new("glm-5.2");
+    // Reasoning-only stream: content never arrives.
+    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"thinking step 1. "}}]}"#);
+    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"thinking step 2."}}]}"#);
+    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+    let done = t.translate_line("data: [DONE]");
+
+    // A text content block must have been synthesized from the reasoning.
+    let joined = done.join("\n");
+    assert!(
+        joined.contains("\"type\":\"text_delta\""),
+        "expected a synthesized text_delta, got: {}",
+        joined
+    );
+    // The synthesized text must contain BOTH reasoning fragments (accumulated).
+    assert!(joined.contains("thinking step 1. "), "missing first reasoning fragment");
+    assert!(joined.contains("thinking step 2."), "missing second reasoning fragment");
+    // And the text block must be properly closed.
+    assert!(joined.contains("content_block_stop"));
+    assert!(joined.contains("message_stop"));
+}
+
+#[test]
+fn test_stream_reasoning_plus_content_does_not_duplicate() {
+    let mut t = AnthropicStreamTranslator::new("glm-5.2");
+    // Both reasoning and real content arrive — text block comes from content,
+    // reasoning must NOT be synthesized again at finish().
+    let mut all = Vec::new();
+    all.extend(t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"private thoughts"}}]}"#));
+    all.extend(t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"final answer"}}]}"#));
+    all.extend(t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#));
+    all.extend(t.translate_line("data: [DONE]"));
+    let joined = all.join("\n");
+
+    // The real content is present (emitted as a text_delta during streaming).
+    assert!(joined.contains("final answer"));
+    // The reasoning must NOT have been promoted to a text block at finish
+    // (no synthesized text_delta containing the reasoning text).
+    assert!(
+        !joined.contains("\"text\":\"private thoughts\""),
+        "reasoning was incorrectly synthesized as text when content was present"
+    );
+}
+
+#[test]
+fn test_non_streaming_reasoning_only_promotes_to_text() {
+    let raw = json!({
+        "id": "chatcmpl_ro",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "", "reasoning": "the real summary"},
+            "finish_reason": "stop"
+        }]
+    });
+    let resp = chat_completions_to_anthropic("glm-5.2", &raw);
+    let content = resp["content"].as_array().unwrap();
+    // A thinking block AND a text block (promoted from reasoning).
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "the real summary");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "the real summary");
+}
+
+#[test]
+fn test_non_streaming_content_present_not_promoted() {
+    let raw = json!({
+        "id": "chatcmpl_cp",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "real answer", "reasoning": "thoughts"},
+            "finish_reason": "stop"
+        }]
+    });
+    let resp = chat_completions_to_anthropic("glm-5.2", &raw);
+    let content = resp["content"].as_array().unwrap();
+    // thinking + text (from content), no promoted duplicate.
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "real answer");
 }

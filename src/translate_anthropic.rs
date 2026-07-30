@@ -204,7 +204,17 @@ pub struct AnthropicStreamTranslator {
     input_tokens: u64,
     output_tokens: u64,
     text_block_open: bool,
+    // True once any text content block has been opened. Used by finish() to
+    // decide whether to synthesize a text block from reasoning-only output.
+    text_ever_emitted: bool,
     thinking_block_open: bool,
+    // Accumulated reasoning text. GLM with thinking enabled may emit the entire
+    // response via delta.reasoning with delta.content empty (reasoning-only
+    // output). We accumulate it so finish() can synthesize a text content block
+    // — without it, the Anthropic stream has only a thinking block and no text
+    // block, and clients like Claude Code CLI's /compact fail with "no
+    // assistant message in summarization response".
+    reasoning_text: String,
     pending_tool_calls: Vec<PendingToolCall>,
     finished: bool,
     stop_reason: String,
@@ -229,7 +239,9 @@ impl AnthropicStreamTranslator {
             input_tokens: 0,
             output_tokens: 0,
             text_block_open: false,
+            text_ever_emitted: false,
             thinking_block_open: false,
+            reasoning_text: String::new(),
             pending_tool_calls: Vec::new(),
             finished: false,
             stop_reason: String::new(),
@@ -286,6 +298,8 @@ impl AnthropicStreamTranslator {
                     // Reasoning → thinking content block
                     if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
                         if !reasoning.is_empty() {
+                            // Accumulate for the reasoning-only fallback in finish().
+                            self.reasoning_text.push_str(reasoning);
                             if !self.thinking_block_open && !self.text_block_open {
                                 events.push(self.thinking_block_start_event());
                                 self.thinking_block_open = true;
@@ -309,6 +323,7 @@ impl AnthropicStreamTranslator {
                                 events.push(self.text_block_start_event(self.current_block_index));
                                 self.text_block_open = true;
                             }
+                            self.text_ever_emitted = true;
                             events.push(self.text_delta_event(self.current_block_index, content));
                         }
                     }
@@ -400,6 +415,21 @@ impl AnthropicStreamTranslator {
             self.current_block_index += 1;
             self.thinking_block_open = false;
         }
+        // Reasoning-only fallback: GLM with thinking enabled may stream the
+        // entire response via delta.reasoning and never emit delta.content. In
+        // that case the Anthropic stream so far has only a thinking block and
+        // no text block. Clients like Claude Code CLI create an assistant
+        // message only from a text content_block_stop, so a thinking-only
+        // response yields "no assistant message in summarization response" and
+        // breaks /compact. Synthesize a text content block from the accumulated
+        // reasoning so the response always carries an assistant text message.
+        // (Mirrors rewrite_reasoning_to_content() used by /v1/chat/completions.)
+        if !self.text_ever_emitted && !self.reasoning_text.is_empty() {
+            events.push(self.text_block_start_event(self.current_block_index));
+            events.push(self.text_delta_event(self.current_block_index, &self.reasoning_text));
+            events.push(self.content_block_stop_event(self.current_block_index));
+            self.current_block_index += 1;
+        }
         if !self.started {
             self.started = true;
             events.push(self.message_start_event());
@@ -477,15 +507,22 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
     if let Some(choices) = response.get("choices").and_then(|c| c.as_array()) {
         if let Some(choice) = choices.first() {
             if let Some(msg) = choice.get("message") {
-                if let Some(reasoning) = msg.get("reasoning").and_then(|v| v.as_str()) {
-                    if !reasoning.is_empty() {
-                        content.push(json!({"type": "thinking", "thinking": reasoning}));
-                    }
+                let reasoning = msg.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
+                if !reasoning.is_empty() {
+                    content.push(json!({"type": "thinking", "thinking": reasoning}));
                 }
-                if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        content.push(json!({"type": "text", "text": text}));
-                    }
+                let text = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !text.is_empty() {
+                    content.push(json!({"type": "text", "text": text}));
+                } else if !reasoning.is_empty() {
+                    // Reasoning-only fallback (non-streaming): GLM with thinking
+                    // enabled may return the full response in `reasoning` with
+                    // empty `content`. Without a text block the client sees no
+                    // assistant message (breaks Claude Code CLI /compact).
+                    // Promote the reasoning to a text block. Mirrors the
+                    // streaming translator's finish() fallback and
+                    // rewrite_reasoning_to_content() in /v1/chat/completions.
+                    content.push(json!({"type": "text", "text": reasoning}));
                 }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|c| c.as_array()) {
                     for tc in tool_calls {

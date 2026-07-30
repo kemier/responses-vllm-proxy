@@ -2072,12 +2072,30 @@ pub async fn handle_messages(
         .map(|s| s.to_lowercase())
         .filter(|e| matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max"));
 
+    // Honor the Anthropic client's `thinking` field. Claude Code CLI sends
+    // `thinking: { type: "disabled" }` for compaction/summarization turns. The
+    // CLI still attaches `reasoning_effort` to the body (it's how the model
+    // choice is conveyed), so keying enable_thinking off effort alone would
+    // force thinking ON for a turn the client explicitly disabled — producing
+    // reasoning-only output that yields no assistant text message and breaks
+    // /compact ("no assistant message in summarization response"). When the
+    // client disables thinking, we must disable it too, regardless of effort.
+    let client_thinking_disabled = request_json
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|v| v.as_str())
+        .map(|s| s == "disabled")
+        .unwrap_or(false);
+
     if let Some(obj) = cc_request.as_object_mut() {
         let kwargs = obj
             .entry("chat_template_kwargs")
             .or_insert_with(|| json!({}));
         if let Some(kw) = kwargs.as_object_mut() {
-            if let Some(ref effort) = effort {
+            if client_thinking_disabled {
+                // Client explicitly disabled thinking — honor it.
+                kw.entry("enable_thinking").or_insert(json!(false));
+            } else if let Some(ref effort) = effort {
                 if lower_model.contains("glm") {
                     let enable = effort != "low";
                     kw.entry("enable_thinking").or_insert(json!(enable));
