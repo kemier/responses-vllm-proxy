@@ -2305,6 +2305,54 @@ pub async fn handle_messages(
         Ok(r) => {
             let status = r.status();
 
+            // If the upstream returned a non-success status (e.g. 429 rate
+            // limit on large inputs, 5xx), do NOT stream the error body
+            // through the translator — vLLM error responses are JSON objects
+            // (no SSE `choices`), so translate_line() would skip every line
+            // and finish() would synthesize an EMPTY assistant message. The
+            // client (CCR/Claude Code) then sees a silent end_turn with ~0
+            // tokens — the "GLM returns empty / ends prematurely" symptom.
+            // Instead surface a real Anthropic SSE error event so the client
+            // can surface the failure (and the user knows to wait/compact).
+            if !status.is_success() {
+                let body_text = r.bytes().await.unwrap_or_default();
+                let body_str = String::from_utf8_lossy(&body_text);
+                let summary = logger::extract_error_summary(&body_str, 500);
+                logger::error(
+                    "messages",
+                    &format!("Upstream {}: {}", status, summary),
+                );
+                if status.as_u16() == 429 || status.as_u16() >= 500 {
+                    logger::error_request(
+                        "messages",
+                        &cc_request.to_string(),
+                        &body_str,
+                        status.as_u16(),
+                    );
+                }
+                let err_type = if status.as_u16() == 429 {
+                    "rate_limit_error"
+                } else {
+                    "api_error"
+                };
+                let err_payload = json!({
+                    "type": "error",
+                    "error": {
+                        "type": err_type,
+                        "message": format!("Upstream {}: {}", status, summary)
+                    }
+                });
+                let sse = format!(
+                    "event: error\ndata: {}\n\n",
+                    err_payload
+                );
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap();
+            }
+
             if is_stream {
                 let stream = r.bytes_stream();
                 use tokio::sync::mpsc;
