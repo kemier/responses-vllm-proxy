@@ -405,6 +405,17 @@ impl AnthropicStreamTranslator {
         }
         self.finished = true;
         let mut events = Vec::new();
+        // Emit message_start FIRST if not already started. The Anthropic SSE
+        // protocol requires message_start before any content_block events.
+        // Previously this was placed after the synthesized content blocks
+        // below, causing Claude Code CLI's stream parser to discard those
+        // blocks (they arrived before message_start) and fail with
+        // "no assistant message in summarization response" during /compact
+        // when the upstream returned an empty response.
+        if !self.started {
+            self.started = true;
+            events.push(self.message_start_event());
+        }
         if self.text_block_open {
             events.push(self.content_block_stop_event(self.current_block_index));
             self.current_block_index += 1;
@@ -430,9 +441,22 @@ impl AnthropicStreamTranslator {
             events.push(self.content_block_stop_event(self.current_block_index));
             self.current_block_index += 1;
         }
-        if !self.started {
-            self.started = true;
-            events.push(self.message_start_event());
+        // Empty-response fallback: if the upstream produced no assistant
+        // content at all — no text, no reasoning, and no tool_use (e.g. an
+        // in-stream error object the translator skipped, an empty body, or a
+        // dropped connection) — the Anthropic stream so far has zero content
+        // blocks. Clients like Claude Code CLI require an assistant text
+        // message; a contentless message yields "no assistant message in
+        // summarization response" and breaks /compact. Synthesize an empty
+        // text content block so every response carries an assistant message.
+        let has_tool_use = self
+            .pending_tool_calls
+            .iter()
+            .any(|t| !t.name.is_empty());
+        if !self.text_ever_emitted && self.reasoning_text.is_empty() && !has_tool_use {
+            events.push(self.text_block_start_event(self.current_block_index));
+            events.push(self.content_block_stop_event(self.current_block_index));
+            self.current_block_index += 1;
         }
         // Emit message_delta now — all usage chunks have been processed.
         let sr = if self.stop_reason.is_empty() { "end_turn" } else { self.stop_reason.as_str() };
@@ -548,18 +572,40 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
                 "model": model, "stop_reason": stop_reason, "stop_sequence": null,
             });
 
-            if let Some(usage) = response.get("usage") {
-                let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                out["usage"] = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            // Always emit a usage object. Upstream may omit `usage` entirely
+            // (empty or error-ish responses); the Anthropic message shape
+            // requires it, so default both counters to 0 rather than leaving
+            // the field absent.
+            let usage = response.get("usage");
+            let input_tokens = usage
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output_tokens = usage
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            out["usage"] = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            // Empty-response fallback (non-streaming): if no content block was
+            // added (no text, no reasoning, no tool_use), synthesize an empty
+            // text block so the message always carries an assistant message.
+            // A contentless response breaks Claude Code CLI /compact with
+            // "no assistant message in summarization response". Mirrors the
+            // streaming translator's finish() empty-response fallback.
+            if content.is_empty() {
+                content.push(json!({"type": "text", "text": ""}));
+                out["content"] = json!(content);
             }
             return out;
         }
     }
 
+    // No choices at all (e.g. upstream error object or empty body). Synthesize
+    // an empty text block so the response always carries an assistant message,
+    // avoiding "no assistant message in summarization response" in /compact.
     json!({
         "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
-        "type": "message", "role": "assistant", "content": [],
+        "type": "message", "role": "assistant", "content": [{"type": "text", "text": ""}],
         "model": model, "stop_reason": "end_turn", "stop_sequence": null,
         "usage": {"input_tokens": 0, "output_tokens": 0}
     })

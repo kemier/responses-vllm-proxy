@@ -255,17 +255,23 @@ fn test_anthropic_stream_reasoning_then_text() {
 fn test_anthropic_stream_tool_use() {
     let mut t = AnthropicStreamTranslator::new("glm-5.2");
     // Tool call with id and name
-    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}"#);
+    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}]}"#);
     // Argument fragment
-    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"STO\"}"}}]}}"#);
+    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"STO\"}"}}]}}]}"#);
     // finish_reason triggers tool_use block emission
     let finish = t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#);
     assert!(finish.iter().any(|e| e.contains("content_block_start") && e.contains("\"type\":\"tool_use\"")));
     assert!(finish.iter().any(|e| e.contains("input_json_delta")));
-    assert!(finish.iter().any(|e| e.contains("\"stop_reason\":\"tool_use\"")));
+    // message_delta (which carries stop_reason) is deliberately deferred to
+    // [DONE]: vLLM sends the usage chunk *after* finish_reason, so emitting it
+    // here would always report 0 tokens.
+    assert!(!finish.iter().any(|e| e.contains("message_delta")));
 
     let done = t.translate_line("data: [DONE]");
+    assert!(done.iter().any(|e| e.contains("\"stop_reason\":\"tool_use\"")));
     assert!(done.iter().any(|e| e.contains("message_stop")));
+    // The tool_use block must not be duplicated by the empty-response fallback.
+    assert!(!done.iter().any(|e| e.contains("content_block_start")));
 }
 
 #[test]
@@ -428,7 +434,10 @@ fn test_non_streaming_anthropic_empty_response() {
         }]
     });
     let resp = chat_completions_to_anthropic("glm-5.2", &raw);
-    assert_eq!(resp["content"].as_array().unwrap().len(), 0);
+    let content = resp["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "");
     assert_eq!(resp["usage"]["input_tokens"], 0);
     assert_eq!(resp["usage"]["output_tokens"], 0);
 }
@@ -439,7 +448,10 @@ fn test_non_streaming_anthropic_no_choices() {
     let resp = chat_completions_to_anthropic("glm-5.2", &raw);
     assert_eq!(resp["type"], "message");
     assert_eq!(resp["stop_reason"], "end_turn");
-    assert_eq!(resp["content"].as_array().unwrap().len(), 0);
+    let content = resp["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "");
 }
 
 #[test]
