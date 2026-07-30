@@ -1722,6 +1722,62 @@ fn rewrite_reasoning_to_content(line: &str) -> String {
     }
 }
 
+/// Markers that identify a "text-only, no tools" turn.
+///
+/// Claude Code CLI builds its compaction/summarization prompt with a literal
+/// preamble instructing the model to answer with prose and never call a tool,
+/// yet it still sends the full `tools` array in the same request (it relies on
+/// rejecting tool calls client-side). GLM-5.x happily ignores the prose
+/// instruction and emits a `tool_use` block instead of text. Claude Code then
+/// extracts no assistant text and aborts /compact with
+/// "summarization produced empty response".
+///
+/// We therefore detect the instruction and drop the tools for that single
+/// request, which forces the backend to produce text. Matching on the
+/// instruction (rather than on `thinking: {"type": "disabled"}`) keeps normal
+/// tool use intact for users who simply run with thinking turned off — e.g.
+/// non-reasoning models such as Qwen2.5-14B-1M.
+const TEXT_ONLY_MARKERS: [&str; 2] = [
+    "Do NOT call any tools",
+    "Tool calls will be rejected and you will fail the task",
+];
+
+/// Append all plain-text fragments of an Anthropic/OpenAI `content` value.
+fn collect_message_text(content: &Value, out: &mut String) {
+    match content {
+        Value::String(s) => out.push_str(s),
+        Value::Array(blocks) => {
+            for block in blocks {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when a user message asks for a text-only reply with no tool calls.
+///
+/// Works for both OpenAI-shaped and Anthropic-shaped message arrays, since
+/// `content` may be a bare string or a list of typed blocks in either.
+pub fn is_text_only_turn(request: &Value) -> bool {
+    let Some(messages) = request.get("messages").and_then(|m| m.as_array()) else {
+        return false;
+    };
+    let mut text = String::new();
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        if let Some(content) = msg.get("content") {
+            collect_message_text(content, &mut text);
+        }
+    }
+    TEXT_ONLY_MARKERS.iter().any(|m| text.contains(m))
+}
+
 // ─── POST /v1/chat/completions (passthrough) ───────────────────────────────
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
@@ -1781,14 +1837,45 @@ pub async fn handle_chat_completions(
             }
         }
 
+        // Honor the Anthropic client's `thinking` field. The CCR gateway keeps
+        // `thinking: {"type": "disabled"}` in the body when translating
+        // Anthropic → chat/completions (and drops reasoning_effort), so this is
+        // the signal Claude Code's /compact turn arrives with on this route.
+        let client_thinking_disabled = request_json
+            .get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(|v| v.as_str())
+            .map(|s| s == "disabled")
+            .unwrap_or(false);
+
+        // A summarization turn must yield prose, not a tool call. Drop the
+        // tools so the backend cannot emit tool_use, and keep thinking off so
+        // the answer lands in `content` where the client looks for it.
+        let text_only = is_text_only_turn(&request_json);
+        if text_only {
+            effort = None;
+        }
+
         thinking_enabled = effort.is_some();
 
         if let Some(obj) = request_json.as_object_mut() {
+            // `thinking` is an Anthropic-only field; the backend's
+            // chat/completions endpoint has no use for it.
+            obj.remove("thinking");
+            if text_only {
+                obj.remove("tools");
+                obj.remove("tool_choice");
+                obj.remove("reasoning_effort");
+            }
             let kwargs = obj
                 .entry("chat_template_kwargs")
                 .or_insert_with(|| json!({}));
             if let Some(kw) = kwargs.as_object_mut() {
-                if let Some(ref effort) = effort {
+                if text_only || client_thinking_disabled {
+                    // Text-only turn, or the client explicitly disabled
+                    // thinking — either way, output must go to `content`.
+                    kw.insert("enable_thinking".to_string(), json!(false));
+                } else if let Some(ref effort) = effort {
                     // User selected an effort level — enable thinking
                     if lower_model.contains("glm") {
                         let enable = effort != "low";
@@ -1803,6 +1890,16 @@ pub async fn handle_chat_completions(
                     kw.entry("enable_thinking").or_insert(json!(false));
                 }
             }
+        }
+
+        if text_only || client_thinking_disabled {
+            logger::info(
+                "chat",
+                &format!(
+                    "text-only turn (marker={}, thinking_disabled={}) — tools stripped={}, thinking off",
+                    text_only, client_thinking_disabled, text_only
+                ),
+            );
         }
     }
 
@@ -2087,14 +2184,30 @@ pub async fn handle_messages(
         .map(|s| s == "disabled")
         .unwrap_or(false);
 
+
+    // A summarization turn must yield prose, not a tool call. Claude Code's
+    // compact prompt says "Do NOT call any tools" but still ships the tool
+    // schemas; GLM-5.x calls FileReadTool anyway, leaving no text block and
+    // failing /compact with "summarization produced empty response". Drop the
+    // tools for that request only — gating on the instruction rather than on
+    // `thinking: disabled` keeps tool use working for non-reasoning models.
+    let text_only = is_text_only_turn(&request_json);
+    if text_only {
+        if let Some(obj) = cc_request.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("reasoning_effort");
+        }
+    }
     if let Some(obj) = cc_request.as_object_mut() {
         let kwargs = obj
             .entry("chat_template_kwargs")
             .or_insert_with(|| json!({}));
         if let Some(kw) = kwargs.as_object_mut() {
-            if client_thinking_disabled {
-                // Client explicitly disabled thinking — honor it.
-                kw.entry("enable_thinking").or_insert(json!(false));
+            if client_thinking_disabled || text_only {
+                // Client explicitly disabled thinking, or this is a text-only
+                // summarization turn — honor it.
+                kw.insert("enable_thinking".to_string(), json!(false));
             } else if let Some(ref effort) = effort {
                 if lower_model.contains("glm") {
                     let enable = effort != "low";
