@@ -137,6 +137,7 @@ openai-compatibility:
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
         rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
+        backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;
@@ -228,6 +229,7 @@ openai-compatibility:
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
         rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
+        backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;
