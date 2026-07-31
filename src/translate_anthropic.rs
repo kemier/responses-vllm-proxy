@@ -399,6 +399,37 @@ impl AnthropicStreamTranslator {
         events
     }
 
+    /// Close out the stream after an in-stream upstream error, without
+    /// synthesizing the empty-text fallback that `finish()` applies.
+    ///
+    /// The backend can reject a request with HTTP 200 plus an SSE error event
+    /// (e.g. `{"message":"upstream error","code":503}` when
+    /// prompt_tokens + max_tokens exceeds the model's context length). Those
+    /// lines carry no `choices`, so `translate_line()` skips them and
+    /// `finish()` would emit an empty assistant text block — which Claude Code
+    /// CLI accepts as a legitimate turn that simply said nothing, silently
+    /// ending the conversation instead of reporting the failure.
+    ///
+    /// The caller emits an Anthropic `error` event instead. We only close any
+    /// content block left open by partial output, so the emitted stream stays
+    /// well-formed; no message_delta/message_stop is produced, because the
+    /// turn did not complete.
+    pub fn abort_for_error(&mut self) -> Vec<String> {
+        let mut events = Vec::new();
+        if self.text_block_open {
+            events.push(self.content_block_stop_event(self.current_block_index));
+            self.current_block_index += 1;
+            self.text_block_open = false;
+        }
+        if self.thinking_block_open {
+            events.push(self.content_block_stop_event(self.current_block_index));
+            self.current_block_index += 1;
+            self.thinking_block_open = false;
+        }
+        self.finished = true;
+        events
+    }
+
     fn finish(&mut self) -> Vec<String> {
         if self.finished {
             return Vec::new();

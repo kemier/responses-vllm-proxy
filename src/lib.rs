@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod logger;
+#[allow(clippy::duplicate_mod)]
 pub mod translate_request;
 pub mod translate_response;
 

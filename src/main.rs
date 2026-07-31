@@ -6,6 +6,7 @@ pub mod config;
 pub mod logger;
 #[allow(clippy::duplicate_mod)]
 pub mod translate_anthropic;
+#[allow(clippy::duplicate_mod)]
 pub mod translate_request;
 #[allow(clippy::duplicate_mod)]
 pub mod translate_response;
@@ -2066,7 +2067,6 @@ pub async fn handle_chat_completions(
                       });
                       let err_event = format!("event: error\ndata: {}\n\n", err_payload);
                       let _ = tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await;
-                      return;
                   }
                });
 
@@ -2312,8 +2312,7 @@ pub async fn handle_messages(
             // and finish() would synthesize an EMPTY assistant message. The
             // client (CCR/Claude Code) then sees a silent end_turn with ~0
             // tokens — the "GLM returns empty / ends prematurely" symptom.
-            // Instead surface a real Anthropic SSE error event so the client
-            // can surface the failure (and the user knows to wait/compact).
+            // Instead surface a real Anthropic error so the client can react.
             if !status.is_success() {
                 let body_text = r.bytes().await.unwrap_or_default();
                 let body_str = String::from_utf8_lossy(&body_text);
@@ -2330,26 +2329,61 @@ pub async fn handle_messages(
                         status.as_u16(),
                     );
                 }
-                let err_type = if status.as_u16() == 429 {
-                    "rate_limit_error"
-                } else {
-                    "api_error"
-                };
+
+                // A request that exceeds the model's context window is a
+                // client-side sizing problem, whatever status the backend
+                // chose (vLLM reports it as a 500). Re-emit it as Anthropic's
+                // 400 invalid_request_error with the canonical "prompt is too
+                // long: N tokens > M maximum" wording: Claude Code CLI matches
+                // that phrasing and responds by compacting the conversation
+                // and retrying, turning a dead session into a recovery.
+                let (http_status, err_type, err_message) =
+                    match translate_response::parse_context_length_error(&body_str) {
+                        Some((total, max)) => {
+                            logger::info(
+                                "messages",
+                                &format!(
+                                    "Context window exceeded ({} > {}) — reporting as prompt-too-long so the client can compact",
+                                    total, max
+                                ),
+                            );
+                            (
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request_error",
+                                format!("prompt is too long: {} tokens > {} maximum", total, max),
+                            )
+                        }
+                        None => {
+                            let code = status.as_u16();
+                            let mapped = StatusCode::from_u16(code)
+                                .unwrap_or(StatusCode::BAD_GATEWAY);
+                            let ty = if code == 429 {
+                                "rate_limit_error"
+                            } else {
+                                "api_error"
+                            };
+                            (mapped, ty, format!("Upstream {}: {}", status, summary))
+                        }
+                    };
+
                 let err_payload = json!({
                     "type": "error",
                     "error": {
                         "type": err_type,
-                        "message": format!("Upstream {}: {}", status, summary)
+                        "message": err_message
                     }
                 });
-                let sse = format!(
-                    "event: error\ndata: {}\n\n",
-                    err_payload
-                );
+                // Return a real HTTP error status with a JSON body. Returning
+                // 200 here breaks non-streaming clients: the Anthropic SDK
+                // parses the body as a Message, finds no content, and reports
+                // "API returned an empty or malformed response (HTTP 200)".
+                // A non-2xx JSON error is correct for streaming clients too —
+                // nothing has been streamed yet, so the SDK raises it as an
+                // API error rather than starting to parse SSE.
                 return Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/event-stream")
-                    .body(Body::from(sse))
+                    .status(http_status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&err_payload).unwrap_or_default()))
                     .unwrap();
             }
 
@@ -2368,6 +2402,10 @@ pub async fn handle_messages(
                     let mut read_pos: usize = 0;
                     let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
                     sse_keepalive.tick().await;
+                    // In-stream upstream errors arrive with HTTP 200, so the
+                    // status check above cannot catch them. Track the first one
+                    // and surface it instead of a synthesized empty message.
+                    let mut upstream_error: Option<(u16, String)> = None;
 
                     loop {
                         tokio::select! {
@@ -2379,6 +2417,41 @@ pub async fn handle_messages(
                                             let pos = read_pos + rel_pos;
                                             let line = &buffer[read_pos..pos];
                                             read_pos = pos + 1;
+                                            // Once an error is seen, stop
+                                            // translating. The backend still
+                                            // sends `data: [DONE]` afterwards,
+                                            // which would drive finish() and
+                                            // synthesize the very empty
+                                            // assistant message we are avoiding.
+                                            if upstream_error.is_some() {
+                                                continue;
+                                            }
+                                            // Check for an in-stream error before handing
+                                            // the line to the translator. The backend
+                                            // returns HTTP 200 with an SSE error event
+                                            // when prompt_tokens + max_tokens exceeds the
+                                            // model's context length; the line has no
+                                            // `choices`, so the translator would skip it
+                                            // and finish() would synthesize an empty
+                                            // assistant message, hiding the failure.
+                                            if let Some(stripped) = line.trim().strip_prefix("data: ") {
+                                                if stripped != "[DONE]" {
+                                                    if let Ok(parsed) = serde_json::from_str::<Value>(stripped) {
+                                                        if let Some((code, msg)) = translate_response::extract_upstream_error(&parsed) {
+                                                            logger::error(
+                                                                "messages",
+                                                                &format!(
+                                                                    "Upstream in-stream error (code={}) — sending SSE error event instead of an empty message: {}",
+                                                                    code, &msg[..msg.len().min(300)]
+                                                                ),
+                                                            );
+                                                            upstream_error = Some((code, msg));
+                                                            // Don't translate the error object.
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let events = translator.translate_line(line);
                                             for event in events {
                                                 if tx.send(Ok(axum::body::Bytes::from(event))).await.is_err() {
@@ -2407,16 +2480,39 @@ pub async fn handle_messages(
                     }
                     if read_pos < buffer.len() {
                         let remaining = &buffer[read_pos..];
-                        if !remaining.trim().is_empty() {
+                        if !remaining.trim().is_empty() && upstream_error.is_none() {
                             let events = translator.translate_line(remaining);
                             for event in events {
                                 let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
                             }
                         }
                     }
-                    let finish_events = translator.translate_line("data: [DONE]");
-                    for event in finish_events {
-                        let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                    if let Some((code, msg)) = upstream_error {
+                        // Close any block left open by partial output, then
+                        // report the failure. Deliberately skips finish() so no
+                        // empty assistant message is synthesized.
+                        for event in translator.abort_for_error() {
+                            let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                        }
+                        let err_type = if code == 429 {
+                            "rate_limit_error"
+                        } else {
+                            "api_error"
+                        };
+                        let err_payload = json!({
+                            "type": "error",
+                            "error": {
+                                "type": err_type,
+                                "message": format!("Upstream error ({}): {}", code, msg)
+                            }
+                        });
+                        let sse = format!("event: error\ndata: {}\n\n", err_payload);
+                        let _ = tx.send(Ok(axum::body::Bytes::from(sse))).await;
+                    } else {
+                        let finish_events = translator.translate_line("data: [DONE]");
+                        for event in finish_events {
+                            let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                        }
                     }
                 });
 
@@ -2431,6 +2527,40 @@ pub async fn handle_messages(
             } else {
                 let body_bytes = r.bytes().await.unwrap_or_default();
                 let cc_response: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!({}));
+                // Same trap as the streaming branch: the backend can return
+                // HTTP 200 with an error object instead of `choices`. Translating
+                // it would yield an empty assistant message, so report the error.
+                if let Some((code, msg)) = translate_response::extract_upstream_error(&cc_response) {
+                    logger::error(
+                        "messages",
+                        &format!(
+                            "Upstream error object in 200 response (code={}): {}",
+                            code,
+                            &msg[..msg.len().min(300)]
+                        ),
+                    );
+                    let err_type = if code == 429 {
+                        "rate_limit_error"
+                    } else {
+                        "api_error"
+                    };
+                    let err_payload = json!({
+                        "type": "error",
+                        "error": {
+                            "type": err_type,
+                            "message": format!("Upstream error ({}): {}", code, msg)
+                        }
+                    });
+                    // Non-2xx, not 200: a 200 with an error body makes the
+                    // Anthropic SDK report "API returned an empty or malformed
+                    // response (HTTP 200)" instead of the real cause.
+                    let http_status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+                    return Response::builder()
+                        .status(http_status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&err_payload).unwrap_or_default()))
+                        .unwrap();
+                }
                 let anthropic_response =
                     translate_anthropic::chat_completions_to_anthropic(&backend_model, &cc_response);
                 Response::builder()

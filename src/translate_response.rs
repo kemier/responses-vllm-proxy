@@ -1519,6 +1519,59 @@ impl ResponseTranslator {
 ///
 /// Returns `Some((code, message))` if the parsed JSON looks like an upstream
 /// error object, `None` otherwise.
+/// Parse a context-length-exceeded error from the backend, returning
+/// `(total_tokens, max_tokens)`.
+///
+/// vLLM phrases it as:
+///   "This model's maximum context length is 196608 tokens. However, you
+///    requested 32000 output tokens and your prompt contains at least 164609
+///    input tokens, for a total of at least 196609 tokens. Please reduce ..."
+///
+/// This matters because Claude Code CLI recovers from an over-long prompt by
+/// compacting the conversation, but only when it recognizes Anthropic's own
+/// wording — it matches
+/// `/prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i` and uses the two
+/// numbers to decide how much history to drop. Reporting the backend's wording
+/// verbatim leaves the client with an unrecognized error and a dead session, so
+/// callers re-emit this as "prompt is too long: N tokens > M maximum".
+pub fn parse_context_length_error(body: &str) -> Option<(u64, u64)> {
+    let lower = body.to_lowercase();
+    // Only treat this as a context-length problem when the backend says so.
+    if !lower.contains("maximum context length") && !lower.contains("context length is") {
+        return None;
+    }
+
+    let max_tokens = number_after(&lower, "maximum context length is ")
+        .or_else(|| number_after(&lower, "context length is "))?;
+
+    // Prefer the total the backend computed; fall back to output + input.
+    let total = number_after(&lower, "for a total of at least ")
+        .or_else(|| number_after(&lower, "for a total of "))
+        .or_else(|| {
+            let requested = number_after(&lower, "you requested ")?;
+            let input = number_after(&lower, "prompt contains at least ")
+                .or_else(|| number_after(&lower, "prompt contains "))?;
+            Some(requested + input)
+        })?;
+
+    Some((total, max_tokens))
+}
+
+/// Read the first run of digits that follows `marker`.
+fn number_after(haystack: &str, marker: &str) -> Option<u64> {
+    let start = haystack.find(marker)? + marker.len();
+    let digits: String = haystack[start..]
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 pub fn extract_upstream_error(parsed: &Value) -> Option<(u16, String)> {
     // Shape 2: {"error":{"message":"...","code":NNN}}
     if let Some(err_obj) = parsed.get("error").and_then(|e| e.as_object()) {
