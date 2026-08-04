@@ -117,6 +117,11 @@ pub struct ResponseTranslator {
     started: bool,
     completion_pending: bool,
     completed_emitted: bool,
+    // The raw finish_reason from vLLM ("stop", "length", "tool_calls", etc.).
+    // Used to distinguish max_tokens truncation ("length") from normal
+    // completion ("stop") so build_completed_event can emit status="incomplete"
+    // with incomplete_details when the model was cut off by max_tokens.
+    finish_reason: String,
 
     // Reasoning state
     reasoning_id: Option<String>,
@@ -204,6 +209,7 @@ impl ResponseTranslator {
             started: false,
             completion_pending: false,
             completed_emitted: false,
+            finish_reason: String::new(),
             reasoning_id: None,
             reasoning_index: None,
             reasoning_buf: String::new(),
@@ -421,6 +427,13 @@ impl ResponseTranslator {
                     .unwrap_or("");
                 if !finish_reason.is_empty() {
                     self.completion_pending = true;
+                    // Store the raw finish_reason so build_completed_event
+                    // can distinguish max_tokens truncation ("length") from
+                    // normal completion ("stop"). Without this, a truncated
+                    // response is reported as status="completed", and Codex
+                    // treats it as a complete turn — silently ending the
+                    // response mid-sentence.
+                    self.finish_reason = finish_reason.to_string();
                 }
 
 
@@ -1290,15 +1303,29 @@ impl ResponseTranslator {
         // turn as complete even when tool calls were emitted.
         let end_turn = self.func_states.is_empty();
 
+        // When the model was cut off by max_tokens (finish_reason: "length"),
+        // emit status="incomplete" with incomplete_details so Codex knows the
+        // response was truncated and can continue generating. Without this,
+        // Codex treats the truncated output as a complete turn — the response
+        // silently ends mid-sentence.
+        let is_truncated = self.finish_reason == "length";
+        let status = if is_truncated { "incomplete" } else { "completed" };
+
         let mut response = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created,
-            "status": "completed",
+            "status": status,
             "background": false,
             "error": null,
             "end_turn": end_turn,
         });
+
+        if is_truncated {
+            response["incomplete_details"] = json!({
+                "reason": "max_output_tokens"
+            });
+        }
 
         if let Some(req) = &self.request_json {
             for field in [
@@ -1638,15 +1665,32 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
         .and_then(|m| m.get("tool_calls"))
         .is_some();
 
+    // Check if the model was truncated by max_tokens (finish_reason: "length").
+    let finish_reason = raw
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let is_truncated = finish_reason == "length";
+    let status = if is_truncated { "incomplete" } else { "completed" };
+
     let mut resp = json!({
         "id": response_id,
         "object": "response",
         "created_at": created,
-        "status": "completed",
+        "status": status,
         "background": false,
         "error": null,
         "end_turn": !has_tool_calls,
     });
+
+    if is_truncated {
+        resp["incomplete_details"] = json!({
+            "reason": "max_output_tokens"
+        });
+    }
 
     if let Some(req) = request_json {
         for field in [
@@ -1818,4 +1862,244 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
     }
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Helper: feed a sequence of SSE data lines to a translator and return
+    /// all emitted event strings concatenated.
+    fn run_stream(lines: &[&str]) -> Vec<String> {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let mut all_events = Vec::new();
+        for line in lines {
+            let events = t.process_line(line);
+            all_events.extend(events);
+        }
+        all_events
+    }
+
+    /// Extract the `response.completed` (or `response.incomplete`) event's
+    /// JSON payload from the event list. In SSE mode the payload is the
+    /// `data:` portion; in raw JSON mode the whole string is the JSON.
+    fn find_completed_event(events: &[String]) -> Option<Value> {
+        for ev in events.iter().rev() {
+            // SSE mode: "event: response.completed\ndata: {...}\n\n"
+            if let Some(data_pos) = ev.find("data: ") {
+                let json_str = &ev[data_pos + 6..].trim();
+                if let Ok(v) = serde_json::from_str::<Value>(json_str) {
+                    let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if t == "response.completed" {
+                        return Some(v);
+                    }
+                }
+            }
+            // Raw JSON mode: the whole string is a JSON object
+            if let Ok(v) = serde_json::from_str::<Value>(ev) {
+                let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if t == "response.completed" {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    /// When finish_reason is "stop", the response should have status="completed"
+    /// and no incomplete_details.
+    #[test]
+    fn test_normal_completion_has_completed_status() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":""}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let completed = find_completed_event(&events).expect("should have response.completed");
+        let response = completed.get("response").expect("should have response field");
+        assert_eq!(
+            response.get("status").and_then(|s| s.as_str()),
+            Some("completed"),
+            "normal stop should have status=completed"
+        );
+        assert!(
+            response.get("incomplete_details").is_none(),
+            "normal stop should not have incomplete_details"
+        );
+    }
+
+    /// When finish_reason is "length" (max_tokens truncation), the response
+    /// should have status="incomplete" with incomplete_details.reason="max_output_tokens".
+    #[test]
+    fn test_max_tokens_truncation_emits_incomplete_status() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"This is a long response that gets cut"},"finish_reason":""}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":" off mid-sentence"},"finish_reason":"length"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":16384,"total_tokens":16484}}"#,
+            "data: [DONE]",
+        ]);
+
+        let completed = find_completed_event(&events).expect("should have response.completed");
+        let response = completed.get("response").expect("should have response field");
+        assert_eq!(
+            response.get("status").and_then(|s| s.as_str()),
+            Some("incomplete"),
+            "finish_reason=length should have status=incomplete"
+        );
+        let details = response
+            .get("incomplete_details")
+            .expect("should have incomplete_details");
+        assert_eq!(
+            details.get("reason").and_then(|r| r.as_str()),
+            Some("max_output_tokens"),
+            "incomplete_details.reason should be max_output_tokens"
+        );
+    }
+
+    /// When finish_reason is "tool_calls", the response should have
+    /// status="completed" (not incomplete) — tool calls are a normal stop.
+    #[test]
+    fn test_tool_calls_finish_has_completed_status() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":""}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#,
+            "data: [DONE]",
+        ]);
+
+        let completed = find_completed_event(&events).expect("should have response.completed");
+        let response = completed.get("response").expect("should have response field");
+        assert_eq!(
+            response.get("status").and_then(|s| s.as_str()),
+            Some("completed"),
+            "finish_reason=tool_calls should have status=completed"
+        );
+        assert!(
+            response.get("incomplete_details").is_none(),
+            "tool_calls finish should not have incomplete_details"
+        );
+    }
+
+    /// When the stream ends without any finish_reason (e.g. connection drop
+    /// followed by [DONE]), the response should have status="completed"
+    /// (no truncation detected — backward compatible).
+    #[test]
+    fn test_no_finish_reason_defaults_to_completed() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":""}]}"#,
+            // No finish_reason at all — stream just ends
+            "data: [DONE]",
+        ]);
+
+        let completed = find_completed_event(&events).expect("should have response.completed");
+        let response = completed.get("response").expect("should have response field");
+        assert_eq!(
+            response.get("status").and_then(|s| s.as_str()),
+            Some("completed"),
+            "no finish_reason should default to status=completed"
+        );
+    }
+
+    /// Non-streaming path: chat_completion_to_response should also set
+    /// status="incomplete" when finish_reason is "length".
+    #[test]
+    fn test_non_streaming_max_tokens_truncation() {
+        let raw = json!({
+            "id": "chatcmpl_abc123",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "This response was cut off"
+                },
+                "finish_reason": "length"
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 16384,
+                "total_tokens": 16434
+            }
+        });
+
+        let resp = chat_completion_to_response(&raw, None);
+        assert_eq!(
+            resp.get("status").and_then(|s| s.as_str()),
+            Some("incomplete"),
+            "non-streaming finish_reason=length should have status=incomplete"
+        );
+        let details = resp
+            .get("incomplete_details")
+            .expect("should have incomplete_details");
+        assert_eq!(
+            details.get("reason").and_then(|r| r.as_str()),
+            Some("max_output_tokens"),
+        );
+    }
+
+    /// Non-streaming path: normal completion should have status="completed".
+    #[test]
+    fn test_non_streaming_normal_completion() {
+        let raw = json!({
+            "id": "chatcmpl_abc123",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello world"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            }
+        });
+
+        let resp = chat_completion_to_response(&raw, None);
+        assert_eq!(
+            resp.get("status").and_then(|s| s.as_str()),
+            Some("completed"),
+        );
+        assert!(
+            resp.get("incomplete_details").is_none(),
+            "normal stop should not have incomplete_details"
+        );
+    }
+
+    /// Raw JSON mode (WebSocket): finish_reason="length" should still
+    /// produce status="incomplete" in the response.completed event.
+    #[test]
+    fn test_raw_json_max_tokens_truncation() {
+        let mut t = ResponseTranslator::new_raw_json("resp_ws_test", None);
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"truncated"},"finish_reason":"length"}]}"#,
+        );
+        let events = t.process_line("data: [DONE]");
+
+        // In raw JSON mode, each event is a bare JSON object string
+        let completed = events
+            .iter()
+            .find_map(|ev| serde_json::from_str::<Value>(ev).ok())
+            .filter(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some("response.completed")
+            })
+            .expect("should have response.completed event");
+
+        let response = completed.get("response").expect("should have response field");
+        assert_eq!(
+            response.get("status").and_then(|s| s.as_str()),
+            Some("incomplete"),
+            "raw JSON mode: finish_reason=length should have status=incomplete"
+        );
+        assert!(
+            response.get("incomplete_details").is_some(),
+            "raw JSON mode: should have incomplete_details"
+        );
+    }
 }

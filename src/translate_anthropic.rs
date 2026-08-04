@@ -641,3 +641,91 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
         "usage": {"input_tokens": 0, "output_tokens": 0}
     })
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: feed SSE lines to the translator and return all events.
+    fn run_stream(lines: &[&str]) -> Vec<String> {
+        let mut t = AnthropicStreamTranslator::new("test-model");
+        let mut all = Vec::new();
+        for line in lines {
+            all.extend(t.translate_line(line));
+        }
+        all
+    }
+
+    /// Extract the JSON payload from an SSE event string.
+    fn parse_event(event: &str) -> Option<Value> {
+        if let Some(pos) = event.find("data: ") {
+            serde_json::from_str(event[pos + 6..].trim()).ok()
+        } else {
+            None
+        }
+    }
+
+    /// Find the message_delta event from the event list and return its JSON.
+    fn find_message_delta(events: &[String]) -> Option<Value> {
+        for ev in events.iter().rev() {
+            if ev.contains("message_delta") {
+                return parse_event(ev);
+            }
+        }
+        None
+    }
+
+    /// When finish_reason is "stop", stop_reason should be "end_turn".
+    #[test]
+    fn test_normal_stop_emits_end_turn() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"Hello world"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(stop_reason, Some("end_turn"));
+    }
+
+    /// When finish_reason is "length" (max_tokens), stop_reason should be
+    /// "max_tokens" so Claude Code knows the response was truncated.
+    #[test]
+    fn test_max_tokens_emits_max_tokens_stop_reason() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"truncated mid-sentence"},"finish_reason":"length"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":16384,"total_tokens":16484}}"#,
+            "data: [DONE]",
+        ]);
+
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(
+            stop_reason,
+            Some("max_tokens"),
+            "finish_reason=length should produce stop_reason=max_tokens"
+        );
+    }
+
+    /// When finish_reason is "tool_calls", stop_reason should be "tool_use".
+    #[test]
+    fn test_tool_calls_emits_tool_use_stop_reason() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ]);
+
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(stop_reason, Some("tool_use"));
+    }
+}
