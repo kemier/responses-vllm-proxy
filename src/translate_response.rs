@@ -1534,6 +1534,15 @@ impl ResponseTranslator {
     pub fn has_upstream_error(&self) -> bool {
         self.upstream_error.is_some()
     }
+
+    /// Returns true if the upstream sent a finish_reason for any choice.
+    /// When false, the stream ended without the model signaling completion
+    /// (e.g. silent stall, connection drop). Callers should emit an error
+    /// event instead of response.completed to avoid the client treating
+    /// a truncated stream as a complete turn.
+    pub fn has_finish_reason(&self) -> bool {
+        !self.finish_reason.is_empty()
+    }
 }
 
 /// Detect upstream error objects embedded in SSE streams.
@@ -2100,6 +2109,40 @@ mod tests {
         assert!(
             response.get("incomplete_details").is_some(),
             "raw JSON mode: should have incomplete_details"
+        );
+    }
+
+    /// When the stream ends with [DONE] but NO finish_reason was ever sent
+    /// (silent stall / connection drop), has_finish_reason() should return
+    /// false so the caller can emit an error instead of response.completed.
+    #[test]
+    fn test_missing_finish_reason_detected() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        // Stream content but never send finish_reason
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"partial response"},"finish_reason":""}]}"#,
+        );
+        // Simulate stream ending with [DONE] — no finish_reason chunk
+        let _ = t.process_line("data: [DONE]");
+
+        assert!(
+            !t.has_finish_reason(),
+            "stream without finish_reason should have has_finish_reason() = false"
+        );
+    }
+
+    /// When finish_reason is present, has_finish_reason() should return true.
+    #[test]
+    fn test_finish_reason_present_detected() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"complete"},"finish_reason":"stop"}]}"#,
+        );
+        let _ = t.process_line("data: [DONE]");
+
+        assert!(
+            t.has_finish_reason(),
+            "stream with finish_reason='stop' should have has_finish_reason() = true"
         );
     }
 }

@@ -83,3 +83,7 @@ openai-compatibility:
             alias: Qwen3.6-35B-A3B
             context_length: 131072
             tags: [fast, multimodal, coding]
+          - name: deepseek-ai/DeepSeek-V4-Flash-0731
+            alias: deepseek-v4-flash
+            context_length: 262144
+            tags: [fast, coding]

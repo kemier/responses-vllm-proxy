@@ -900,13 +900,34 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
                if tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await.is_err() {
                    return;
                }
-               // Do NOT send [DONE] / response.completed — the error event
-               // above signals codex to retry/fallback.
-               return;
-           }
+              // Do NOT send [DONE] / response.completed — the error event
+              // above signals codex to retry/fallback.
+              return;
+          }
 
-           // Send [DONE]
-           let events = translator.process_line("data: [DONE]");
+          // If the upstream stream ended without a finish_reason (silent
+          // stall, connection drop), emit an error event instead of
+          // response.completed. Without this, the proxy synthesizes a
+          // completed response with end_turn=true, and Codex treats the
+          // truncated stream as a complete turn.
+          if !translator.has_finish_reason() {
+              logger::error("responses", "Upstream stream ended without finish_reason — sending error instead of response.completed");
+              let err_payload = json!({
+                  "type": "error",
+                  "status": 502,
+                  "error": {
+                      "message": "Upstream stream ended without completion signal — response may be truncated"
+                  }
+              });
+              let err_event = format!("event: error\ndata: {}\n\n", err_payload);
+              if tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await.is_err() {
+                  return;
+              }
+              return;
+          }
+
+          // Send [DONE]
+          let events = translator.process_line("data: [DONE]");
            for event in events {
                if tx
                    .send(Ok(axum::body::Bytes::from(event.into_bytes())))
@@ -1597,14 +1618,34 @@ pub async fn handle_responses_ws(
                 let _ = socket.send(axum::extract::ws::Message::Text(
                     err_payload.to_string()
                 )).await;
-                continue 'connection;
-            }
+               continue 'connection;
+           }
 
-            // Properly flush the translator by passing [DONE], which emits
-            // the full response.completed event with output/usage data.
-            // This replaces the previous manual response.completed that was
-            // missing output, usage, model, and other fields.
-            let done_events = translator.process_line("data: [DONE]");
+           // If the upstream stream ended without a finish_reason (silent
+           // stall, connection drop), emit an error event instead of
+           // response.completed. Without this, the proxy synthesizes a
+           // completed response with end_turn=true, and Codex treats the
+           // truncated stream as a complete turn.
+           if !translator.has_finish_reason() {
+               logger::error("ws", &format!("[{}] Upstream stream ended without finish_reason — sending error instead of response.completed", conn_short));
+               let err_payload = json!({
+                   "type": "error",
+                   "status": 502,
+                   "error": {
+                       "message": "Upstream stream ended without completion signal — response may be truncated"
+                   }
+               });
+               let _ = socket.send(axum::extract::ws::Message::Text(
+                   err_payload.to_string()
+               )).await;
+               continue 'connection;
+           }
+
+           // Properly flush the translator by passing [DONE], which emits
+           // the full response.completed event with output/usage data.
+           // This replaces the previous manual response.completed that was
+           // missing output, usage, model, and other fields.
+           let done_events = translator.process_line("data: [DONE]");
             for event in done_events {
                 if logger::is_enabled(logger::LogLevel::Debug) {
                     let preview: String = event.chars().take(500).collect();
@@ -2506,15 +2547,38 @@ pub async fn handle_messages(
                                 "message": format!("Upstream error ({}): {}", code, msg)
                             }
                         });
-                        let sse = format!("event: error\ndata: {}\n\n", err_payload);
-                        let _ = tx.send(Ok(axum::body::Bytes::from(sse))).await;
-                    } else {
-                        let finish_events = translator.translate_line("data: [DONE]");
-                        for event in finish_events {
-                            let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                       let sse = format!("event: error\ndata: {}\n\n", err_payload);
+                       let _ = tx.send(Ok(axum::body::Bytes::from(sse))).await;
+                   } else {
+                        // If the upstream stream ended without a finish_reason
+                        // (silent stall, connection drop), the translator's
+                        // stop_reason is empty. finish() would default to
+                        // "end_turn", making Claude Code think the model chose
+                        // to stop — causing premature end_turn on short
+                        // responses. Emit an error event instead so the client
+                        // can retry.
+                        if !translator.has_finish_reason() {
+                            logger::error("messages", "Upstream stream ended without finish_reason — sending error instead of end_turn");
+                            for event in translator.abort_for_error() {
+                                let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                            }
+                            let err_payload = json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "api_error",
+                                    "message": "Upstream stream ended without completion signal — response may be truncated"
+                                }
+                            });
+                            let sse = format!("event: error\ndata: {}\n\n", err_payload);
+                            let _ = tx.send(Ok(axum::body::Bytes::from(sse))).await;
+                        } else {
+                           let finish_events = translator.translate_line("data: [DONE]");
+                           for event in finish_events {
+                               let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
+                           }
                         }
-                    }
-                });
+                   }
+               });
 
                 let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
                 let body = Body::from_stream(translated_stream);

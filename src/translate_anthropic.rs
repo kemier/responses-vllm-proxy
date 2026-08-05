@@ -430,6 +430,15 @@ impl AnthropicStreamTranslator {
         events
     }
 
+    /// Returns true if the upstream sent a finish_reason for any choice.
+    /// When false, the stream ended without the model signaling completion
+    /// (e.g. silent stall, connection drop). Callers should emit an error
+    /// event instead of finish() to avoid the client treating a truncated
+    /// stream as a complete turn (end_turn).
+    pub fn has_finish_reason(&self) -> bool {
+        !self.stop_reason.is_empty()
+    }
+
     fn finish(&mut self) -> Vec<String> {
         if self.finished {
             return Vec::new();
@@ -727,5 +736,40 @@ mod tests {
             .and_then(|d| d.get("stop_reason"))
             .and_then(|s| s.as_str());
         assert_eq!(stop_reason, Some("tool_use"));
+    }
+
+    /// When the stream ends with [DONE] but NO finish_reason was ever sent
+    /// (silent stall / connection drop), has_finish_reason() should return
+    /// false so the caller can emit an error instead of finish() defaulting
+    /// to "end_turn".
+    #[test]
+    fn test_missing_finish_reason_detected() {
+        let mut t = AnthropicStreamTranslator::new("test-model");
+        // Stream content but never send finish_reason
+        let _ = t.translate_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#,
+        );
+        // Simulate stream ending with [DONE] — no finish_reason chunk
+        let _ = t.translate_line("data: [DONE]");
+
+        assert!(
+            !t.has_finish_reason(),
+            "stream without finish_reason should have has_finish_reason() = false"
+        );
+    }
+
+    /// When finish_reason is present, has_finish_reason() should return true.
+    #[test]
+    fn test_finish_reason_present_detected() {
+        let mut t = AnthropicStreamTranslator::new("test-model");
+        let _ = t.translate_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"complete"},"finish_reason":"stop"}]}"#,
+        );
+        let _ = t.translate_line("data: [DONE]");
+
+        assert!(
+            t.has_finish_reason(),
+            "stream with finish_reason='stop' should have has_finish_reason() = true"
+        );
     }
 }
