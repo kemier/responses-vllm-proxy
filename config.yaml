@@ -60,7 +60,7 @@ openai-compatibility:
             tags: [sota, near_sota, thinking]
           - name: deepseek-ai/DeepSeek-V4-Pro
             alias: deepseek-v4-pro
-            context_length: 131072
+            context_length: 262144
             tags: [near_sota, sota]
           - name: Qwen/Qwen2.5-14B-Instruct-1M
             alias: qwen2.5-14b-1m
