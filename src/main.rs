@@ -319,6 +319,7 @@ async fn main() {
             post(handle_responses).get(handle_responses_ws),
         )
         .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/embeddings", post(handle_embeddings))
         .route("/v1/messages", post(handle_messages))
         // Codex can send very large request bodies (up to ~30MB for long
         // conversation contexts with 196K+ tokens). Axum's default body
@@ -2162,6 +2163,85 @@ pub async fn handle_chat_completions(
         }
         Err(e) => {
             logger::error("chat", &format!("Upstream error: {}", e));
+            (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response()
+        }
+    }
+}
+
+// ─── POST /v1/embeddings (passthrough) ─────────────────────────────────────
+/// Thin non-streaming passthrough for OpenAI-compatible `/v1/embeddings`.
+///
+/// The upstream ericai provider already serves embedding models (e.g.
+/// `BAAI/bge-m3`, `Qwen/Qwen3-Embedding-8B`, `intfloat/e5-mistral-7b-instruct`,
+/// `nomic-ai/nomic-embed-text-v1.5`); this route just exposes them through the
+/// proxy's auth/rate-limit layer so downstream clients (e.g. the TencentDB
+/// Agent Memory gateway) can point their embedding `baseUrl` at the proxy
+/// instead of the raw upstream. The request and response are forwarded
+/// verbatim — only the `model` alias is resolved to its backend id, matching
+/// `handle_chat_completions`.
+pub async fn handle_embeddings(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    let mut request_json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            logger::error("embeddings", &format!("Invalid JSON: {}", e));
+            return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
+        }
+    };
+
+    let model_alias = request_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Resolve alias → backend model id (e.g. "bge-m3" → "BAAI/bge-m3/...").
+    let backend_model = state.cfg.resolve_model(&model_alias);
+    request_json["model"] = json!(backend_model);
+
+    let token = match state.token_mgr.get_token().await {
+        Ok(t) => t,
+        Err(e) => {
+            logger::error("embeddings", &format!("Auth failed: {}", e));
+            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
+        }
+    };
+
+    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+    let url = format!("{}/embeddings", base_url);
+
+    logger::info(
+        "embeddings",
+        &format!("Passthrough POST {} model={}", url, backend_model),
+    );
+
+    let resp = state
+        .http_client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&request_json)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let headers = r.headers().clone();
+            // Embedding responses are small JSON blobs — never streamed. Forward
+            // the body verbatim (no reasoning/content rewrite needed).
+            let body_bytes = r.bytes().await.unwrap_or_default();
+            let mut response = Response::builder().status(status);
+            for (k, v) in &headers {
+                if k != "content-encoding" && k != "transfer-encoding" {
+                    response = response.header(k, v);
+                }
+            }
+            response.body(Body::from(body_bytes)).unwrap()
+        }
+        Err(e) => {
+            logger::error("embeddings", &format!("Upstream error: {}", e));
             (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response()
         }
     }
