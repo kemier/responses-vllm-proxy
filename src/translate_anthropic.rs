@@ -248,7 +248,37 @@ pub struct AnthropicStreamTranslator {
     // tool_use block this turn. Forces stop_reason=tool_use even when the
     // upstream finish_reason is "stop" (the model used the text channel).
     inline_tool_emitted: bool,
+    // Which inline-tool grammar the open tag matched. The square-bracket form
+    // (`[Name key="value"]`) has a closing `]`; the angle-bracket form
+    // (`<Name\nkey: "value"`) that GLM-5.2 also emits has NO closing tag and is
+    // terminated by a blank line / the next opener / stream end. The body
+    // drain and parser differ per kind.
+    tool_tag_kind: ToolTagKind,
 }
+
+/// Which inline-tool-call grammar a streaming tag matched.
+#[derive(Default, PartialEq, Clone, Copy)]
+enum ToolTagKind {
+    #[default]
+    /// `[Name key="value" ...]` — closed by a matching `]` at depth 0.
+    Square,
+    /// `<Name\nkey: "value"` — NO closing tag; terminated by a blank line,
+    /// the next opener, or stream end. (A bare-angle form; less common.)
+    Angle,
+    /// The HuggingFace/Qwen chat-template tool-call wrapper: the literal tag
+    /// formed by `\x3c` + `tool_call` + `\x3e` (angle-bracket, no attributes),
+    /// a newline, then the tool NAME on its own line, then `key: "value"`
+    /// attribute lines. GLM-5.2 emits this in claude-code-acp sessions. May or
+    /// may not be closed by the matching `\x3c/tool_call\x3e`; treat unclosed as
+    /// terminating at the next opener / blank line / stream end.
+    ToolCall,
+}
+
+/// The literal opener tag for the `ToolCall` grammar. Written with hex escapes
+/// so the source contains no literal angle-bracket-tool token.
+const TOOL_CALL_OPEN_TAG: &str = "\x3ctool_call\x3e";
+/// The matching closer, when GLM emits one.
+const TOOL_CALL_CLOSE_TAG: &str = "\x3c/tool_call\x3e";
 
 #[derive(Default)]
 struct PendingToolCall {
@@ -282,9 +312,9 @@ struct ParsedToolCall {
 }
 
 enum ToolTagMatch {
-    /// A complete tag opener was found; the inner value is the byte index of
-    /// the opening `[` in the buffer.
-    Full(usize),
+    /// A complete tag opener was found; the inner values are the byte index of
+    /// the opening bracket in the buffer and which grammar matched.
+    Full(usize, ToolTagKind),
     /// The buffer ends with bytes that could be the start of a tag opener
     /// (e.g. `[Ba`); the inner value is how many trailing bytes to hold back.
     Partial(usize),
@@ -293,9 +323,10 @@ enum ToolTagMatch {
 }
 
 enum TagBodyResult {
-    /// The closing `]` was found and consumed; `body` holds the tag interior.
+    /// The tag is complete (closing `]` for Square, or a terminator for
+    /// Angle); `body` holds the tag interior.
     Closed,
-    /// Need more input to reach the closing `]`.
+    /// Need more input to reach the terminator.
     Pending,
 }
 
@@ -314,23 +345,62 @@ fn is_ident_char(c: char) -> bool {
 /// Returns `Partial(hold)` when the buffer ends with a prefix of such an opener
 /// (so a tag split across chunks can still be recognized once more arrives).
 /// Returns `None` when no opener is possible.
+/// Scan `buf` for the opening bracket of a tool-call tag (either grammar).
+///
+/// Returns `Full(pos, kind)` when `buf[pos]` begins a tool-call tag opener —
+/// `[` for the square grammar (`[Name key="value"]`) or `<` for the angle
+/// grammar (`<Name\nkey: "value"`). The conservative validation in
+/// `validate_opener` / `validate_angle_opener` distinguishes tool-call openers
+/// from array literals (`[1, 2, 3]`), prose brackets (`[see note]`), and stray
+/// `<` / HTML-like tags.
+///
+/// Returns `Partial(hold)` when the buffer ends with a prefix of such an opener
+/// (so a tag split across chunks can still be recognized once more arrives).
+/// Returns `None` when no opener is possible.
 fn find_tool_tag_open(buf: &str) -> ToolTagMatch {
     let bytes = buf.as_bytes();
-    let mut last_bracket = None;
+    // Track the last bracket of EACH kind that *might* be a partial opener, so
+    // we can hold its trailing bytes back when no Full match is found.
+    let mut last_square: Option<usize> = None;
+    let mut last_angle: Option<usize> = None;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'[' {
-            // Tentatively record this bracket; validate below.
+        let b = bytes[i];
+        if b == b'[' {
             if validate_opener(buf, i) {
-                return ToolTagMatch::Full(i);
+                return ToolTagMatch::Full(i, ToolTagKind::Square);
             }
-            last_bracket = Some(i);
+            last_square = Some(i);
+        } else if b == b'<' {
+            // The HF tool-call wrapper (TOOL_CALL_OPEN_TAG) takes precedence:
+            // it also begins with `<` but is a distinct, well-known token.
+            if validate_toolcall_opener(buf, i) {
+                return ToolTagMatch::Full(i, ToolTagKind::ToolCall);
+            }
+            if validate_angle_opener(buf, i) {
+                return ToolTagMatch::Full(i, ToolTagKind::Angle);
+            }
+            // Only hold back `<` that could begin an opener — a `<` not
+            // followed by an identifier char (e.g. `a < b`, HTML `<br>`) is
+            // plain text. validate_angle_opener returning false means it's not
+            // a Full match; record it only if it plausibly starts an ident or
+            // the tool-call wrapper prefix (`<t...`).
+            if bytes.get(i + 1).map_or(false, |c| is_ident_char(*c as char)) {
+                last_angle = Some(i);
+            }
         }
         i += 1;
     }
-    // If the buffer ends with a possible partial opener (a trailing `[` plus a
-    // partial identifier), hold those bytes back for the next chunk.
-    if let Some(start) = last_bracket {
+    // If the buffer ends with a possible partial opener, hold those bytes back.
+    // Prefer the later of the two candidates so we don't emit text that is
+    // actually part of a pending opener of the other kind.
+    let candidate = match (last_square, last_angle) {
+        (Some(s), Some(a)) => Some(if s >= a { (s, b'[') } else { (a, b'<') }),
+        (Some(s), None) => Some((s, b'[')),
+        (None, Some(a)) => Some((a, b'<')),
+        (None, None) => None,
+    };
+    if let Some((start, _kind)) = candidate {
         let hold = bytes.len() - start;
         if hold <= AnthropicStreamTranslator::TOOL_TAG_MAX_HOLD {
             return ToolTagMatch::Partial(hold);
@@ -341,7 +411,32 @@ fn find_tool_tag_open(buf: &str) -> ToolTagMatch {
     ToolTagMatch::None
 }
 
-/// Validate that `buf[pos] == '['` begins a tool-call tag opener. Returns true
+/// How many trailing bytes of `buf` to hold back when no opener matched, in
+/// case the buffer ends with the start of an opener that more chunks would
+/// complete. Holds a lone trailing `[` (square) or a trailing `<` immediately
+/// followed by ident chars (angle); everything else is flushed as text.
+fn opener_hold_suffix(buf: &str) -> usize {
+    let bytes = buf.as_bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    // Lone trailing `[` could start a square opener.
+    if bytes[bytes.len() - 1] == b'[' {
+        return 1;
+    }
+    // A trailing run of `<` + ident chars (e.g. `<Ag`, `<B`) could start an
+    // angle opener once more ident/newline arrives. Hold back the `<` and any
+    // following ident chars.
+    if let Some(lt_pos) = buf.rfind('<') {
+        let tail = &buf[lt_pos + 1..];
+        if !tail.is_empty() && tail.chars().all(is_ident_char) {
+            return buf.len() - lt_pos;
+        }
+    }
+    0
+}
+
+
 /// if it looks like a tag opener. We require: `[`, ≥1 ident char (name),
 /// whitespace, ≥1 ident char (first attr key), then `=`. This is strict enough
 /// to reject prose arrays and loose enough to match `[Bash command="..."]`.
@@ -393,6 +488,171 @@ fn validate_opener(buf: &str, pos: usize) -> bool {
         return false;
     }
     matches!(chars.peek(), Some(&(_, '=')))
+}
+
+/// Validate that `buf[pos] == '<'` begins an ANGLE-grammar tool-call opener.
+/// Returns true if it looks like the angle form GLM-5.2 emits, e.g.:
+///
+/// ```text
+/// <Agent
+/// description: "..."
+/// prompt: "..."
+/// ```
+///
+/// We require: `<`, ≥1 ident char (tool name), then a NEWLINE (the name and
+/// its first attribute are on separate lines — this is what distinguishes the
+/// tool-call form from HTML tags like `<br>` or `<div class=...>`, where the
+/// name is followed by whitespace then an attribute on the SAME line, and
+/// from comparison operators like `a < b`). The first attribute line must be a
+/// `key:` (colon) pair to confirm it is the angle grammar, not a stray `<`.
+fn validate_angle_opener(buf: &str, pos: usize) -> bool {
+    let rest = match buf.get(pos + 1..) {
+        Some(r) => r,
+        None => return false,
+    };
+    let mut chars = rest.char_indices().peekable();
+    // Tool name: at least one identifier character.
+    let mut name_len = 0;
+    while let Some(&(_, c)) = chars.peek() {
+        if is_ident_char(c) {
+            name_len += 1;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if name_len == 0 {
+        return false;
+    }
+    // The name MUST be immediately followed by a newline (the angle form puts
+    // the first attribute on the next line). A same-line attribute means this
+    // is an HTML/XML tag, not a tool call — pass through as text.
+    match chars.peek() {
+        Some(&(_, '\n')) => {
+            chars.next();
+        }
+        Some(&(byte_idx, c)) if c == '\r' => {
+            // Allow CRLF line endings.
+            chars.next();
+            match chars.peek() {
+                Some(&(_, '\n')) => {
+                    chars.next();
+                }
+                _ => {
+                    // Lone CR not followed by LF — treat as not-an-opener.
+                    let _ = byte_idx;
+                    return false;
+                }
+            }
+        }
+        _ => return false,
+    }
+    // Skip blank lines / leading whitespace on the first attribute line.
+    let mut saw_key = false;
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_whitespace() && c != '\n' && c != '\r' {
+            chars.next();
+        } else if c == '\n' || c == '\r' {
+            // Blank line right after the name — not the angle form.
+            return false;
+        } else {
+            break;
+        }
+    }
+    // First attribute key: at least one identifier char, then ':'.
+    while let Some(&(_, c)) = chars.peek() {
+        if is_ident_char(c) {
+            saw_key = true;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if !saw_key {
+        return false;
+    }
+    matches!(chars.peek(), Some(&(_, ':')))
+}
+
+/// Validate that `buf[pos..]` begins the HF tool-call wrapper opener
+/// (`TOOL_CALL_OPEN_TAG`). The real form GLM-5.2 emits is:
+///
+/// ```text
+/// <Agent
+/// description: "..."
+/// prompt: "..."
+/// ```
+///
+/// (opener tag, newline, tool name, newline, then `key: "value"` lines). We
+/// require: the literal opener tag, a newline, at least one ident char (tool
+/// name), a newline, and the first attribute line to start with an ident
+/// followed by `:`. This is strict enough to reject HTML tags and stray `<`
+/// while matching the wrapper. Returns false (not yet) on a partial prefix so
+/// the caller holds the bytes back for the next chunk.
+fn validate_toolcall_opener(buf: &str, pos: usize) -> bool {
+    let rest = match buf.get(pos..) {
+        Some(r) => r,
+        None => return false,
+    };
+    // Must start with the literal opener tag.
+    if !rest.starts_with(TOOL_CALL_OPEN_TAG) {
+        return false;
+    }
+    let after_tag = &rest[TOOL_CALL_OPEN_TAG.len()..];
+    let mut chars = after_tag.char_indices().peekable();
+    // Tool name: at least one identifier character, IMMEDIATELY after the
+    // opener tag (GLM emits `<tag>Agent\n…`, with no newline between the tag
+    // and the name).
+    let mut name_len = 0;
+    while let Some(&(_, c)) = chars.peek() {
+        if is_ident_char(c) {
+            name_len += 1;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if name_len == 0 {
+        return false;
+    }
+    // Newline after the tool name.
+    match chars.peek() {
+        Some(&(_, '\n')) => {
+            chars.next();
+        }
+        Some(&(_, '\r')) => {
+            chars.next();
+            match chars.peek() {
+                Some(&(_, '\n')) => {
+                    chars.next();
+                }
+                _ => return false,
+            }
+        }
+        _ => return false,
+    }
+    // Skip leading whitespace on the first attribute line (but not a blank line).
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_whitespace() && c != '\n' && c != '\r' {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    // First attribute key: at least one ident char, then ':'.
+    let mut saw_key = false;
+    while let Some(&(_, c)) = chars.peek() {
+        if is_ident_char(c) {
+            saw_key = true;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if !saw_key {
+        return false;
+    }
+    matches!(chars.peek(), Some(&(_, ':')))
 }
 
 /// Drain `buf` into `body`, tracking bracket depth and string literals, until
@@ -558,6 +818,450 @@ fn parse_tool_tag_body(body: &str) -> Option<ParsedToolCall> {
     Some(ParsedToolCall { name, arguments })
 }
 
+/// Drain `buf` into `body` for the ANGLE grammar (no closing tag). The body is
+/// a tool name on the first line followed by `key: "value"` lines. We consume
+/// until a terminator is reached:
+///   - a BLANK line (two consecutive newlines) — the angle tool block ends and
+///     prose may follow, OR
+///   - the start of the NEXT opener: a `<` followed by an ident char + newline
+///     pattern, or a `[` square opener (validated). When the next opener begins
+///     we stop WITHOUT consuming it, so the outer loop re-enters tag mode.
+///
+/// Because there is no closing bracket, we cannot track depth the way the
+/// square grammar does. Instead we scan line-by-line: a line that is a bare
+/// `key: "..."` or `key: value` belongs to the tag; a blank line terminates;
+/// the start of a new opener terminates. Quoted values may contain newlines, so
+/// we honor `in_string` while scanning.
+///
+/// On entry, the opening `<` and the tool-name line have NOT yet been consumed
+/// from `buf` (unlike the square path, which consumes the `[` first). We drain
+/// the opener + body together into `body` here. Returns `Closed` once a
+/// terminator is reached (terminator NOT consumed unless it's a blank line),
+/// or `Pending` when more input is needed.
+fn take_angle_tag_body(
+    buf: &mut String,
+    body: &mut String,
+    in_string: &mut bool,
+) -> TagBodyResult {
+    let bytes = buf.as_bytes();
+    let mut consumed = 0usize;
+    let mut i = 0usize;
+    let mut consecutive_newlines = 0u32;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Inside a quoted value: consume verbatim until the closing quote.
+        if *in_string {
+            body.push(c);
+            consumed = i + 1;
+            if c == '\\' && i + 1 < bytes.len() {
+                // Escaped char — consume together.
+                body.push(bytes[i + 1] as char);
+                consumed = i + 2;
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                *in_string = false;
+            }
+            consecutive_newlines = 0;
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                *in_string = true;
+                body.push('"');
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+            '\n' => {
+                // A blank line (two newlines with only whitespace between)
+                // terminates the angle tool block. Detect: if the PREVIOUS
+                // char pushed to body was also a newline (i.e. an empty line),
+                // stop here.
+                if consecutive_newlines >= 1 {
+                    // Blank line terminator. The newline at `i` is the second
+                    // of the pair; include it in body so the parser sees the
+                    // trailing blank, then stop. Consume through this newline.
+                    body.push('\n');
+                    consumed = i + 1;
+                    let _ = buf.drain(..consumed);
+                    return TagBodyResult::Closed;
+                }
+                body.push('\n');
+                consumed = i + 1;
+                consecutive_newlines += 1;
+                i += 1;
+            }
+            '<' => {
+                // Possible start of the NEXT angle opener. If it validates (or
+                // looks like `<Ident\n`), stop BEFORE it so the outer loop
+                // re-enters tag mode. Only do this once we already have a body
+                // (i.e. past the first opener's name line) — otherwise `<` is
+                // part of this tag's value.
+                if !body.is_empty() && validate_angle_opener(buf, i) {
+                    let _ = buf.drain(..consumed);
+                    return TagBodyResult::Closed;
+                }
+                body.push('<');
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+            '[' => {
+                // Possible start of a SQUARE opener interleaved after an angle
+                // tool. Stop before it so the outer loop handles it.
+                if !body.is_empty() && validate_opener(buf, i) {
+                    let _ = buf.drain(..consumed);
+                    return TagBodyResult::Closed;
+                }
+                body.push('[');
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+            _ => {
+                // Any non-newline, non-bracket char resets the blank-line
+                // counter and is appended.
+                body.push(c);
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+        }
+    }
+    // Reached end of buffer without a terminator. Drain what we consumed and
+    // wait for more input.
+    let _ = buf.drain(..consumed);
+    TagBodyResult::Pending
+}
+
+/// Parse the interior of an ANGLE-grammar tool call into a `ParsedToolCall`.
+/// The body looks like (the opening `<` is included so we can strip it):
+///
+/// ```text
+/// <Agent
+/// description: "Check which ericli commits..."
+/// prompt: "..."
+/// tools: "Bash"
+/// ```
+///
+/// Attributes are `key: "value"` (colon separator, quoted values) or
+/// `key: value` (bare). The tool name is the identifier immediately after `<`,
+/// terminated by a newline. Returns `None` if the body has no name or no
+/// `key:` pair.
+fn parse_angle_tag_body(body: &str) -> Option<ParsedToolCall> {
+    // Strip the leading `<`.
+    let body = body.strip_prefix('<')?;
+    // Tool name: identifier up to the first newline (or end).
+    let mut name_end = 0;
+    for (i, c) in body.char_indices() {
+        if is_ident_char(c) {
+            name_end = i + c.len_utf8();
+        } else if c == '\n' || c == '\r' {
+            break;
+        } else {
+            // Non-ident, non-newline right after the name — not the angle form.
+            return None;
+        }
+    }
+    if name_end == 0 {
+        return None;
+    }
+    let name = body[..name_end].to_string();
+    let rest = &body[name_end..];
+
+    let mut arguments = serde_json::Map::new();
+    // Process line by line. Values may be quoted (and quoted values may span
+    // newlines), so we walk the whole `rest` with a small state machine rather
+    // than splitting on '\n' naively.
+    let mut lines = String::new();
+    let mut in_string = false;
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            lines.push(c);
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    lines.push(next);
+                    chars.next();
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                lines.push('"');
+            }
+            '\n' => {
+                // End of a logical line. Try to parse it as `key: value`.
+                if let Some((k, v)) = parse_angle_attr_line(&lines) {
+                    arguments.insert(k, Value::String(v));
+                }
+                lines.clear();
+            }
+            _ => {
+                lines.push(c);
+            }
+        }
+    }
+    // Trailing line without a newline.
+    if !lines.trim().is_empty() {
+        if let Some((k, v)) = parse_angle_attr_line(&lines) {
+            arguments.insert(k, Value::String(v));
+        }
+    }
+
+    if arguments.is_empty() {
+        return None;
+    }
+    Some(ParsedToolCall { name, arguments })
+}
+
+/// Parse a single `key: "value"` or `key: value` attribute line (the colon
+/// form used by the angle grammar). Returns `None` for lines that aren't an
+/// attribute (e.g. a stray blank or prose), so the caller can skip them.
+fn parse_angle_attr_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Key: leading identifier.
+    let key_end = trimmed
+        .find(|c: char| !is_ident_char(c))
+        .unwrap_or(trimmed.len());
+    if key_end == 0 {
+        return None;
+    }
+    let key = trimmed[..key_end].to_string();
+    let after_key = trimmed[key_end..].trim_start();
+    // Expect ':'.
+    let after_colon = after_key.strip_prefix(':')?;
+    let value_raw = after_colon.trim();
+    // Quoted value: strip surrounding quotes and unescape \" \\ \n \t.
+    let value = if value_raw.starts_with('"') && value_raw.ends_with('"') && value_raw.len() >= 2 {
+        let inner = &value_raw[1..value_raw.len() - 1];
+        unquote_angle_value(inner)
+    } else {
+        // Bare value (no quotes) — take as-is.
+        value_raw.to_string()
+    };
+    Some((key, value))
+}
+
+/// Unescape a quoted angle-grammar value: `\"` → `"`, `\\` → `\`, `\n` →
+/// newline, `\t` → tab. Other backslash sequences are preserved literally.
+fn unquote_angle_value(inner: &str) -> String {
+    let mut out = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Drain `buf` into `body` for the ToolCall (HF wrapper) grammar. The opener
+/// tag has already been matched but NOT consumed (it stays at the front of
+/// `buf`); we drain the opener + tool name + attribute lines into `body`.
+///
+/// Terminators (return `Closed`):
+///   - the close tag `TOOL_CALL_CLOSE_TAG` (consumed through it), OR
+///   - a BLANK line (two consecutive newlines) — consumed through the second
+///     newline, OR
+///   - the start of the NEXT opener (`<`-wrapper or `[`-square, validated) —
+///     NOT consumed, so the outer loop re-enters tag mode.
+///
+/// Quoted values may contain newlines, so we honor `in_string` while scanning.
+/// Returns `Pending` when more input is needed.
+fn take_toolcall_body(
+    buf: &mut String,
+    body: &mut String,
+    in_string: &mut bool,
+) -> TagBodyResult {
+    let bytes = buf.as_bytes();
+    let mut consumed = 0usize;
+    let mut i = 0usize;
+    let mut consecutive_newlines = 0u32;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Inside a quoted value: consume verbatim until the closing quote.
+        if *in_string {
+            body.push(c);
+            consumed = i + 1;
+            if c == '\\' && i + 1 < bytes.len() {
+                body.push(bytes[i + 1] as char);
+                consumed = i + 2;
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                *in_string = false;
+            }
+            consecutive_newlines = 0;
+            i += 1;
+            continue;
+        }
+        // Check for the close tag at this position (only meaningful once we
+        // have a body past the opener + name).
+        if !body.is_empty()
+            && buf[i..].starts_with(TOOL_CALL_CLOSE_TAG)
+        {
+            let end = i + TOOL_CALL_CLOSE_TAG.len();
+            body.push_str(TOOL_CALL_CLOSE_TAG);
+            consumed = end;
+            let _ = buf.drain(..consumed);
+            return TagBodyResult::Closed;
+        }
+        match c {
+            '"' => {
+                *in_string = true;
+                body.push('"');
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+            '\n' => {
+                if consecutive_newlines >= 1 {
+                    // Blank line terminator.
+                    body.push('\n');
+                    consumed = i + 1;
+                    let _ = buf.drain(..consumed);
+                    return TagBodyResult::Closed;
+                }
+                body.push('\n');
+                consumed = i + 1;
+                consecutive_newlines += 1;
+                i += 1;
+            }
+            '<' => {
+                // Possible start of the NEXT wrapper opener. Stop before it so
+                // the outer loop re-enters tag mode. (Only once we have a body
+                // past the opener itself.)
+                if !body.is_empty()
+                    && buf[i..].starts_with(TOOL_CALL_OPEN_TAG)
+                    && validate_toolcall_opener(buf, i)
+                {
+                    let _ = buf.drain(..consumed);
+                    return TagBodyResult::Closed;
+                }
+                body.push('<');
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+            '[' => {
+                if !body.is_empty() && validate_opener(buf, i) {
+                    let _ = buf.drain(..consumed);
+                    return TagBodyResult::Closed;
+                }
+                body.push('[');
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+            _ => {
+                body.push(c);
+                consumed = i + 1;
+                consecutive_newlines = 0;
+                i += 1;
+            }
+        }
+    }
+    let _ = buf.drain(..consumed);
+    TagBodyResult::Pending
+}
+
+/// Parse the body of a ToolCall (HF wrapper) grammar tag into a `ParsedToolCall`.
+/// The body looks like (opener tag included):
+///
+/// ```text
+/// <Agent
+/// description: "..."
+/// prompt: "..."
+/// ```
+///
+/// (possibly with a trailing close tag). Strip the opener, read the tool name
+/// from the first line, then parse each remaining line as a `key: "value"` (or
+/// `key: value`) attribute via `parse_angle_attr_line`. Returns `None` if the
+/// body has no name or no attribute.
+fn parse_toolcall_body(body: &str) -> Option<ParsedToolCall> {
+    // Strip the opener tag.
+    let body = body.strip_prefix(TOOL_CALL_OPEN_TAG)?;
+    // Strip a trailing close tag if present.
+    let body = body.strip_suffix(TOOL_CALL_CLOSE_TAG).unwrap_or(body);
+    // First line is the tool name.
+    let nl = body.find('\n')?;
+    let name = body[..nl].trim();
+    if name.is_empty() || !name.chars().next().map_or(false, is_ident_char) {
+        return None;
+    }
+    let name = name.to_string();
+    let rest = &body[nl + 1..];
+
+    let mut arguments = serde_json::Map::new();
+    // Walk line by line, honoring quoted strings (values may span newlines).
+    let mut lines = String::new();
+    let mut in_string = false;
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            lines.push(c);
+            if c == '\\' {
+                if let Some(&next) = chars.peek() {
+                    lines.push(next);
+                    chars.next();
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                lines.push('"');
+            }
+            '\n' => {
+                if let Some((k, v)) = parse_angle_attr_line(&lines) {
+                    arguments.insert(k, Value::String(v));
+                }
+                lines.clear();
+            }
+            _ => {
+                lines.push(c);
+            }
+        }
+    }
+    if !lines.trim().is_empty() {
+        if let Some((k, v)) = parse_angle_attr_line(&lines) {
+            arguments.insert(k, Value::String(v));
+        }
+    }
+
+    if arguments.is_empty() {
+        return None;
+    }
+    Some(ParsedToolCall { name, arguments })
+}
+
 impl AnthropicStreamTranslator {
     pub fn new(model: &str) -> Self {
         Self {
@@ -580,6 +1284,7 @@ impl AnthropicStreamTranslator {
             tool_tag_depth: 0,
             in_tool_tag_string: false,
             inline_tool_emitted: false,
+            tool_tag_kind: ToolTagKind::default(),
         }
     }
 
@@ -850,7 +1555,21 @@ impl AnthropicStreamTranslator {
             self.current_block_index += 1;
         }
         // Emit message_delta now — all usage chunks have been processed.
-        let sr = if self.stop_reason.is_empty() { "end_turn" } else { self.stop_reason.as_str() };
+        // flush_text_buffer() above may have emitted an inline tool call (e.g.
+        // an angle-grammar tag with no terminator that only resolved at stream
+        // end) and set inline_tool_emitted AFTER stop_reason was locked in when
+        // finish_reason arrived. Re-evaluate: if an inline tool was emitted but
+        // stop_reason defaulted to end_turn, override to tool_use so the client
+        // executes the tool.
+        let sr = if self.inline_tool_emitted
+            && (self.stop_reason.is_empty() || self.stop_reason == "end_turn")
+        {
+            "tool_use"
+        } else if self.stop_reason.is_empty() {
+            "end_turn"
+        } else {
+            self.stop_reason.as_str()
+        };
         events.push(self.message_delta_event(sr));
         events.push(self.message_stop_event());
         events
@@ -889,10 +1608,9 @@ impl AnthropicStreamTranslator {
 
         loop {
             if !self.in_tool_tag {
-                // Looking for the start of a tool-call tag: `[` followed by an
-                // ASCII-identifier tool name.
+                // Looking for the start of a tool-call tag: either grammar.
                 match find_tool_tag_open(&self.text_buffer) {
-                    ToolTagMatch::Full(start) => {
+                    ToolTagMatch::Full(start, kind) => {
                         // Emit any plain text before the tag as text_delta.
                         if start > 0 {
                             let before: String = self.text_buffer.drain(..start).collect();
@@ -900,9 +1618,27 @@ impl AnthropicStreamTranslator {
                                 out.push(self.text_delta_event(self.current_block_index, &before));
                             }
                         }
-                        // Consume the `[` and enter tag mode.
-                        self.text_buffer.drain(..1);
+                        // Enter tag mode. For the SQUARE grammar the opening `[`
+                        // is consumed now (take_tool_tag_body expects the body
+                        // without it). For the ANGLE grammar the opening `<` is
+                        // LEFT in the buffer — take_angle_tag_body drains the
+                        // opener + body together, and parse_angle_tag_body
+                        // strips the leading `<`.
+                        match kind {
+                            ToolTagKind::Square => {
+                                self.text_buffer.drain(..1);
+                            }
+                            ToolTagKind::Angle => {
+                                // `<` stays in text_buffer; take_angle_tag_body
+                                // consumes it into `tool_tag_body`.
+                            }
+                            ToolTagKind::ToolCall => {
+                                // The wrapper opener tag stays in text_buffer;
+                                // take_toolcall_body drains it into `tool_tag_body`.
+                            }
+                        }
                         self.in_tool_tag = true;
+                        self.tool_tag_kind = kind;
                         self.tool_tag_body.clear();
                         self.tool_tag_depth = 0;
                         self.in_tool_tag_string = false;
@@ -910,7 +1646,8 @@ impl AnthropicStreamTranslator {
                     }
                     ToolTagMatch::Partial(hold) => {
                         // The buffer ends with a possible partial tag opening
-                        // (e.g. `[Ba`). Emit everything before it, hold the rest.
+                        // (e.g. `[Ba` or `<Ag`). Emit everything before it, hold
+                        // the rest for the next chunk.
                         let emit_len = self.text_buffer.len().saturating_sub(hold);
                         if emit_len > 0 {
                             let to_emit: String = self.text_buffer.drain(..emit_len).collect();
@@ -922,8 +1659,9 @@ impl AnthropicStreamTranslator {
                     }
                     ToolTagMatch::None => {
                         // No tag opening possible. Emit all but a suffix that
-                        // could be the start of `[` (a lone trailing `[`).
-                        let hold = if self.text_buffer.ends_with('[') { 1 } else { 0 };
+                        // could be the start of an opener (a lone trailing `[`
+                        // or `<` followed by an ident char).
+                        let hold = opener_hold_suffix(&self.text_buffer);
                         let emit_len = self.text_buffer.len().saturating_sub(hold);
                         if emit_len > 0 {
                             let to_emit: String = self.text_buffer.drain(..emit_len).collect();
@@ -936,30 +1674,89 @@ impl AnthropicStreamTranslator {
                 }
             }
 
-            // Inside a tool-call tag: accumulate the body until the matching
-            // `]` at bracket depth 0, tracking string literals so brackets and
-            // quotes inside a value don't affect depth or close the tag.
-            match take_tool_tag_body(&mut self.text_buffer, &mut self.tool_tag_body,
-                                     &mut self.tool_tag_depth, &mut self.in_tool_tag_string) {
-                TagBodyResult::Closed => {
-                    // The closing `]` was consumed. Parse the body and emit a
-                    // tool_use block, then return to plain-text scanning.
-                    if let Some(tc) = parse_tool_tag_body(&self.tool_tag_body) {
-                        out.extend(self.emit_inline_tool_use(&tc));
-                    } else {
-                        // Not actually a parseable tool call (e.g. matched the
-                        // conservative opener but body was malformed). Emit the
-                        // original `[…]` text verbatim so nothing is lost.
-                        let raw = format!("[{}]", self.tool_tag_body);
-                        out.push(self.text_delta_event(self.current_block_index, &raw));
+            // Inside a tool-call tag: drain the body. Dispatch on the grammar
+            // detected at opener time.
+            match self.tool_tag_kind {
+                ToolTagKind::Square => {
+                    // SQUARE grammar: body is `Name key="value" ...`; closing
+                    // `]` at bracket depth 0 ends it. The opening `[` was
+                    // already consumed; body accumulates the interior.
+                    match take_tool_tag_body(&mut self.text_buffer, &mut self.tool_tag_body,
+                                             &mut self.tool_tag_depth, &mut self.in_tool_tag_string) {
+                        TagBodyResult::Closed => {
+                            if let Some(tc) = parse_tool_tag_body(&self.tool_tag_body) {
+                                out.extend(self.emit_inline_tool_use(&tc));
+                            } else {
+                                // Not actually a parseable tool call (e.g. matched the
+                                // conservative opener but body was malformed). Emit the
+                                // original `[…]` text verbatim so nothing is lost.
+                                let raw = format!("[{}]", self.tool_tag_body);
+                                out.push(self.text_delta_event(self.current_block_index, &raw));
+                            }
+                            self.in_tool_tag = false;
+                            self.tool_tag_body.clear();
+                            continue;
+                        }
+                        TagBodyResult::Pending => {
+                            // Need more chunks to reach the closing `]`.
+                            return out;
+                        }
                     }
-                    self.in_tool_tag = false;
-                    self.tool_tag_body.clear();
-                    continue;
                 }
-                TagBodyResult::Pending => {
-                    // Need more chunks to reach the closing `]`.
-                    return out;
+                ToolTagKind::Angle => {
+                    // ANGLE grammar: body is `<Name\nkey: "value"\n…`; there is
+                    // NO closing bracket. take_angle_tag_body drains the opener
+                    // + body together into `tool_tag_body` and returns Closed at
+                    // a terminator (blank line / next opener / stream end
+                    // handled by flush).
+                    match take_angle_tag_body(&mut self.text_buffer, &mut self.tool_tag_body,
+                                             &mut self.in_tool_tag_string) {
+                        TagBodyResult::Closed => {
+                            if let Some(tc) = parse_angle_tag_body(&self.tool_tag_body) {
+                                out.extend(self.emit_inline_tool_use(&tc));
+                            } else {
+                                // Matched the conservative opener but body was
+                                // malformed. Emit the accumulated text verbatim
+                                // (it already includes the `<`).
+                                let raw = self.tool_tag_body.clone();
+                                out.push(self.text_delta_event(self.current_block_index, &raw));
+                            }
+                            self.in_tool_tag = false;
+                            self.tool_tag_body.clear();
+                            continue;
+                        }
+                        TagBodyResult::Pending => {
+                            // Need more chunks to reach a terminator.
+                            return out;
+                        }
+                    }
+                }
+                ToolTagKind::ToolCall => {
+                    // TOOLCALL (HF wrapper) grammar: body is the opener tag +
+                    // newline + tool name + `key: "value"` lines. May be closed
+                    // by the close tag, a blank line, the next opener, or
+                    // stream end (handled by flush).
+                    match take_toolcall_body(&mut self.text_buffer, &mut self.tool_tag_body,
+                                             &mut self.in_tool_tag_string) {
+                        TagBodyResult::Closed => {
+                            if let Some(tc) = parse_toolcall_body(&self.tool_tag_body) {
+                                out.extend(self.emit_inline_tool_use(&tc));
+                            } else {
+                                // Matched the opener but body was malformed.
+                                // Emit the accumulated text verbatim (it already
+                                // includes the opener tag).
+                                let raw = self.tool_tag_body.clone();
+                                out.push(self.text_delta_event(self.current_block_index, &raw));
+                            }
+                            self.in_tool_tag = false;
+                            self.tool_tag_body.clear();
+                            continue;
+                        }
+                        TagBodyResult::Pending => {
+                            // Need more chunks to reach a terminator.
+                            return out;
+                        }
+                    }
                 }
             }
         }
@@ -1022,23 +1819,76 @@ impl AnthropicStreamTranslator {
     fn flush_text_buffer(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         if self.in_tool_tag {
-            // Reconstruct the verbatim `[body…` text. The opening `[` was
-            // consumed on entry to tag mode, so prepend it.
-            let mut raw = String::from("[");
-            raw.push_str(&self.tool_tag_body);
-            raw.push_str(&self.text_buffer);
-            self.text_buffer.clear();
-            self.tool_tag_body.clear();
-            self.in_tool_tag = false;
-            self.tool_tag_depth = 0;
-            self.in_tool_tag_string = false;
-            if !raw.is_empty() {
-                if !self.text_block_open {
-                    out.push(self.text_block_start_event(self.current_block_index));
-                    self.text_block_open = true;
-                    self.text_ever_emitted = true;
+            match self.tool_tag_kind {
+                ToolTagKind::Square => {
+                    // Reconstruct the verbatim `[body…` text. The opening `[` was
+                    // consumed on entry to tag mode, so prepend it.
+                    let mut raw = String::from("[");
+                    raw.push_str(&self.tool_tag_body);
+                    raw.push_str(&self.text_buffer);
+                    self.text_buffer.clear();
+                    self.tool_tag_body.clear();
+                    self.in_tool_tag = false;
+                    self.tool_tag_depth = 0;
+                    self.in_tool_tag_string = false;
+                    if !raw.is_empty() {
+                        if !self.text_block_open {
+                            out.push(self.text_block_start_event(self.current_block_index));
+                            self.text_block_open = true;
+                            self.text_ever_emitted = true;
+                        }
+                        out.push(self.text_delta_event(self.current_block_index, &raw));
+                    }
                 }
-                out.push(self.text_delta_event(self.current_block_index, &raw));
+                ToolTagKind::Angle => {
+                    // The angle form has NO closing tag, so reaching stream end
+                    // inside an angle tag is NORMAL — GLM emits `<Name\nkey:
+                    // "value"\n…` and stops. Combine the drained body with any
+                    // remaining buffer and try to parse it as a tool call. The
+                    // opener `<` was left in the buffer and drained into
+                    // `tool_tag_body` by take_angle_tag_body, so the body
+                    // already starts with `<`.
+                    let mut body = std::mem::take(&mut self.tool_tag_body);
+                    body.push_str(&self.text_buffer);
+                    self.text_buffer.clear();
+                    self.in_tool_tag = false;
+                    self.in_tool_tag_string = false;
+                    if let Some(tc) = parse_angle_tag_body(&body) {
+                        out.extend(self.emit_inline_tool_use(&tc));
+                    } else if !body.is_empty() {
+                        // Not parseable as a tool call — emit verbatim so
+                        // nothing is silently dropped.
+                        if !self.text_block_open {
+                            out.push(self.text_block_start_event(self.current_block_index));
+                            self.text_block_open = true;
+                            self.text_ever_emitted = true;
+                        }
+                        out.push(self.text_delta_event(self.current_block_index, &body));
+                    }
+                }
+                ToolTagKind::ToolCall => {
+                    // The HF wrapper form is frequently unclosed (GLM emits the
+                    // opener + attrs and stops), so reaching stream end inside a
+                    // ToolCall tag is NORMAL. Combine the drained body with any
+                    // remaining buffer and try to parse it. The opener tag was
+                    // drained into `tool_tag_body` by take_toolcall_body, so the
+                    // body already starts with the opener.
+                    let mut body = std::mem::take(&mut self.tool_tag_body);
+                    body.push_str(&self.text_buffer);
+                    self.text_buffer.clear();
+                    self.in_tool_tag = false;
+                    self.in_tool_tag_string = false;
+                    if let Some(tc) = parse_toolcall_body(&body) {
+                        out.extend(self.emit_inline_tool_use(&tc));
+                    } else if !body.is_empty() {
+                        if !self.text_block_open {
+                            out.push(self.text_block_start_event(self.current_block_index));
+                            self.text_block_open = true;
+                            self.text_ever_emitted = true;
+                        }
+                        out.push(self.text_delta_event(self.current_block_index, &body));
+                    }
+                }
             }
         } else if !self.text_buffer.is_empty() {
             let raw = std::mem::take(&mut self.text_buffer);
@@ -1592,5 +2442,454 @@ mod tests {
             })
             .collect();
         assert!(text.contains("[Bash"), "unclosed tag text should pass through, got: {text}");
+    }
+
+    // ── Angle-bracket-colon grammar tests ────────────────────────────────
+    //
+    // GLM-5.2 also emits tool calls in the ANGLE form, e.g.:
+    //
+    //     <Agent
+    //     description: "Check which ericli commits..."
+    //     prompt: "..."
+    //     tools: "Bash"
+    //
+    // (angle bracket + colon separator, quoted values, NO closing tag). These
+    // tests mirror the square-bracket suite for the angle grammar and cover the
+    // behaviors unique to it: no closing bracket, stream-end flush, blank-line
+    // terminator, next-opener terminator, and HTML-tag pass-through.
+
+    /// A complete angle-grammar tool call (terminated by a blank line) emitted
+    /// as a single content delta should convert to a tool_use block.
+    #[test]
+    fn test_angle_tool_call_single_chunk() {
+        // Use a literal newline in the JSON content via \n. The blank line
+        // (two newlines) after the last attribute terminates the tag.
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1, "expected one tool_use block, got events: {:?}", events);
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
+        // The tool_use block is at index 1 (after the text block opened for
+        // preceding/following prose). Find its input_json_delta.
+        let json = input_json_for(&events, 1).expect("should have input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["description"], "Check commits");
+        assert_eq!(parsed["prompt"], "find recent ericli commits");
+        assert_eq!(parsed["tools"], "Bash");
+
+        // stop_reason must be tool_use even though finish_reason was "stop".
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(stop_reason, Some("tool_use"));
+    }
+
+    /// An angle tool call split across many SSE chunks must still be
+    /// reassembled — including splits inside the quoted value and across the
+    /// terminating blank line.
+    #[test]
+    fn test_angle_tool_call_split_across_chunks() {
+        let full = "<Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\"\ntools: \"Bash\"\n\n";
+        let slices: &[&str] = &[
+            "<Agent\ndescrip",
+            "tion: \"Check commits\"\nprom",
+            "pt: \"find recent ericli com",
+            "mits\"\ntools: \"Bash\"\n",
+            "\n",
+        ];
+        assert_eq!(slices.concat(), full);
+        let mut lines: Vec<String> = Vec::new();
+        for slice in slices {
+            let content_json = serde_json::to_string(slice).unwrap();
+            lines.push(format!(
+                r#"data: {{"id":"1","model":"test","choices":[{{"index":0,"delta":{{"content":{}}}}}]}}"#,
+                content_json
+            ));
+        }
+        lines.push(r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_string());
+        lines.push(r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#.to_string());
+        lines.push("data: [DONE]".to_string());
+        let lines_ref: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+
+        let events = run_stream(&lines_ref);
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1, "split angle tag should yield one tool_use");
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
+        let json = input_json_for(&events, 1).expect("should have input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["description"], "Check commits");
+        assert_eq!(parsed["prompt"], "find recent ericli commits");
+        assert_eq!(parsed["tools"], "Bash");
+    }
+
+    /// The angle form has NO closing tag, so a tag that runs to stream end
+    /// (the model stops after the last attribute) must be flushed and parsed at
+    /// finish() — NOT dropped or emitted as verbatim text. This is the
+    /// realistic case for the end_turn-prematurely bug.
+    #[test]
+    fn test_angle_tool_call_no_terminator_at_stream_end() {
+        // No trailing blank line — the stream just ends after the last attr.
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\""},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "angle tag at stream end should flush as a tool_use, got events: {:?}",
+            events
+        );
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
+        let json = input_json_for(&events, 1).expect("should have input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["description"], "Check commits");
+        assert_eq!(parsed["prompt"], "find recent ericli commits");
+
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(stop_reason, Some("tool_use"));
+    }
+
+    /// Prose before an angle tool call should pass through as text, and the tag
+    /// should NOT leak into the text stream.
+    #[test]
+    fn test_angle_tool_call_with_preceding_text() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"I'll investigate that now.\n<Agent\ndescription: \"Check commits\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1);
+        let text: String = events
+            .iter()
+            .filter_map(|ev| {
+                let v = parse_event(ev)?;
+                if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta")
+                    && v.get("index").and_then(|i| i.as_i64()) == Some(0)
+                {
+                    v.get("delta")?.get("text")?.as_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(text.contains("I'll investigate that now."), "preceding text should pass through, got: {text}");
+        assert!(!text.contains("<Agent"), "angle tag should NOT leak into text, got: {text}");
+    }
+
+    /// Two consecutive angle tool calls (each terminated by a blank line) in
+    /// one content delta should each become a tool_use block.
+    #[test]
+    fn test_angle_tool_call_multiple() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"first\"\ntools: \"Bash\"\n\n<Agent\ndescription: \"second\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 2, "expected two tool_use blocks");
+        assert_eq!(tool_uses[0].get("name").and_then(|n| n.as_str()), Some("Agent"));
+        assert_eq!(tool_uses[1].get("name").and_then(|n| n.as_str()), Some("Agent"));
+        let j1 = input_json_for(&events, 1).expect("first tool input");
+        let p1: Value = serde_json::from_str(&j1).unwrap();
+        assert_eq!(p1["description"], "first");
+        // Second tool_use block: index advances past the first's text reopen.
+        // Find whichever input_json_delta decodes to description=second.
+        let mut found_second = false;
+        for idx in 2..6 {
+            if let Some(j) = input_json_for(&events, idx) {
+                if let Ok(p) = serde_json::from_str::<Value>(&j) {
+                    if p.get("description").and_then(|d| d.as_str()) == Some("second") {
+                        found_second = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(found_second, "second angle tool call should have its input_json");
+    }
+
+    /// An angle tool call whose value spans multiple lines (newlines inside the
+    /// quoted string) must parse with the embedded newlines preserved.
+    #[test]
+    fn test_angle_tool_call_multiline_value() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"git status\ngit log -1\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1);
+        let json = input_json_for(&events, 1).expect("should have input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["prompt"], "git status\ngit log -1");
+        assert_eq!(parsed["description"], "Check commits");
+    }
+
+    /// A `<` that begins an HTML/XML-style tag (name followed by whitespace
+    /// and an attribute on the SAME line, or `</close>`, or a comparison like
+    /// `a < b`) must NOT be treated as an angle tool call — it should pass
+    /// through as text. The angle grammar requires the name to be followed by
+    /// a newline and a `key:` line.
+    #[test]
+    fn test_html_tag_passes_through_as_text() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"See <div class=\"x\"> and a < b and <br/> here"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 0, "HTML/comparison < must not become a tool_use");
+        let text: String = events
+            .iter()
+            .filter_map(|ev| {
+                let v = parse_event(ev)?;
+                if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+                    v.get("delta")?.get("text")?.as_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(text.contains("<div"), "HTML tag should pass through, got: {text}");
+        assert!(text.contains("a < b"), "comparison should pass through, got: {text}");
+        assert!(text.contains("<br/>"), "self-closing tag should pass through, got: {text}");
+    }
+
+    /// A lone `<` or a `<Word` prefix at stream end (no newline + key: yet)
+    /// must be held back, not emitted prematurely — and when the stream ends
+    /// without completing an opener, it flushes as text.
+    #[test]
+    fn test_angle_partial_opener_flushed_as_text() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"result is <Ag"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 0, "incomplete opener must not yield a tool_use");
+        let text: String = events
+            .iter()
+            .filter_map(|ev| {
+                let v = parse_event(ev)?;
+                if v.get("type").and_then(|t| t.as_str()) == Some("content_block_delta") {
+                    v.get("delta")?.get("text")?.as_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(text.contains("<Ag"), "partial opener should flush as text, got: {text}");
+    }
+
+    /// A square-bracket tool call followed by an angle tool call (both grammars
+    /// in one stream) must each be parsed by the correct grammar.
+    #[test]
+    fn test_mixed_square_and_angle_tool_calls() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"[Bash command=\"git status\" description=\"Status\"]\n<Agent\ndescription: \"follow-up\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 2, "expected one square + one angle tool_use");
+        assert_eq!(tool_uses[0].get("name").and_then(|n| n.as_str()), Some("Bash"));
+        assert_eq!(tool_uses[1].get("name").and_then(|n| n.as_str()), Some("Agent"));
+    }
+
+    // ── HF tool-call-wrapper grammar (the REAL GLM-5.2 leak) ─────────────
+    //
+    // GLM-5.2 emits tool calls in the HuggingFace/Qwen chat-template wrapper:
+    // the literal opener tag (angle-bracket `tool_call` token), a newline, the
+    // tool name, then `key: "value"` lines. Frequently UNCLOSED (the model
+    // stops after the last attribute). This is the form that caused the
+    // "after compaction I said something, it didn't call tools and reached
+    // end_turn prematurely" bug in claude-code-acp. These tests use the EXACT
+    // bytes captured from a live transcript (60867dfe…) to verify the parser
+    // converts them to tool_use + stop_reason=tool_use.
+
+    /// Build the opener tag without a literal angle-bracket-tool token in the
+    /// source (keeps editors/tooling from mis-parsing the test file).
+    fn tc_open() -> String {
+        format!("{}tool_call{}", "\x3c", "\x3e")
+    }
+    fn tc_close() -> String {
+        format!("{}/tool_call{}", "\x3c", "\x3e")
+    }
+
+    /// The exact leaked content from transcript 60867dfe line 3959 (an
+    /// UNCLOSED wrapper tool call) should convert to a tool_use block, not leak
+    /// as text + end_turn.
+    #[test]
+    fn test_real_leak_unclosed_wrapper() {
+        let open = tc_open();
+        // Reconstructed from the transcript: prose, then the wrapper opener,
+        // tool name "Agent", then colon attributes, NO close tag, NO blank line.
+        let content = format!(
+            "I'll launch two parallel investigations: (1) check which ericli commits touch the ACP path, and (2) trace the context-usage growth + post-compaction 50% residual.{}Agent\ndescription: \"Check which ericli commits touch ACP path vs run path\"\nprompt: \"Check these 7 ericli commits in /workspace/git/ezennin/ericli and tell me which touch the ACP server path (src/acp/acp-server.ts) vs the ericli run CI path (src/cli-run/*). Commits: 0cf8310, 51ee75b, 37e4da8.\"\ntools: \"Bash\"\nagent: \"Explore\"\ntool_input: \"Explore\"",
+            open
+        );
+        let content_json = serde_json::to_string(&content).unwrap();
+        let line1 = format!(
+            r#"data: {{"id":"1","model":"test","choices":[{{"index":0,"delta":{{"content":{}}}}}]}}"#,
+            content_json
+        );
+        let events = run_stream(&[
+            line1.as_str(),
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "real unclosed wrapper leak should yield one tool_use, got events: {:?}",
+            events
+        );
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
+        // Find the input_json_delta for the tool_use block.
+        let mut json = None;
+        for idx in 0..6 {
+            if let Some(j) = input_json_for(&events, idx) {
+                if serde_json::from_str::<Value>(&j)
+                    .ok()
+                    .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()))
+                    == Some("Check which ericli commits touch ACP path vs run path".to_string())
+                {
+                    json = Some(j);
+                    break;
+                }
+            }
+        }
+        let json = json.expect("should find the tool_use input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["tools"], "Bash");
+        assert_eq!(parsed["agent"], "Explore");
+        assert_eq!(parsed["tool_input"], "Explore");
+
+        // stop_reason MUST be tool_use (this was the bug: it was end_turn).
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(stop_reason, Some("tool_use"), "unclosed wrapper leak must force stop_reason=tool_use");
+    }
+
+    /// The exact leaked content from transcript 60867dfe line 3970 — a CLOSED
+    /// wrapper tool call (with the close tag) for a Bash command.
+    #[test]
+    fn test_real_leak_closed_wrapper() {
+        let open = tc_open();
+        let close = tc_close();
+        let content = format!(
+            "{}Bash\ncommand: \"git show --stat 0cf8310 | head -20\"\ndescription: \"Show files changed in commit\"{}",
+            open, close
+        );
+        let content_json = serde_json::to_string(&content).unwrap();
+        let line1 = format!(
+            r#"data: {{"id":"1","model":"test","choices":[{{"index":0,"delta":{{"content":{}}}}}]}}"#,
+            content_json
+        );
+        let events = run_stream(&[
+            line1.as_str(),
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+            "data: [DONE]",
+        ]);
+
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1, "closed wrapper leak should yield one tool_use");
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Bash")
+        );
+        let json = input_json_for(&events, 1).expect("should have input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["command"], "git show --stat 0cf8310 | head -20");
+        assert_eq!(parsed["description"], "Show files changed in commit");
+
+        let delta = find_message_delta(&events).expect("should have message_delta");
+        let stop_reason = delta
+            .get("delta")
+            .and_then(|d| d.get("stop_reason"))
+            .and_then(|s| s.as_str());
+        assert_eq!(stop_reason, Some("tool_use"));
+    }
+
+    /// A wrapper tool call split across many SSE chunks (including a split
+    /// right after the opener tag, before the tool name) must reassemble.
+    #[test]
+    fn test_wrapper_tool_call_split_across_chunks() {
+        let open = tc_open();
+        let full = format!(
+            "{}Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\"\ntools: \"Bash\"\n\n",
+            open
+        );
+        // Split awkwardly: opener tag alone, then name+attrs in pieces.
+        let open_len = open.len();
+        let slices: Vec<String> = vec![
+            full[..open_len].to_string(),               // just the opener tag
+            full[open_len..open_len + 7].to_string(),   // "Agent\n"
+            full[open_len + 7..].to_string(),           // rest
+        ];
+        assert_eq!(slices.concat(), full);
+        let mut lines: Vec<String> = Vec::new();
+        for slice in &slices {
+            let content_json = serde_json::to_string(slice).unwrap();
+            lines.push(format!(
+                r#"data: {{"id":"1","model":"test","choices":[{{"index":0,"delta":{{"content":{}}}}}]}}"#,
+                content_json
+            ));
+        }
+        lines.push(r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#.to_string());
+        lines.push(r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#.to_string());
+        lines.push("data: [DONE]".to_string());
+        let lines_ref: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+
+        let events = run_stream(&lines_ref);
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1, "split wrapper tag should yield one tool_use");
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
+        let json = input_json_for(&events, 1).expect("should have input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
+        assert_eq!(parsed["description"], "Check commits");
+        assert_eq!(parsed["tools"], "Bash");
     }
 }
