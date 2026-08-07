@@ -1,3 +1,4 @@
+use crate::logger;
 use serde_json::{json, Value};
 
 // ─── Anthropic Messages API → OpenAI Chat Completions ──────────────────────
@@ -55,7 +56,32 @@ pub fn anthropic_to_chat_completions(model: &str, body: &Value, stream: bool) ->
 
     // Convert tools
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let openai_tools: Vec<Value> = tools.iter().filter_map(convert_anthropic_tool).collect();
+        let add_placeholder = needs_noargs_placeholder(model);
+        let openai_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| convert_anthropic_tool(t, add_placeholder))
+            .collect();
+        if add_placeholder {
+            let patched: Vec<&str> = openai_tools
+                .iter()
+                .filter(|t| {
+                    t["function"]["parameters"]["properties"]
+                        .get(NOARGS_PLACEHOLDER)
+                        .is_some()
+                })
+                .filter_map(|t| t["function"]["name"].as_str())
+                .collect();
+            if !patched.is_empty() {
+                logger::debug(
+                    "translate_anthropic",
+                    &format!(
+                        "[noargs] injected {} into: [{}]",
+                        NOARGS_PLACEHOLDER,
+                        patched.join(",")
+                    ),
+                );
+            }
+        }
         if !openai_tools.is_empty() {
             out["tools"] = json!(openai_tools);
         }
@@ -181,11 +207,84 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
     }
 }
 
+/// Property name injected into zero-parameter tool schemas as a workaround for
+/// the backend's streaming tool-call parser.
+///
+/// GLM-5.2-FP8 on the vLLM engine silently DROPS any tool call whose arguments
+/// object is empty when `stream: true`: the turn comes back as
+/// `finish_reason: "stop"` with no `tool_calls` and only the model's preamble
+/// text ("Now let me list them."), so the client sees a turn that ended without
+/// doing anything. The same request with `stream: false` returns the tool call
+/// correctly, and giving the tool a single parameter also fixes it — verified
+/// against the backend directly, bypassing this proxy.
+///
+/// So for affected models we give argument-less tools one optional throwaway
+/// property. The model then emits `{"__noargs": ""}` instead of `{}`, the
+/// parser keeps the tool call, and `strip_placeholder_arg` removes the property
+/// again before the tool_use block reaches the client — which would otherwise
+/// reject it as not matching the tool's schema.
+const NOARGS_PLACEHOLDER: &str = "__noargs";
+
+/// True when `model` needs the zero-argument tool workaround. Scoped to GLM:
+/// DeepSeek-V4 streams empty-argument tool calls correctly (verified), and an
+/// unexpected property in the schema is not free — it costs tokens and can
+/// tempt a model into putting real content in it.
+fn needs_noargs_placeholder(model: &str) -> bool {
+    model.to_lowercase().contains("glm")
+}
+
+/// Remove the injected placeholder from a tool call's JSON arguments so the
+/// client sees the arguments its own schema declares. Returns the input
+/// unchanged when the placeholder is absent or the arguments aren't a JSON
+/// object, so a real tool call is never mangled.
+fn strip_placeholder_arg(arguments: &str) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    let Some(obj) = parsed.as_object_mut() else {
+        return arguments.to_string();
+    };
+    if obj.remove(NOARGS_PLACEHOLDER).is_none() {
+        return arguments.to_string();
+    }
+    serde_json::to_string(&parsed).unwrap_or_else(|_| arguments.to_string())
+}
+
 /// Convert an Anthropic tool definition to OpenAI function tool format.
-fn convert_anthropic_tool(tool: &Value) -> Option<Value> {
+///
+/// `add_noargs_placeholder` gives a tool that declares no properties one
+/// optional throwaway property — see [`NOARGS_PLACEHOLDER`].
+fn convert_anthropic_tool(tool: &Value, add_noargs_placeholder: bool) -> Option<Value> {
     let name = tool.get("name").and_then(|v| v.as_str())?;
     let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
-    let input_schema = tool.get("input_schema").cloned().unwrap_or(json!({}));
+    let mut input_schema = tool.get("input_schema").cloned().unwrap_or(json!({}));
+    if add_noargs_placeholder {
+        let has_properties = input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        if !has_properties {
+            // Build a fresh object schema rather than patching in place: an
+            // argument-less tool may declare `input_schema` as `{}`, as
+            // `{"type":"object"}`, or omit `properties` entirely.
+            input_schema = json!({
+                "type": "object",
+                "properties": {
+                    NOARGS_PLACEHOLDER: {
+                        "type": "string",
+                        "description": "Unused. Pass an empty string.",
+                    }
+                },
+                // Required, not optional. With an optional placeholder the model
+                // frequently still emits `{}` and the tool call is dropped again
+                // (measured 1/5 success optional vs 5/5 required). Requiring it
+                // guarantees non-empty arguments; strip_placeholder_arg removes
+                // it before the client ever sees it.
+                "required": [NOARGS_PLACEHOLDER],
+            });
+        }
+    }
     Some(json!({
         "type": "function",
         "function": {"name": name, "description": description, "parameters": input_schema}
@@ -218,6 +317,25 @@ pub struct AnthropicStreamTranslator {
     pending_tool_calls: Vec<PendingToolCall>,
     finished: bool,
     stop_reason: String,
+
+    // ── Turn diagnostics ───────────────────────────────────────────────────
+    // Total bytes of assistant text actually streamed to the client, plus a
+    // short preview of the head of that text. Used only by the turn-summary
+    // log line in finish(): when a client reports a silent/premature end_turn
+    // we need to know whether the upstream produced no text, a few junk
+    // tokens, or a tool call the client failed to act on.
+    text_chars: usize,
+    text_preview: String,
+    // Raw `delta.content` exactly as the upstream sent it, before the
+    // inline-tool-call scanner rewrites/withholds anything. Capped. When a turn
+    // ends with a short preamble and no tool call, this is the only way to tell
+    // "the model really stopped" apart from "the scanner ate a tool-call tag".
+    raw_content: String,
+    raw_chars: usize,
+    // True once a non-streaming re-run recovered a tool call the streaming
+    // response dropped. Reported in the turn summary so the workaround's hit
+    // rate is visible in the log.
+    recovered_non_streaming: bool,
 
     // ── Inline-text tool-call scanner ──────────────────────────────────────
     // GLM-5.x sometimes emits tool calls as inline markup in `delta.content`
@@ -1278,6 +1396,11 @@ impl AnthropicStreamTranslator {
             pending_tool_calls: Vec::new(),
             finished: false,
             stop_reason: String::new(),
+            text_chars: 0,
+            text_preview: String::new(),
+            raw_content: String::new(),
+            raw_chars: 0,
+            recovered_non_streaming: false,
             text_buffer: String::new(),
             in_tool_tag: false,
             tool_tag_body: String::new(),
@@ -1368,6 +1491,21 @@ impl AnthropicStreamTranslator {
                                 self.text_block_open = true;
                             }
                             self.text_ever_emitted = true;
+                            // Record the raw upstream text before the scanner
+                            // touches it (turn-summary diagnostic).
+                            self.raw_chars += content.len();
+                            const RAW_MAX: usize = 1200;
+                            if self.raw_content.len() < RAW_MAX {
+                                let room = RAW_MAX - self.raw_content.len();
+                                let take = content
+                                    .char_indices()
+                                    .map(|(i, _)| i)
+                                    .chain(std::iter::once(content.len()))
+                                    .take_while(|i| *i <= room)
+                                    .last()
+                                    .unwrap_or(0);
+                                self.raw_content.push_str(&content[..take]);
+                            }
                             events.extend(self.handle_text_content(content));
                         }
                     }
@@ -1416,7 +1554,10 @@ impl AnthropicStreamTranslator {
                             let block_index = self.current_block_index;
                             events.push(self.tool_use_block_start_event(block_index, &pending.id, &pending.name));
                             if !pending.arguments_buffer.is_empty() {
-                                events.push(self.tool_use_delta_event(block_index, &pending.arguments_buffer));
+                                // Drop the zero-argument workaround property so
+                                // the client's schema validation still passes.
+                                let args = strip_placeholder_arg(&pending.arguments_buffer);
+                                events.push(self.tool_use_delta_event(block_index, &args));
                             }
                             events.push(self.content_block_stop_event(block_index));
                             self.current_block_index += 1;
@@ -1450,8 +1591,88 @@ impl AnthropicStreamTranslator {
         events
     }
 
-    /// Close out the stream after an in-stream upstream error, without
-    /// synthesizing the empty-text fallback that `finish()` applies.
+    /// True when this turn looks like the backend silently swallowed a tool
+    /// call, so the caller should re-run the request non-streaming.
+    ///
+    /// GLM-5.2-FP8 on vLLM drops tool calls whose arguments object is empty
+    /// when `stream: true`: the turn arrives as `finish_reason: "stop"` with no
+    /// `tool_calls` and at most a short preamble ("Now let me list them."), and
+    /// sometimes with output tokens but *no* content at all (the parser ate the
+    /// tool-call markup without producing a tool call). The identical request
+    /// with `stream: false` returns the tool call every time, so a non-streaming
+    /// re-run recovers the turn. Verified against the backend with no proxy in
+    /// the path; `NOARGS_PLACEHOLDER` alone is not enough because the model
+    /// often still emits `{}` despite the schema.
+    ///
+    /// `max_text` bounds how much assistant text may already have been streamed.
+    /// A genuine final answer is long, so it stays well clear of the retry and
+    /// costs nothing; the stalled turns measured 0–110 characters.
+    pub fn should_retry_non_streaming(&self, max_text: usize) -> bool {
+        let has_tool_use = self.pending_tool_calls.iter().any(|t| !t.name.is_empty());
+        self.stop_reason == "end_turn" && !has_tool_use && self.text_chars <= max_text
+    }
+
+    /// Splice tool calls from a non-streaming response into this stream as
+    /// Anthropic `tool_use` blocks and flip the turn to `stop_reason: tool_use`.
+    ///
+    /// Returns the SSE events to forward. Must be called after the upstream
+    /// stream's `finish_reason` has been processed (so text/thinking blocks are
+    /// closed and `current_block_index` is correct) and before `finish()`.
+    /// Any text already streamed is kept — it is the model's own preamble for
+    /// the action, and the non-streaming re-run returns empty content.
+    pub fn inject_tool_calls_from_message(&mut self, message: &Value) -> Vec<String> {
+        let mut events = Vec::new();
+        let Some(tool_calls) = message.get("tool_calls").and_then(|c| c.as_array()) else {
+            return events;
+        };
+        for tc in tool_calls {
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+            let raw_args = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            let args = strip_placeholder_arg(raw_args);
+
+            let block_index = self.current_block_index;
+            events.push(self.tool_use_block_start_event(block_index, &id, name));
+            events.push(self.tool_use_delta_event(block_index, &args));
+            events.push(self.content_block_stop_event(block_index));
+            self.current_block_index += 1;
+
+            // Record it so finish() sees a tool_use (skipping the empty-text
+            // fallback) and reports it in the turn summary. `emitted` keeps the
+            // finish_reason handler from emitting the block a second time.
+            self.pending_tool_calls.push(PendingToolCall {
+                index: self.pending_tool_calls.len(),
+                id,
+                name: name.to_string(),
+                arguments_buffer: args,
+                emitted: true,
+            });
+        }
+        if !events.is_empty() {
+            // Force stop_reason=tool_use: the upstream said "stop", but the turn
+            // now carries a tool call the client must execute.
+            self.stop_reason = "tool_use".to_string();
+            self.recovered_non_streaming = true;
+        }
+        events
+    }
+
     ///
     /// The backend can reject a request with HTTP 200 plus an SSE error event
     /// (e.g. `{"message":"upstream error","code":503}` when
@@ -1533,7 +1754,9 @@ impl AnthropicStreamTranslator {
         // (Mirrors rewrite_reasoning_to_content() used by /v1/chat/completions.)
         if !self.text_ever_emitted && !self.reasoning_text.is_empty() {
             events.push(self.text_block_start_event(self.current_block_index));
-            events.push(self.text_delta_event(self.current_block_index, &self.reasoning_text));
+            let reasoning = std::mem::take(&mut self.reasoning_text);
+            events.push(self.text_delta_event(self.current_block_index, &reasoning));
+            self.reasoning_text = reasoning;
             events.push(self.content_block_stop_event(self.current_block_index));
             self.current_block_index += 1;
         }
@@ -1572,6 +1795,46 @@ impl AnthropicStreamTranslator {
         };
         events.push(self.message_delta_event(sr));
         events.push(self.message_stop_event());
+
+        // Turn summary — the single line that makes a "silent end_turn"
+        // diagnosable. A client reporting "the agent ended the turn with no
+        // response" maps to one of: text=0 tool_uses=0 (nothing came back),
+        // tiny text with stop=end_turn (the model genuinely stopped early), or
+        // tool_uses>0 with stop=end_turn (the client never ran the tool).
+        let tool_names: Vec<&str> = self
+            .pending_tool_calls
+            .iter()
+            .filter(|t| !t.name.is_empty())
+            .map(|t| t.name.as_str())
+            .collect();
+        logger::info(
+            "translate_anthropic",
+            &format!(
+                "[turn-summary] stop={}{} out_tokens={} in_tokens={} text_chars={} raw_chars={} reasoning_chars={} tool_uses={}{} preview={:?}{}",
+                sr,
+                if self.recovered_non_streaming { " (recovered non-streaming)" } else { "" },
+                self.output_tokens,
+                self.input_tokens,
+                self.text_chars,
+                self.raw_chars,
+                self.reasoning_text.len(),
+                tool_names.len(),
+                if tool_names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" tools=[{}]", tool_names.join(","))
+                },
+                self.text_preview,
+                // Only dump the raw upstream text when the scanner changed it.
+                // raw_chars != text_chars means markup was consumed (converted
+                // to a tool_use) or, in the bug case, silently dropped.
+                if self.raw_chars != self.text_chars {
+                    format!(" raw={:?}", self.raw_content)
+                } else {
+                    String::new()
+                },
+            ),
+        );
         events
     }
 
@@ -1925,7 +2188,21 @@ impl AnthropicStreamTranslator {
         format!("event: content_block_start\ndata: {}\n\n", event)
     }
 
-    fn text_delta_event(&self, index: i32, text: &str) -> String {
+    fn text_delta_event(&mut self, index: i32, text: &str) -> String {
+        // Record for the turn-summary diagnostic in finish().
+        self.text_chars += text.len();
+        const PREVIEW_MAX: usize = 200;
+        if self.text_preview.len() < PREVIEW_MAX {
+            let room = PREVIEW_MAX - self.text_preview.len();
+            let take = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(text.len()))
+                .take_while(|i| *i <= room)
+                .last()
+                .unwrap_or(0);
+            self.text_preview.push_str(&text[..take]);
+        }
         let event = json!({"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}});
         format!("event: content_block_delta\ndata: {}\n\n", event)
     }
@@ -1990,7 +2267,12 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
                         let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                         let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
                         let args_str = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}");
-                        let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                        let mut input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                        // Drop the zero-argument workaround property so the
+                        // client's schema validation still passes.
+                        if let Some(obj) = input.as_object_mut() {
+                            obj.remove(NOARGS_PLACEHOLDER);
+                        }
                         content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
                     }
                 }
@@ -2891,5 +3173,138 @@ mod tests {
         let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
         assert_eq!(parsed["description"], "Check commits");
         assert_eq!(parsed["tools"], "Bash");
+    }
+
+    // ── Zero-argument tool workaround (NOARGS_PLACEHOLDER) ─────────────────
+    //
+    // GLM-5.2-FP8 on vLLM drops any streamed tool call whose arguments object
+    // is empty: the turn returns finish_reason="stop" with no tool_calls and
+    // only the model's preamble, so the client sees a turn that did nothing.
+    // Reproduced against the backend directly (no proxy), and only for GLM —
+    // DeepSeek-V4 streams empty-argument tool calls fine.
+
+    /// A tool that declares no properties gets the placeholder for GLM, so the
+    /// model emits `{"__noargs": ""}` instead of the dropped `{}`.
+    #[test]
+    fn test_noargs_tool_gets_placeholder_for_glm() {
+        let body = json!({
+            "messages": [],
+            "tools": [{"name": "TaskList", "description": "List tasks", "input_schema": {"type": "object", "properties": {}, "required": []}}]
+        });
+        let out = anthropic_to_chat_completions("zai-org/GLM-5.2-FP8", &body, true);
+        let props = &out["tools"][0]["function"]["parameters"]["properties"];
+        assert!(
+            props.get(NOARGS_PLACEHOLDER).is_some(),
+            "GLM should get the zero-argument placeholder, got {}",
+            props
+        );
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["required"],
+            json!([NOARGS_PLACEHOLDER]),
+            "the placeholder must be required — an optional one is still emitted as {{}} most of the time"
+        );
+    }
+
+    /// An `input_schema` with no `properties` key at all is also argument-less.
+    #[test]
+    fn test_noargs_tool_without_properties_key_gets_placeholder() {
+        let body = json!({
+            "messages": [],
+            "tools": [{"name": "TaskList", "input_schema": {"type": "object"}}]
+        });
+        let out = anthropic_to_chat_completions("zai-org/GLM-5.2-FP8", &body, true);
+        assert!(out["tools"][0]["function"]["parameters"]["properties"]
+            .get(NOARGS_PLACEHOLDER)
+            .is_some());
+    }
+
+    /// A tool that already has parameters is left exactly as-is.
+    #[test]
+    fn test_tool_with_args_is_untouched() {
+        let body = json!({
+            "messages": [],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}]
+        });
+        let out = anthropic_to_chat_completions("zai-org/GLM-5.2-FP8", &body, true);
+        let params = &out["tools"][0]["function"]["parameters"];
+        assert!(params["properties"].get(NOARGS_PLACEHOLDER).is_none());
+        assert_eq!(params["required"], json!(["command"]));
+    }
+
+    /// Models that stream empty-argument tool calls correctly must not pay for
+    /// the workaround — an unexpected property costs tokens and can tempt the
+    /// model into putting real content in it.
+    #[test]
+    fn test_noargs_placeholder_not_added_for_non_glm() {
+        let body = json!({
+            "messages": [],
+            "tools": [{"name": "TaskList", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        let out = anthropic_to_chat_completions("deepseek-ai/DeepSeek-V4-Flash-0731", &body, true);
+        assert!(out["tools"][0]["function"]["parameters"]["properties"]
+            .get(NOARGS_PLACEHOLDER)
+            .is_none());
+    }
+
+    /// The placeholder must never reach the client: Claude Code validates
+    /// tool_use input against its own schema and rejects unknown properties.
+    #[test]
+    fn test_placeholder_stripped_from_streamed_tool_use() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"TaskList","arguments":"{\"__noargs\": \"\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ]);
+        let tool_uses = collect_tool_use(&events);
+        assert_eq!(tool_uses.len(), 1, "expected one tool_use block");
+        assert_eq!(tool_uses[0]["name"], "TaskList");
+        let json = input_json_for(&events, 0).expect("tool_use should carry input_json_delta");
+        let parsed: Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, json!({}), "placeholder must be stripped, got {}", parsed);
+    }
+
+    /// Stripping must not disturb real arguments sent alongside the placeholder.
+    #[test]
+    fn test_placeholder_stripped_keeps_real_args() {
+        assert_eq!(
+            strip_placeholder_arg(r#"{"__noargs":"","command":"ls"}"#),
+            r#"{"command":"ls"}"#
+        );
+    }
+
+    /// Arguments without the placeholder — and malformed arguments — pass
+    /// through byte-for-byte so a real tool call is never mangled.
+    #[test]
+    fn test_strip_placeholder_is_noop_without_placeholder() {
+        assert_eq!(
+            strip_placeholder_arg(r#"{"command":"ls -la"}"#),
+            r#"{"command":"ls -la"}"#
+        );
+        assert_eq!(strip_placeholder_arg("{not json"), "{not json");
+        assert_eq!(strip_placeholder_arg("[1,2]"), "[1,2]");
+    }
+
+    /// The non-streaming response path strips the placeholder too.
+    #[test]
+    fn test_placeholder_stripped_from_non_streaming_tool_use() {
+        let response = json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "TaskList", "arguments": "{\"__noargs\": \"\"}"}
+                    }]
+                }
+            }]
+        });
+        let msg = chat_completions_to_anthropic("zai-org/GLM-5.2-FP8", &response);
+        let tool_use = msg["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("expected a tool_use block");
+        assert_eq!(tool_use["input"], json!({}));
     }
 }

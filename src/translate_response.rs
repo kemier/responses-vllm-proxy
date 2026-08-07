@@ -1543,6 +1543,80 @@ impl ResponseTranslator {
     pub fn has_finish_reason(&self) -> bool {
         !self.finish_reason.is_empty()
     }
+
+    /// True when this turn looks like the backend silently swallowed a tool
+    /// call, so the caller should re-run the request non-streaming.
+    ///
+    /// Same backend defect the Anthropic path works around: GLM-5.2-FP8 on vLLM
+    /// drops tool calls whose arguments object is empty when `stream: true`,
+    /// returning `finish_reason: "stop"` with no `tool_calls` and at most a
+    /// short preamble. Codex is exposed through exactly one tool — `get_goal`,
+    /// whose schema is `JsonSchema::object(BTreeMap::new(), ...)` — reproduced
+    /// at 0/4 streaming vs 2/2 non-streaming against the backend directly.
+    ///
+    /// `max_text` bounds how much assistant text may already have streamed, so
+    /// a genuine final answer never triggers the extra call.
+    pub fn should_retry_non_streaming(&self, max_text: usize) -> bool {
+        if self.finish_reason != "stop" || self.completed_emitted {
+            return false;
+        }
+        if !self.func_states.is_empty() {
+            return false;
+        }
+        let text_len: usize = self.msg_states.values().map(|s| s.text_buf.len()).sum();
+        text_len <= max_text
+    }
+
+    /// Splice tool calls from a non-streaming response into this stream as
+    /// Responses-API `function_call` items.
+    ///
+    /// Feeds them through the normal `handle_tool_calls` / `handle_finish` path
+    /// so item indices, call ids and the custom-tool (`apply_patch`) handling
+    /// stay identical to a natively streamed tool call. Must run before the
+    /// final `[DONE]`, and keeps any text already streamed — that text is the
+    /// model's own preamble and the re-run returns empty content.
+    pub fn inject_tool_calls_from_message(&mut self, message: &Value) -> Vec<String> {
+        let Some(tool_calls) = message.get("tool_calls").and_then(|c| c.as_array()) else {
+            return Vec::new();
+        };
+        let mut synthetic = Vec::new();
+        for (i, tc) in tool_calls.iter().enumerate() {
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let call_id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+            let args = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("{}");
+            synthetic.push(json!({
+                "index": i,
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            }));
+        }
+        if synthetic.is_empty() {
+            return Vec::new();
+        }
+        let mut out = self.handle_tool_calls(0, &synthetic);
+        // Report tool_calls so build_completed_event's end_turn goes false and
+        // codex executes the tool instead of ending the turn.
+        self.finish_reason = "tool_calls".to_string();
+        out.extend(self.handle_finish(0));
+        out
+    }
 }
 
 /// Detect upstream error objects embedded in SSE streams.
@@ -2144,5 +2218,109 @@ mod tests {
             t.has_finish_reason(),
             "stream with finish_reason='stop' should have has_finish_reason() = true"
         );
+    }
+
+    // ── Dropped-tool-call recovery (codex path) ────────────────────────────
+    //
+    // GLM-5.2-FP8 on vLLM drops streamed tool calls whose arguments object is
+    // empty. Codex is exposed through `get_goal`, whose parameters are an empty
+    // object. Reproduced at 0/4 streaming vs 2/2 non-streaming.
+
+    /// A turn that stopped with only a short preamble and no tool call is the
+    /// signature of a swallowed tool call — retry it non-streaming.
+    #[test]
+    fn test_should_retry_on_short_stop_with_no_tool_call() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"Now let me read the goal back."},"finish_reason":"stop"}]}"#,
+        );
+        assert!(t.should_retry_non_streaming(400));
+    }
+
+    /// A turn that already produced a tool call is fine — never retry.
+    #[test]
+    fn test_no_retry_when_tool_call_present() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        assert!(!t.should_retry_non_streaming(400));
+    }
+
+    /// A long final answer must never pay for the extra non-streaming call.
+    #[test]
+    fn test_no_retry_on_long_final_answer() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let long = "x".repeat(500);
+        let line = format!(
+            r#"data: {{"id":"1","model":"test","choices":[{{"index":0,"delta":{{"content":"{}"}},"finish_reason":"stop"}}]}}"#,
+            long
+        );
+        let _ = t.process_line(&line);
+        assert!(!t.should_retry_non_streaming(400));
+    }
+
+    /// finish_reason=length is a truncation, not a swallowed tool call.
+    #[test]
+    fn test_no_retry_on_max_tokens_truncation() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"cut"},"finish_reason":"length"}]}"#,
+        );
+        assert!(!t.should_retry_non_streaming(400));
+    }
+
+    /// The injected tool call must reach codex as a real function_call item,
+    /// with end_turn=false so the turn continues instead of ending.
+    #[test]
+    fn test_injected_tool_call_emits_function_call_and_continues_turn() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let mut events = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"Now let me read the goal back."},"finish_reason":"stop"}]}"#,
+        );
+        assert!(t.should_retry_non_streaming(400));
+
+        let message = json!({
+            "content": "",
+            "tool_calls": [{
+                "id": "call_goal_1",
+                "function": {"name": "get_goal", "arguments": "{}"}
+            }]
+        });
+        events.extend(t.inject_tool_calls_from_message(&message));
+        events.extend(t.process_line("data: [DONE]"));
+
+        let joined = events.join("");
+        assert!(
+            joined.contains("get_goal") && joined.contains("call_goal_1"),
+            "the recovered tool call should be streamed to codex"
+        );
+
+        let completed = find_completed_event(&events).expect("should have response.completed");
+        let response = completed.get("response").unwrap();
+        assert_eq!(
+            response.get("end_turn").and_then(|v| v.as_bool()),
+            Some(false),
+            "a recovered tool call must set end_turn=false so codex executes it"
+        );
+        let output = response["output"].as_array().unwrap();
+        assert!(
+            output
+                .iter()
+                .any(|i| i["type"] == "function_call" && i["name"] == "get_goal"),
+            "response.output should carry the function_call item, got {:?}",
+            output
+        );
+    }
+
+    /// A message with no tool calls yields nothing — the turn is left alone.
+    #[test]
+    fn test_inject_is_noop_without_tool_calls() {
+        let mut t = ResponseTranslator::new("resp_test", None);
+        let _ = t.process_line(
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        );
+        let events = t.inject_tool_calls_from_message(&json!({"content": "done"}));
+        assert!(events.is_empty());
     }
 }

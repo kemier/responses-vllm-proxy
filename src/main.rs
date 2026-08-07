@@ -784,6 +784,15 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
 
         let byte_stream = resp.bytes_stream();
 
+        // Everything the dropped-tool-call recovery needs to replay the request
+        // non-streaming (see retry_non_streaming).
+        let retry_noargs_tool_call = responses_request_has_zero_parameter_tool(&request_json)
+            && needs_noargs_retry(&backend_model);
+        let retry_client = state.http_client.clone();
+        let retry_url = url.clone();
+        let retry_token = token.clone();
+        let retry_request = cc_payload.clone();
+
         // Use a channel so we can detect client disconnects.  When the
         // client (codex) drops the connection — e.g. when the user clicks
         // Stop — Axum stops polling the response body.  The channel sender
@@ -820,6 +829,14 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
                                  buffer.push_str(&String::from_utf8_lossy(&chunk));
                                  while let Some(rel_pos) = buffer[read_pos..].find('\n') {
                                       let pos = read_pos + rel_pos;
+                                      // Defer `[DONE]`: process_line() turns it into
+                                      // flush_and_complete(), which emits response.completed. That must
+                                      // happen AFTER the dropped-tool-call recovery below, or the
+                                      // recovered function_call lands after the response is complete.
+                                      if buffer[read_pos..pos].trim() == "data: [DONE]" {
+                                          read_pos = pos + 1;
+                                          continue;
+                                      }
                                       let events = translator.process_line(&buffer[read_pos..pos]);
                                       read_pos = pos + 1;
                                      for event in events {
@@ -867,7 +884,13 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
 
            // Flush remaining buffer
            if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
-               let events = translator.process_line(&buffer[read_pos..]);
+               // `[DONE]` is deferred to the post-loop path so the
+               // dropped-tool-call recovery runs before response.completed.
+               let events = if buffer[read_pos..].trim() == "data: [DONE]" {
+                   Vec::new()
+               } else {
+                   translator.process_line(&buffer[read_pos..])
+               };
                for event in events {
                    if tx
                        .send(Ok(axum::body::Bytes::from(event.into_bytes())))
@@ -925,6 +948,36 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
                   return;
               }
               return;
+          }
+
+          // Same dropped-tool-call recovery as /v1/messages: GLM-5.2 silently
+          // discards streamed tool calls with empty arguments (codex's
+          // `get_goal`), so re-run the request non-streaming and splice the
+          // tool call in before completing the response.
+          if retry_noargs_tool_call
+              && translator.should_retry_non_streaming(NOARGS_RETRY_MAX_TEXT)
+          {
+              if let Some(message) =
+                  retry_non_streaming(&retry_client, &retry_url, &retry_token, &retry_request)
+                      .await
+              {
+                  let events = translator.inject_tool_calls_from_message(&message);
+                  if !events.is_empty() {
+                      logger::info(
+                          "responses",
+                          "Recovered a dropped tool call via a non-streaming re-run",
+                      );
+                      for event in events {
+                          if tx
+                              .send(Ok(axum::body::Bytes::from(event.into_bytes())))
+                              .await
+                              .is_err()
+                          {
+                              return;
+                          }
+                      }
+                  }
+              }
           }
 
           // Send [DONE]
@@ -1490,6 +1543,14 @@ pub async fn handle_responses_ws(
 
                                while let Some(rel_pos) = buffer[read_pos..].find('\n') {
                                     let pos = read_pos + rel_pos;
+                                    // Defer `[DONE]`: process_line() turns it into
+                                    // flush_and_complete(), which emits response.completed. That must
+                                    // happen AFTER the dropped-tool-call recovery below, or the
+                                    // recovered function_call lands after the response is complete.
+                                    if buffer[read_pos..pos].trim() == "data: [DONE]" {
+                                        read_pos = pos + 1;
+                                        continue;
+                                    }
                                     let events = translator.process_line(&buffer[read_pos..pos]);
                                     // Hot path: only allocate the preview string when
                                     // debug logging is actually on. With multiple codex
@@ -1590,7 +1651,13 @@ pub async fn handle_responses_ws(
 
            // Flush remaining buffer
           if read_pos < buffer.len() && !buffer[read_pos..].trim().is_empty() {
-               let events = translator.process_line(&buffer[read_pos..]);
+               // `[DONE]` is deferred to the post-loop path so the
+               // dropped-tool-call recovery runs before response.completed.
+               let events = if buffer[read_pos..].trim() == "data: [DONE]" {
+                   Vec::new()
+               } else {
+                   translator.process_line(&buffer[read_pos..])
+               };
                for event in events {
                    stream_event_count += 1;
                    if logger::is_enabled(logger::LogLevel::Debug) {
@@ -1640,6 +1707,40 @@ pub async fn handle_responses_ws(
                    err_payload.to_string()
                )).await;
                continue 'connection;
+           }
+
+           // Same dropped-tool-call recovery as /v1/messages and the SSE
+           // responses path: GLM-5.2 silently discards streamed tool calls with
+           // empty arguments (codex's `get_goal`), so re-run the request
+           // non-streaming and splice the tool call in before completing.
+           if responses_request_has_zero_parameter_tool(&effective_request_arc)
+               && needs_noargs_retry(&backend_model)
+               && translator.should_retry_non_streaming(NOARGS_RETRY_MAX_TEXT)
+           {
+               if let Some(message) = retry_non_streaming(
+                   &state.http_client,
+                   &url,
+                   &token,
+                   &cc_payload,
+               )
+               .await
+               {
+                   let events = translator.inject_tool_calls_from_message(&message);
+                   if !events.is_empty() {
+                       logger::info(
+                           "ws",
+                           &format!(
+                               "[{}] Recovered a dropped tool call via a non-streaming re-run",
+                               conn_short
+                           ),
+                       );
+                       for event in events {
+                           if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
+                               break 'connection;
+                           }
+                       }
+                   }
+               }
            }
 
            // Properly flush the translator by passing [DONE], which emits
@@ -2248,6 +2349,128 @@ pub async fn handle_embeddings(
 }
 
 // ─── POST /v1/messages (Anthropic Messages API → OpenAI Chat Completions) ───
+/// Longest already-streamed assistant text that still counts as a stalled turn
+/// worth re-running non-streaming. Measured stalls carried 0–110 characters; a
+/// genuine final answer runs into the hundreds or thousands and is left alone.
+const NOARGS_RETRY_MAX_TEXT: usize = 400;
+
+/// True if any tool in an Anthropic request declares no parameters. Only those
+/// trip the backend's streaming tool-call defect, so a request without one
+/// never pays for the recovery path.
+fn has_zero_parameter_tool(request_json: &Value) -> bool {
+    request_json
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|tools| {
+            tools.iter().any(|t| {
+                !t.get("input_schema")
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.as_object())
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// True for models whose streaming tool-call parser drops empty-argument calls.
+/// Scoped to GLM: DeepSeek-V4 streams them correctly (verified).
+fn needs_noargs_retry(backend_model: &str) -> bool {
+    backend_model.to_lowercase().contains("glm")
+}
+
+/// True if any tool in a Responses-API request declares no parameters.
+///
+/// Responses-API tools are `{"type":"function","name":...,"parameters":{...}}`
+/// (flat, unlike Anthropic's nested `input_schema`), and `type":"namespace"`
+/// entries nest their own `tools` array. Custom/freeform tools (`apply_patch`,
+/// `exec`) take raw text rather than a JSON object, so they are not affected and
+/// are skipped.
+fn responses_request_has_zero_parameter_tool(request_json: &Value) -> bool {
+    fn schema_is_empty(tool: &Value) -> bool {
+        // Only plain function tools use a JSON-object argument schema.
+        if tool.get("type").and_then(|t| t.as_str()) != Some("function") {
+            return false;
+        }
+        !tool
+            .get("parameters")
+            .and_then(|p| p.get("properties"))
+            .and_then(|p| p.as_object())
+            .map(|p| !p.is_empty())
+            .unwrap_or(false)
+    }
+    let Some(tools) = request_json.get("tools").and_then(|t| t.as_array()) else {
+        return false;
+    };
+    tools.iter().any(|tool| {
+        if tool.get("type").and_then(|t| t.as_str()) == Some("namespace") {
+            return tool
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|subs| subs.iter().any(schema_is_empty))
+                .unwrap_or(false);
+        }
+        schema_is_empty(tool)
+    })
+}
+
+/// Replay a chat-completions request with `stream: false` and return
+/// `choices[0].message`, or None if the re-run fails or carries no message.
+///
+/// Used only to recover a tool call the streaming response dropped, so failures
+/// are logged and swallowed: the client still gets the original turn.
+async fn retry_non_streaming(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    cc_request: &Value,
+) -> Option<Value> {
+    let mut body = cc_request.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stream".to_string(), json!(false));
+        obj.remove("stream_options");
+    }
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            logger::warn(
+                "messages",
+                &format!("Non-streaming tool-call re-run returned {}", r.status()),
+            );
+            return None;
+        }
+        Err(e) => {
+            logger::warn(
+                "messages",
+                &format!("Non-streaming tool-call re-run failed: {}", e),
+            );
+            return None;
+        }
+    };
+    let parsed: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            logger::warn(
+                "messages",
+                &format!("Non-streaming tool-call re-run returned unparseable JSON: {}", e),
+            );
+            return None;
+        }
+    };
+    parsed
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("message"))
+        .cloned()
+}
+
 /// Native Anthropic Messages API endpoint. Translates Anthropic format to
 /// OpenAI Chat Completions internally, then translates the response back.
 /// This bypasses CCR (Claude Code Router) entirely, fixing broken streaming.
@@ -2358,6 +2581,48 @@ pub async fn handle_messages(
         "messages",
         &format!("POST {} model={} stream={}", url, backend_model, is_stream),
     );
+
+    // Log which tools declare no parameters. Those are the ones GLM-5.2 drops
+    // in streaming mode (see NOARGS_PLACEHOLDER), so knowing whether a client
+    // actually sends any is the difference between the workaround mattering and
+    // being dead weight.
+    if let Some(tools) = request_json.get("tools").and_then(|t| t.as_array()) {
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        let noargs: Vec<&str> = tools
+            .iter()
+            .filter(|t| {
+                !t.get("input_schema")
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.as_object())
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
+            })
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        logger::debug(
+            "messages",
+            &format!(
+                "[tools] {} offered: [{}] | zero-parameter: [{}]",
+                names.len(),
+                names.join(","),
+                noargs.join(",")
+            ),
+        );
+        if !noargs.is_empty() {
+            logger::info(
+                "messages",
+                &format!(
+                    "[tools] {} of {} tools declare no parameters: [{}]",
+                    noargs.len(),
+                    tools.len(),
+                    noargs.join(",")
+                ),
+            );
+        }
+    }
 
     // Turn-debug: log request size breakdown to diagnose rapid context growth.
     if state.cfg.log_turn_debug {
@@ -2514,6 +2779,15 @@ pub async fn handle_messages(
                 let (tx, rx) =
                     mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
 
+                // Everything the dropped-tool-call recovery needs to replay the
+                // request non-streaming (see retry_non_streaming).
+                let retry_noargs_tool_call =
+                    has_zero_parameter_tool(&request_json) && needs_noargs_retry(&backend_model);
+                let retry_client = state.http_client.clone();
+                let retry_url = url.clone();
+                let retry_token = token.clone();
+                let retry_request = cc_request.clone();
+
                 let model_for_translator = backend_model.clone();
                 tokio::spawn(async move {
                     let mut translator =
@@ -2573,6 +2847,18 @@ pub async fn handle_messages(
                                                     }
                                                 }
                                             }
+                                            // Defer `[DONE]` to the post-loop
+                                            // path. translate_line() turns it
+                                            // straight into finish(), which
+                                            // emits message_delta/message_stop —
+                                            // that must happen AFTER the
+                                            // dropped-tool-call recovery below,
+                                            // or the recovered tool_use blocks
+                                            // land after the message has already
+                                            // been closed.
+                                            if line.trim() == "data: [DONE]" {
+                                                continue;
+                                            }
                                             let events = translator.translate_line(line);
                                             for event in events {
                                                 if tx.send(Ok(axum::body::Bytes::from(event))).await.is_err() {
@@ -2601,7 +2887,12 @@ pub async fn handle_messages(
                     }
                     if read_pos < buffer.len() {
                         let remaining = &buffer[read_pos..];
-                        if !remaining.trim().is_empty() && upstream_error.is_none() {
+                        // Same `[DONE]` deferral as the main loop: finish() must
+                        // run after the dropped-tool-call recovery, not here.
+                        if !remaining.trim().is_empty()
+                            && remaining.trim() != "data: [DONE]"
+                            && upstream_error.is_none()
+                        {
                             let events = translator.translate_line(remaining);
                             for event in events {
                                 let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
@@ -2652,6 +2943,44 @@ pub async fn handle_messages(
                             let sse = format!("event: error\ndata: {}\n\n", err_payload);
                             let _ = tx.send(Ok(axum::body::Bytes::from(sse))).await;
                         } else {
+                           // GLM-5.2-FP8 drops streamed tool calls whose
+                           // arguments object is empty (verified against the
+                           // backend with no proxy in the path): the turn comes
+                           // back as finish_reason "stop" with no tool_calls and
+                           // at most a short preamble, so the client renders a
+                           // turn that announced an action and did nothing. The
+                           // same request non-streaming returns the tool call
+                           // every time, so re-run it once and splice the tool
+                           // call in. Gated to requests that actually offer a
+                           // zero-parameter tool, and to turns whose streamed
+                           // text is short, so a real final answer never pays
+                           // for the extra call.
+                           if retry_noargs_tool_call
+                               && translator.should_retry_non_streaming(NOARGS_RETRY_MAX_TEXT)
+                           {
+                               if let Some(message) = retry_non_streaming(
+                                   &retry_client,
+                                   &retry_url,
+                                   &retry_token,
+                                   &retry_request,
+                               )
+                               .await
+                               {
+                                   let events =
+                                       translator.inject_tool_calls_from_message(&message);
+                                   if !events.is_empty() {
+                                       logger::info(
+                                           "messages",
+                                           "Recovered a dropped tool call via a non-streaming re-run",
+                                       );
+                                       for event in events {
+                                           let _ = tx
+                                               .send(Ok(axum::body::Bytes::from(event)))
+                                               .await;
+                                       }
+                                   }
+                               }
+                           }
                            let finish_events = translator.translate_line("data: [DONE]");
                            for event in finish_events {
                                let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
