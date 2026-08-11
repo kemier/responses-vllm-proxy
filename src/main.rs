@@ -2122,6 +2122,73 @@ fn rewrite_reasoning_to_content(line: &str) -> String {
     }
 }
 
+/// Per-SSE-line classification used by the thinking-only guard on the
+/// /v1/chat/completions passthrough.
+///
+/// The guard must inspect each `data:` line BEFORE `rewrite_reasoning_to_content`
+/// runs, because the rewrite moves `delta.reasoning` into `delta.content` —
+/// after the rewrite we can no longer tell a genuine answer from a thinking
+/// trace that was promoted to look like one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChatDeltaFlags {
+    /// A non-empty `delta.content` field was present (real answer text).
+    has_content: bool,
+    /// A non-empty `delta.reasoning` / `delta.reasoning_content` was present.
+    has_reasoning: bool,
+    /// A non-empty `delta.tool_calls` array was present (tool turn).
+    has_tool_calls: bool,
+}
+
+/// Inspect a single SSE `data:` line from the upstream chat/completions
+/// stream. Returns `None` for non-JSON lines (keepalives, `[DONE]`, empty).
+fn inspect_chat_delta(line: &str) -> Option<ChatDeltaFlags> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("data: ") || trimmed == "data: [DONE]" || trimmed.len() <= 6 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&trimmed[6..]).ok()?;
+    let mut flags = ChatDeltaFlags::default();
+    let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+        return Some(flags);
+    };
+    for choice in choices {
+        let Some(delta) = choice.get("delta").and_then(|d| d.as_object()) else {
+            continue;
+        };
+        if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+            if !c.trim().is_empty() {
+                flags.has_content = true;
+            }
+        }
+        let rc = delta
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .or_else(|| delta.get("reasoning_content").and_then(|v| v.as_str()));
+        if let Some(rc) = rc {
+            if !rc.trim().is_empty() {
+                flags.has_reasoning = true;
+            }
+        }
+        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            if !tcs.is_empty() {
+                flags.has_tool_calls = true;
+            }
+        }
+    }
+    Some(flags)
+}
+
+/// Compose the SSE error frame used by the thinking-only guard.
+fn thinking_only_error_event() -> String {
+    let err_payload = json!({
+        "error": {
+            "message": "Model produced only reasoning (thinking) with no final answer — retrying with different settings",
+            "code": 502,
+        }
+    });
+    format!("data: {}\n\n", err_payload)
+}
+
 /// Markers that identify a "text-only, no tools" turn.
 ///
 /// Claude Code CLI builds its compaction/summarization prompt with a literal
@@ -2380,6 +2447,20 @@ pub async fn handle_chat_completions(
                    // empty response → premature end_turn. When detected, we inject
                    // an SSE error event so the client can retry/fallback.
                    let mut upstream_error: Option<(u16, String)> = None;
+                   // Thinking-only guard state: GLM-5.x with thinking enabled
+                   // streams the ENTIRE response via `delta.reasoning` and emits
+                   // no `delta.content` (or only whitespace). The rewrite below
+                   // promotes that reasoning to `content`, so to the client the
+                   // turn looks like a (short) real answer followed by
+                   // finish_reason=stop → end_turn. Detect the "reasoning but
+                   // never any real content/tool call" case and, at stream end,
+                   // inject an error event instead of a clean [DONE] so the
+                   // client retries/falls back instead of ending the turn on a
+                   // thinking trace. See also the non-streaming branch below.
+                   let mut saw_reasoning = false;
+                   let mut saw_real_content = false;
+                   let mut saw_tool_calls = false;
+                   let mut pending_done = false;
 
                    loop {
                        tokio::select! {
@@ -2423,6 +2504,30 @@ pub async fn handle_chat_completions(
                                           } else {
                                               line.to_string()
                                           };
+                                          if thinking_enabled && !pending_done {
+                                              // Defer `[DONE]` until the end of the
+                                              // stream so the thinking-only guard can
+                                              // inject an error before the client sees
+                                              // a clean completion.
+                                              if output.trim() == "data: [DONE]" {
+                                                  pending_done = true;
+                                                  continue;
+                                              }
+                                              // Classify the raw line BEFORE the
+                                              // rewrite so reasoning-only promotion
+                                              // stays distinguishable from real content.
+                                              if let Some(flags) = inspect_chat_delta(line) {
+                                                  if flags.has_reasoning {
+                                                      saw_reasoning = true;
+                                                  }
+                                                  if flags.has_content {
+                                                      saw_real_content = true;
+                                                  }
+                                                  if flags.has_tool_calls {
+                                                      saw_tool_calls = true;
+                                                  }
+                                              }
+                                          }
                                            let framed = format!("{}\n", output);
                                            if tx.send(Ok(axum::body::Bytes::from(framed))).await.is_err() {
                                               return;
@@ -2456,8 +2561,12 @@ pub async fn handle_chat_completions(
                           } else {
                               remaining.to_string()
                           };
+                          if thinking_enabled && !pending_done && output.trim() == "data: [DONE]" {
+                              pending_done = true;
+                          } else {
                            let framed = format!("{}\n", output);
                            let _ = tx.send(Ok(axum::body::Bytes::from(framed))).await;
+                          }
                       }
                   }
                   // If an in-stream upstream error was detected, send an SSE
@@ -2474,6 +2583,30 @@ pub async fn handle_chat_completions(
                       });
                       let err_event = format!("event: error\ndata: {}\n\n", err_payload);
                      let _ = tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await;
+                 } else if thinking_enabled && saw_reasoning && !saw_real_content && !saw_tool_calls {
+                      // Thinking-only stream: reasoning deltas were already
+                      // rewritten to content and forwarded, but the model never
+                      // produced a real answer or tool call. The client would
+                      // otherwise see a clean `[DONE]` and treat the turn as
+                      // complete (end_turn on a thinking trace). Inject an error
+                      // event instead so ericli/CCR retry: ericli throws on a
+                      // `data:` line with an `error` key and falls back to
+                      // directChat, whose non-streaming re-run hits the guard
+                      // below and returns 502 — triggering model fallback instead
+                      // of ending the turn.
+                      logger::error(
+                          "chat",
+                          "Thinking-only stream detected (reasoning, no content, no tool calls) — injecting error instead of [DONE]",
+                      );
+                      let _ = tx.send(Ok(axum::body::Bytes::from(
+                          thinking_only_error_event().into_bytes(),
+                      )))
+                      .await;
+                 } else if pending_done {
+                      let _ = tx.send(Ok(axum::body::Bytes::from(
+                          "data: [DONE]\n\n".to_string().into_bytes(),
+                      )))
+                      .await;
                  }
                     };
                     if let Some(id) = conn_id {
@@ -2499,6 +2632,12 @@ pub async fn handle_chat_completions(
                 // Non-streaming: if thinking was enabled, GLM-5.2 may return
                 // content in `reasoning` field with empty `content`. Move it.
                 let body_bytes = r.bytes().await.unwrap_or_default();
+                // Track whether ANY choice had only reasoning promoted to
+                // content (i.e. no real answer text ever, no tool call) so a
+                // thinking-only response returns 502 instead of a "successful"
+                // short answer that the client turns into end_turn. Mirrors
+                // the streaming thinking-only guard above.
+                let mut thinking_only_nonstream = false;
                 let body_bytes = if thinking_enabled {
                     if let Ok(mut v) = serde_json::from_slice::<Value>(&body_bytes) {
                         if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
@@ -2511,10 +2650,24 @@ pub async fn handle_chat_completions(
                                     if content_empty {
                                         if let Some(reasoning) = msg.remove("reasoning") {
                                             msg.insert("content".to_string(), reasoning);
+                                            let has_tool_calls = msg
+                                                .get("tool_calls")
+                                                .and_then(|t| t.as_array())
+                                                .map(|a| !a.is_empty())
+                                                .unwrap_or(false);
+                                            if !has_tool_calls {
+                                                thinking_only_nonstream = true;
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+                        if thinking_only_nonstream {
+                            logger::error(
+                                "chat",
+                                "Non-streaming thinking-only response detected (reasoning, no content, no tool calls) — returning 502",
+                            );
                         }
                         serde_json::to_vec(&v).unwrap_or_else(|_| body_bytes.to_vec())
                     } else {
@@ -2523,13 +2676,29 @@ pub async fn handle_chat_completions(
                 } else {
                     body_bytes.to_vec()
                 };
-                let mut response = Response::builder().status(status);
+                let final_status = if thinking_only_nonstream {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    status
+                };
+                let final_body = if thinking_only_nonstream {
+                    serde_json::to_vec(&json!({
+                        "error": {
+                            "message": "Model produced only reasoning (thinking) with no final answer — retrying with different settings",
+                            "code": 502,
+                        }
+                    }))
+                    .unwrap_or_default()
+                } else {
+                    body_bytes
+                };
+                let mut response = Response::builder().status(final_status);
                 for (k, v) in &headers {
                     if k != "content-encoding" && k != "transfer-encoding" {
                         response = response.header(k, v);
                     }
                 }
-                response.body(Body::from(body_bytes)).unwrap()
+                response.body(Body::from(final_body)).unwrap()
             }
         }
         Err(e) => {
@@ -4054,5 +4223,92 @@ mod tests {
             &mut map,
         );
         assert!(map.is_empty());
+    }
+
+
+    // ─── inspect_chat_delta / thinking-only guard tests ───────────────────
+
+    #[test]
+    fn inspect_delta_content_only() {
+        let flags = inspect_chat_delta("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}").unwrap();
+        assert!(flags.has_content);
+        assert!(!flags.has_reasoning);
+        assert!(!flags.has_tool_calls);
+    }
+
+    #[test]
+    fn inspect_delta_reasoning_only() {
+        let flags = inspect_chat_delta("data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking...\"}}]}").unwrap();
+        assert!(!flags.has_content);
+        assert!(flags.has_reasoning);
+        assert!(!flags.has_tool_calls);
+    }
+
+    #[test]
+    fn inspect_delta_reasoning_and_content() {
+        let flags = inspect_chat_delta("data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\",\"content\":\"answer\"}}]}").unwrap();
+        assert!(flags.has_content);
+        assert!(flags.has_reasoning);
+        assert!(!flags.has_tool_calls);
+    }
+
+    #[test]
+    fn inspect_delta_tool_calls() {
+        let flags = inspect_chat_delta("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"x\"}]}}]}").unwrap();
+        assert!(!flags.has_content);
+        assert!(!flags.has_reasoning);
+        assert!(flags.has_tool_calls);
+    }
+
+    #[test]
+    fn inspect_delta_whitespace_content_is_not_real() {
+        let flags = inspect_chat_delta("data: {\"choices\":[{\"delta\":{\"content\":\"  \"}}]}").unwrap();
+        assert!(!flags.has_content);
+    }
+
+    #[test]
+    fn inspect_delta_done_and_junk_return_none() {
+        assert!(inspect_chat_delta("data: [DONE]").is_none());
+        assert!(inspect_chat_delta(": keepalive").is_none());
+        assert!(inspect_chat_delta("not json").is_none());
+    }
+
+    #[test]
+    fn inspect_delta_usage_chunk_no_flags() {
+        let flags = inspect_chat_delta("data: {\"choices\":[],\"usage\":{\"total_tokens\":5}}").unwrap();
+        assert!(!flags.has_content);
+        assert!(!flags.has_reasoning);
+        assert!(!flags.has_tool_calls);
+    }
+
+    #[test]
+    fn thinking_only_error_event_has_error_key() {
+        let ev = thinking_only_error_event();
+        assert!(ev.starts_with("data: {"));
+        let parsed: Value = serde_json::from_str(ev.trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(parsed["error"]["code"], 502);
+    }
+
+    #[test]
+    fn rewrite_reasoning_moves_reasoning_to_content() {
+        let line = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think text\"}}]}";
+        let out = rewrite_reasoning_to_content(line);
+        assert!(out.contains("\"content\":\"think text\""));
+        assert!(!out.contains("\"reasoning\""));
+    }
+
+    #[test]
+    fn rewrite_reasoning_keeps_real_content() {
+        let line = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\",\"content\":\"answer\"}}]}";
+        let out = rewrite_reasoning_to_content(line);
+        assert!(out.contains("\"content\":\"answerthink\""));
+    }
+
+    #[test]
+    fn rewrite_reasoning_passthrough_done() {
+        assert_eq!(
+            rewrite_reasoning_to_content("data: [DONE]"),
+            "data: [DONE]"
+        );
     }
 }
