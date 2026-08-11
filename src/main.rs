@@ -51,6 +51,7 @@ pub struct AppState {
     pub model_catalog: ModelCatalog,
     pub shutdown: tokio_util::sync::CancellationToken,
     pub rate_limiter: Arc<RateLimiter>,
+    pub model_throttle: Arc<ModelThrottle>,
     pub backend_meta: BackendMetaCache,
 }
 
@@ -276,6 +277,130 @@ impl RateLimiter {
     }
 }
 
+/// Per-model concurrency throttle. Prevents the upstream 429 storm observed
+/// when multiple agents (codex-acp, ericli, claude-code-acp, kiro) all hit the
+/// same backend model (e.g. zai-org/GLM-5.2-FP8) with large contexts at once.
+/// `Semaphore::Permit`s are held for the DURATION of each upstream request
+/// (including streaming), so excess requests queue instead of being forwarded
+/// and rejected with 429.
+///
+/// A fixed `max_concurrent` is not enough: a single model on a shared vLLM can
+/// only prefill/decode so many requests in parallel before queue pressure
+/// spikes. Any higher limit just moves the 429 an mbps later.
+pub struct ModelThrottle {
+    default_limit: usize,
+    limits: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    semaphores: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+}
+
+impl ModelThrottle {
+    pub fn new(default_limit: usize, overrides: &std::collections::HashMap<String, usize>) -> Self {
+        Self {
+            default_limit,
+            limits: std::sync::Mutex::new({
+                let mut m = std::collections::HashMap::new();
+                for (k, v) in overrides {
+                    m.insert(k.clone(), *v);
+                }
+                m
+            }),
+            semaphores: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn limit_for(&self, model: &str) -> usize {
+        let limits = self.limits.lock().unwrap();
+        limits.get(model).copied().unwrap_or(self.default_limit)
+    }
+
+    /// Acquire a permit for `model`, waiting up to `timeout`. Returns None if
+    /// the wait timed out (caller should respond 503 + Retry-After).
+    pub async fn acquire(
+        &self,
+        model: &str,
+        timeout: Duration,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let limit = self.limit_for(model);
+        if limit == 0 {
+            return None; // 0 = unlimited (config default is 3, but allow opt-out)
+        }
+
+        // Lazily create the semaphore for this model.
+        let sem = {
+            let mut sems = self.semaphores.lock().await;
+            sems.entry(model.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
+                .clone()
+        };
+
+        let t0 = std::time::Instant::now();
+        let res = tokio::time::timeout(timeout, sem.acquire_owned())
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        if let Some(waited_ms) = res.as_ref().map(|_| t0.elapsed().as_millis()) {
+            if waited_ms > 250 {
+                logger::info(
+                    "throttle",
+                    &format!(
+                        "model {} waited {}ms for a free slot (limit={})",
+                        model, waited_ms, limit
+                    ),
+                );
+            }
+        }
+        res
+    }
+}
+
+/// Throttle timeout before returning 503. Long enough that a streaming model
+/// slot is unlikely to be held much longer; short enough that the client
+/// retries rather than hanging.
+const MODEL_THROTTLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// HTTP 503 Retry-After suggested to the client after a throttle timeout.
+const MODEL_THROTTLE_RETRY_AFTER: &str = "30";
+
+/// Acquire a per-model permit for the given backend model. Logs when the
+/// request had to wait, and returns `Some(permit)` to hold for the duration
+/// of the upstream call, or `Some(None)` when throttling is disabled
+/// (max=0), or `Err(503 Response)` when the wait timed out.
+async fn throttle_model<'a>(
+    state: &'a AppState,
+    model: &str,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Response> {
+    let limit = state.model_throttle.limit_for(model);
+    if limit == 0 {
+        return Ok(None); // unlimited
+    }
+    match state
+        .model_throttle
+        .acquire(model, MODEL_THROTTLE_TIMEOUT)
+        .await
+    {
+        Some(permit) => Ok(Some(permit)),
+        None => {
+            logger::warn(
+                "throttle",
+                &format!(
+                    "model {} saturated (limit={}), timed out after {}s — 503",
+                    model,
+                    limit,
+                    MODEL_THROTTLE_TIMEOUT.as_secs()
+                ),
+            );
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", MODEL_THROTTLE_RETRY_AFTER)],
+                format!(
+                    "Model {} is busy (limit={} concurrent). Retry after {}s",
+                    model, limit, MODEL_THROTTLE_RETRY_AFTER
+                ),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// Look up a model's context_window from the cached catalog.
 /// Falls back to 200000 (200K) if the catalog isn't loaded or the model
 /// isn't found.
@@ -326,6 +451,10 @@ async fn main() {
         cfg.client_id.clone(),
     ));
     let rate_limiter = Arc::new(RateLimiter::new(cfg.rate_limit_per_minute));
+    let model_throttle = Arc::new(ModelThrottle::new(
+        cfg.max_concurrent_per_model,
+        &cfg.model_concurrency,
+    ));
     // NOTE: We do NOT set a global .timeout() on the client because reqwest's
     // timeout applies to the ENTIRE request including the streaming body.
     // For long conversations with large contexts, the upstream may take 5+
@@ -386,6 +515,7 @@ async fn main() {
         model_catalog,
         shutdown: shutdown_token.clone(),
         rate_limiter,
+        model_throttle,
         backend_meta,
     };
 
@@ -778,6 +908,12 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
 
     // Resolve alias → backend model ID
     let backend_model = state.cfg.resolve_model(&model_alias);
+
+    // Per-model concurrency throttle — hold spot for the whole upstream call.
+    let _permit = match throttle_model(&state, &backend_model).await {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
 
     let is_stream = request_json
         .get("stream")
@@ -1268,6 +1404,24 @@ pub async fn handle_responses_ws(
                .to_string();
 
             let backend_model = state.cfg.resolve_model(&model_alias);
+
+            // Per-model concurrency throttle — hold spot for the duration of
+            // this turn's upstream call. Multiple codex/ericli/ci instances
+            // share the proxy; without this they all forward to the backend
+            // simultaneously and GLM-5.2 returns 429 (queue full).
+            let _permit = match throttle_model(&state, &backend_model).await {
+                Ok(p) => p,
+                Err(_err_resp) => {
+                    let _ = socket.send(axum::extract::ws::Message::Text(
+                        format!(
+                            "{{\"type\":\"error\",\"status\":{},\"error\":{{\"message\":\"{}\"}}}}",
+                            503,
+                            "Model busy — proxy throttle timeout. Try again."
+                        )
+                    )).await;
+                    continue 'connection; // keep connection alive for retry
+                }
+            };
 
            let is_stream = request_json.get("stream")
                .and_then(|v| v.as_bool())
@@ -2045,6 +2199,12 @@ pub async fn handle_chat_completions(
 
     let backend_model = state.cfg.resolve_model(&model);
 
+    // Per-model concurrency throttle — hold spot for the whole upstream call.
+    let _permit = match throttle_model(&state, &backend_model).await {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
     // Resolve alias in the request
     request_json["model"] = json!(backend_model);
 
@@ -2603,6 +2763,13 @@ pub async fn handle_messages(
         .to_string();
 
     let backend_model = state.cfg.resolve_model(&model);
+
+    // Per-model concurrency throttle — hold spot for the whole upstream call.
+    let _permit = match throttle_model(&state, &backend_model).await {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
     let is_stream = request_json
         .get("stream")
         .and_then(|v| v.as_bool())

@@ -21,6 +21,15 @@ pub struct Config {
     /// Maximum requests per minute per client IP. 0 = unlimited.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
+    /// Maximum concurrent in-flight requests per backend model before the proxy
+    /// holds new requests (prevents upstream 429 storms). 0 = unlimited.
+    #[serde(default = "default_max_concurrent_per_model")]
+    pub max_concurrent_per_model: usize,
+    /// Per-model override for max concurrent requests. Keyed by backend model ID
+    /// (e.g. "zai-org/GLM-5.2-FP8": 1). If a model isn't listed here, falls
+    /// back to max_concurrent_per_model.
+    #[serde(default)]
+    pub model_concurrency: HashMap<String, usize>,
     #[serde(default)]
     pub openai_compatibility: Vec<OpenAICompatProvider>,
     #[serde(default)]
@@ -59,6 +68,9 @@ fn default_log_dir() -> String {
 }
 fn default_rate_limit() -> u32 {
     60
+}
+fn default_max_concurrent_per_model() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Deserialize)]

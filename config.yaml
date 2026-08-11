@@ -13,6 +13,15 @@ token-endpoint: "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6
 client-id: "b46aa582-485a-4a7d-b30e-552dbd790b16"
 # Max requests per minute per client IP (0 = unlimited)
 rate-limit-per-minute: 60
+# Max concurrent in-flight requests per backend model (0 = unlimited).
+# Prevents upstream 429 "queue full" storms when multiple agents (codex,
+# ericli, claude-code, kiro) all hit the same model at once. Excess requests
+# queue up to 60s, then get 503 + Retry-After instead of being forwarded.
+max-concurrent-per-model: 3
+# Per-model overrides (keyed by backend model ID)
+model-concurrency:
+    zai-org/GLM-5.2-FP8: 2
+    zai-org/GLM-5.1-FP8: 2
 request-retry: 3
 
 # Logging

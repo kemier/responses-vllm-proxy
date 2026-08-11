@@ -1,5 +1,108 @@
 use serde_json::{json, Value};
 
+use crate::logger;
+
+/// Truncate a string to at most `max` characters without splitting a
+/// multi-byte UTF-8 character (plain byte slicing would panic).
+fn preview(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Attempt to recover a malformed `{"key": <unquoted raw text>` arguments
+/// object into valid JSON, preserving the original parameter name.
+///
+/// Observed in the wild from DeepSeek-V4-Flash for `exec_command`: the model
+/// opens the object and names the parameter correctly but then writes the
+/// value as raw text instead of a JSON string literal — no surrounding
+/// quotes, literal newlines, unescaped inner quotes:
+///
+/// ```text
+/// {"command": cd /some/dir && python3 -c "
+/// content = open('src/config.rs').read()
+/// ```
+///
+/// Recovering the key (rather than falling back to a generic `input` wrapper)
+/// keeps the replayed history faithful to what the model meant to call, so
+/// the conversation stays coherent on subsequent turns.
+fn repair_unquoted_json_object(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix('{')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let key_end = rest.find('"')?;
+    let key = &rest[..key_end];
+    if key.is_empty() {
+        return None;
+    }
+    let after = rest[key_end + 1..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    // Drop a trailing '}' if the model did close the object.
+    let mut value = after.trim_end();
+    if let Some(v) = value.strip_suffix('}') {
+        value = v.trim_end();
+    }
+    // If the value happens to be a (possibly unterminated) quoted string,
+    // strip the quotes so we do not double-encode them.
+    let value = value
+        .strip_prefix('"')
+        .map(|v| v.trim_end_matches('"'))
+        .unwrap_or(value);
+    if value.is_empty() {
+        return None;
+    }
+    Some(json!({ key: value }).to_string())
+}
+
+/// Ensure a function-call `arguments` string is valid JSON before it is
+/// replayed to vLLM as part of an assistant `tool_calls` entry.
+///
+/// vLLM rejects the ENTIRE request with HTTP 400 ("Assistant tool call
+/// function.arguments must be valid JSON.") when any assistant tool call in
+/// the conversation history carries a non-JSON arguments string. Because the
+/// offending item lives in the *history*, every subsequent turn resends it
+/// and fails identically — the session stays permanently wedged (restarting
+/// the proxy does not help) until the history is repaired here.
+///
+/// Observed sources of invalid arguments:
+///   * empty string — tool called with no parameters and the stream never
+///     produced an `arguments` delta, leaving the accumulator empty
+///   * unquoted value — DeepSeek-V4-Flash emits `{"command": <raw text>`
+///     without JSON-encoding the string value (confirmed in production logs,
+///     `exec_command`, 37 consecutive failing turns on one poisoned item)
+///
+/// Repair strategy, in order of fidelity:
+///   1. pass through untouched when it already parses (the common case)
+///   2. recover `{"key": <raw>}` preserving the parameter name
+///   3. last resort, wrap the raw text under an `input` key
+fn ensure_valid_json_arguments(tool_name: &str, call_id: &str, arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return "{}".to_string();
+    }
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+
+    let (repaired, how) = match repair_unquoted_json_object(trimmed) {
+        Some(r) => (r, "recovered original parameter name"),
+        None => (json!({ "input": arguments }).to_string(), "wrapped as input"),
+    };
+
+    logger::warn(
+        "translate_request",
+        &format!(
+            "[repair] invalid JSON tool arguments — tool='{}' call_id='{}' len={} ({}) \
+             preview={:?} — repaired to prevent upstream HTTP 400 \
+             (\"Assistant tool call function.arguments must be valid JSON.\")",
+            tool_name,
+            call_id,
+            arguments.len(),
+            how,
+            preview(trimmed, 300),
+        ),
+    );
+    repaired
+}
+
 /// Convert OpenAI Responses API request → Chat Completions request.
 /// Ported from the Go translator in CLIProxyAPI.
 pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -> Value {
@@ -165,7 +268,12 @@ pub fn responses_to_chat_completions(model: &str, input: &Value, stream: bool) -
                 "function_call" => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    // Guard the replayed history: a non-JSON arguments string
+                    // (empty, or truncated by max_tokens mid-tool-call) makes
+                    // vLLM reject the whole request with HTTP 400, wedging
+                    // every subsequent turn of the session.
                     let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = ensure_valid_json_arguments(name, call_id, arguments);
                     pending_tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",

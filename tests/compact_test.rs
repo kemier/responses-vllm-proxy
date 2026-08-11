@@ -137,6 +137,10 @@ openai-compatibility:
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
         rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
+        model_throttle: Arc::new(ericai_proxy::main::ModelThrottle::new(
+            0,
+            &std::collections::HashMap::new(),
+        )),
         backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
@@ -229,6 +233,10 @@ openai-compatibility:
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
         rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
+        model_throttle: Arc::new(ericai_proxy::main::ModelThrottle::new(
+            0,
+            &std::collections::HashMap::new(),
+        )),
         backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 

@@ -128,6 +128,56 @@ fn test_tool_call_streaming() {
 }
 
 #[test]
+fn test_function_call_with_no_arguments_defaults_to_empty_json_object() {
+    // A tool called with no parameters (e.g. `wait`, or an MCP tool with an
+    // empty schema) can have its streaming delta produce an id/name but
+    // never send an `arguments` chunk at all — leaving the accumulator as
+    // "". An empty string is not valid JSON: replaying it in the next turn's
+    // history caused vLLM to reject the request with "Assistant tool call
+    // function.arguments must be valid JSON." The proxy must normalize this
+    // to "{}" everywhere arguments are emitted.
+    let mut t = ResponseTranslator::new("resp_test_empty_args", None);
+
+    t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_noargs","function":{"name":"wait","arguments":""}}]}}]}"#,
+    );
+    let finish = t.process_line(
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+    );
+
+    let args_done = finish
+        .iter()
+        .find(|e| e.contains("response.function_call_arguments.done"))
+        .expect("expected a function_call_arguments.done event");
+    assert!(
+        args_done.contains("\"arguments\":\"{}\""),
+        "expected normalized empty-object arguments, got: {}",
+        args_done
+    );
+
+    let item_done = finish
+        .iter()
+        .find(|e| e.contains("response.output_item.done") && e.contains("function_call"))
+        .expect("expected an output_item.done event for the function_call");
+    assert!(
+        item_done.contains("\"arguments\":\"{}\""),
+        "expected normalized empty-object arguments in item_done, got: {}",
+        item_done
+    );
+
+    let done = t.process_line("data: [DONE]");
+    let completed = done
+        .iter()
+        .find(|e| e.contains("response.completed"))
+        .unwrap();
+    assert!(
+        completed.contains("\"arguments\":\"{}\""),
+        "expected normalized empty-object arguments in response.completed, got: {}",
+        completed
+    );
+}
+
+#[test]
 fn test_reasoning_content_streaming() {
     let mut t = ResponseTranslator::new("resp_test6", None);
 

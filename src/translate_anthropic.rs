@@ -150,12 +150,23 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                             let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                             let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                             let input = block.get("input").cloned().unwrap_or(json!({}));
+                            // Never emit an empty arguments string: vLLM
+                            // rejects the whole request with HTTP 400
+                            // ("Assistant tool call function.arguments must
+                            // be valid JSON.") if it is not valid JSON.
+                            let arguments = serde_json::to_string(&input)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            let arguments = if arguments.trim().is_empty() {
+                                "{}".to_string()
+                            } else {
+                                arguments
+                            };
                             tool_calls.push(json!({
                                 "id": id,
                                 "type": "function",
                                 "function": {
                                     "name": name,
-                                    "arguments": serde_json::to_string(&input).unwrap_or_default(),
+                                    "arguments": arguments,
                                 }
                             }));
                         }

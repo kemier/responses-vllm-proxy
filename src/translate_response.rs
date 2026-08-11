@@ -66,6 +66,22 @@ fn is_custom_tool(name: &str) -> bool {
     name == "apply_patch" || name == "exec"
 }
 
+/// Normalize a function-call arguments string for the Responses API /
+/// Chat Completions round-trip. An empty (or whitespace-only) arguments
+/// string is not valid JSON, and vLLM rejects it on the next turn with
+/// "Assistant tool call function.arguments must be valid JSON." — this
+/// happens when a tool is called with no parameters (e.g. `wait`, or an
+/// MCP tool with an empty schema) and the streaming delta never sends an
+/// `arguments` chunk, leaving the accumulator empty. Default to `"{}"`
+/// so the assistant tool_calls entry is always valid JSON.
+fn normalize_function_arguments(args: &str) -> String {
+    if args.trim().is_empty() {
+        "{}".to_string()
+    } else {
+        args.to_string()
+    }
+}
+
 /// Extract the `input` field from a JSON arguments string.
 ///
 /// The model sends apply_patch/exec/wait arguments as JSON: {"input": "..."}
@@ -1208,12 +1224,13 @@ impl ResponseTranslator {
             });
             out.push(self.emit("response.output_item.done", item_done));
         } else {
+            let args = normalize_function_arguments(&args);
             let done = json!({
                 "type": "response.function_call_arguments.done",
                 "sequence_number": self.next_seq(),
                 "item_id": item_id,
                 "output_index": oix,
-                "arguments": args,
+                "arguments": &args,
             });
             out.push(self.emit("response.function_call_arguments.done", done));
 
@@ -1391,7 +1408,7 @@ impl ResponseTranslator {
                     "id": format!("fc_{}", fs.call_id),
                     "type": "function_call",
                     "status": "completed",
-                    "arguments": fs.args_buf,
+                    "arguments": normalize_function_arguments(&fs.args_buf),
                     "call_id": fs.call_id,
                     "name": fs.name,
                 })
@@ -1493,7 +1510,7 @@ impl ResponseTranslator {
                     "id": format!("fc_{}", fs.call_id),
                     "type": "function_call",
                     "status": "completed",
-                    "arguments": fs.args_buf,
+                    "arguments": normalize_function_arguments(&fs.args_buf),
                     "call_id": fs.call_id,
                     "name": fs.name,
                 })
@@ -1902,7 +1919,7 @@ pub fn chat_completion_to_response(raw: &Value, request_json: Option<&Value>) ->
                                 "id": format!("fc_{}", call_id),
                                 "type": "function_call",
                                 "status": "completed",
-                                "arguments": args,
+                                "arguments": normalize_function_arguments(&args),
                                 "call_id": call_id,
                                 "name": short_name,
                                 "namespace": ns,
