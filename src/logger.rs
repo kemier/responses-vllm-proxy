@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
+use tokio::task_local;
 use uuid::Uuid;
 
 /// A single log record enqueued for the background writer task.
@@ -13,6 +14,58 @@ struct LogRecord {
     level: LogLevel,
     module: String,
     message: String,
+    conn_id: Option<String>,
+}
+
+// Task-local storage for the per-connection/request UUID.
+//
+// Set at the entry point of each HTTP handler and WebSocket upgrade via
+// `set_conn_id`. Automatically inherited by `tokio::spawn`ed child tasks
+// (e.g. the upstream stream reader in `handle_responses`), so all log lines
+// within a single request lifecycle share the same short UUID.
+//
+// When unset (e.g. background tasks like `backend_meta_refresh_loop` or
+// startup/shutdown), log lines show `[--------]` as before.
+task_local! {
+    static CONN_ID: Option<String>;
+}
+
+/// Run `f` with a per-connection UUID scope. All `logger::` calls inside `f`
+/// (including spawned sub-tasks) will include the UUID in the log line.
+///
+/// Typically called at the top of each handler:
+/// ```ignore
+/// logger::set_conn_id(&conn_id, async {
+///     // handler body
+/// }).await
+/// ```
+pub async fn set_conn_id<F, R>(conn_id: &str, f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    CONN_ID.scope(Some(conn_id.to_string()), f).await
+}
+
+/// Generate a short 8-char hex UUID for connection/request identification.
+pub fn new_conn_id() -> String {
+    Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+/// Read the current conn_id from the task-local, if set. Returns `None`
+/// when called outside a `set_conn_id` scope (e.g. background tasks).
+///
+/// Used to capture the conn_id before `tokio::spawn` so the spawned task
+/// can re-scope it via `set_conn_id`:
+/// ```ignore
+/// let conn_id = logger::current_conn_id();
+/// tokio::spawn(async move {
+///     if let Some(id) = conn_id {
+///         logger::set_conn_id(&id, async { /* task body */ }).await;
+///     }
+/// });
+/// ```
+pub fn current_conn_id() -> Option<String> {
+    CONN_ID.try_get().ok().flatten()
 }
 
 /// Log levels
@@ -42,6 +95,45 @@ impl LogLevel {
             "debug" => LogLevel::Debug,
             _ => LogLevel::Info,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn new_conn_id_is_8_hex_chars() {
+        let id = new_conn_id();
+        assert_eq!(id.len(), 8);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn new_conn_id_is_unique() {
+        let a = new_conn_id();
+        let b = new_conn_id();
+        assert_ne!(a, b, "two consecutive conn_ids should differ");
+    }
+
+    #[tokio::test]
+    async fn set_conn_id_scopes_correctly() {
+        // Task-locals set via set_conn_id must be visible inside the
+        // scoped future. When the scope exits, the task-local is unset.
+        let conn = "deadbeef";
+        set_conn_id(conn, async {
+            // Read the task-local from within the scope
+            let val = CONN_ID.get();
+            assert_eq!(val.as_deref(), Some(conn));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conn_id_unset_outside_scope() {
+        // When no scope is set, try_get returns Err(AccessError) → None
+        let val = CONN_ID.try_get().ok().flatten();
+        assert_eq!(val, None);
     }
 }
 
@@ -264,9 +356,10 @@ fn write_record(state: &mut LoggerState, rec: LogRecord) {
 
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
     let level_str = format!("{:<5}", rec.level.as_str());
+    let conn = rec.conn_id.as_deref().unwrap_or("--------");
     let line = format!(
-        "[{}] [--------] [{}] [{}] {}\n",
-        timestamp, level_str, rec.module, rec.message
+        "[{}] [{}] [{}] [{}] {}\n",
+        timestamp, conn, level_str, rec.module, rec.message
     );
 
     // Write to file
@@ -293,11 +386,17 @@ fn enqueue(level: LogLevel, module: &str, message: &str) {
         return;
     }
 
+    // Read the per-connection UUID from task-local storage. Falls back to
+    // None when unset (background tasks, startup/shutdown). Uses
+    // try_get to avoid panicking outside a tokio runtime context.
+    let conn_id = CONN_ID.try_get().ok().flatten();
+
     if let Some(sender) = SENDER.get() {
         let record = LogRecord {
             level,
             module: module.to_string(),
             message: message.to_string(),
+            conn_id,
         };
         if sender.try_send(record).is_err() {
             // Channel full or closed — drop and count. Emit stderr only at
@@ -318,10 +417,12 @@ fn enqueue(level: LogLevel, module: &str, message: &str) {
     } else {
         // Logger not initialized — emit directly to stderr as a fallback.
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let conn = conn_id.as_deref().unwrap_or("--------");
         let _ = writeln!(
             io::stderr(),
-            "[{}] [--------] [{}] [{}] {}",
+            "[{}] [{}] [{}] [{}] {}",
             timestamp,
+            conn,
             format_args!("{:<5}", level.as_str()),
             module,
             message

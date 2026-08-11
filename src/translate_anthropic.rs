@@ -503,7 +503,7 @@ fn find_tool_tag_open(buf: &str) -> ToolTagMatch {
             // plain text. validate_angle_opener returning false means it's not
             // a Full match; record it only if it plausibly starts an ident or
             // the tool-call wrapper prefix (`<t...`).
-            if bytes.get(i + 1).map_or(false, |c| is_ident_char(*c as char)) {
+            if bytes.get(i + 1).is_some_and(|c| is_ident_char(*c as char)) {
                 last_angle = Some(i);
             }
         }
@@ -649,7 +649,7 @@ fn validate_angle_opener(buf: &str, pos: usize) -> bool {
         Some(&(_, '\n')) => {
             chars.next();
         }
-        Some(&(byte_idx, c)) if c == '\r' => {
+        Some(&(byte_idx, '\r')) => {
             // Allow CRLF line endings.
             chars.next();
             match chars.peek() {
@@ -1328,7 +1328,7 @@ fn parse_toolcall_body(body: &str) -> Option<ParsedToolCall> {
     // First line is the tool name.
     let nl = body.find('\n')?;
     let name = body[..nl].trim();
-    if name.is_empty() || !name.chars().next().map_or(false, is_ident_char) {
+    if name.is_empty() || !name.chars().next().is_some_and(is_ident_char) {
         return None;
     }
     let name = name.to_string();

@@ -64,24 +64,83 @@ static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": k
 /// tag:fast / tag:coding without needing rayllm_metadata (which the proxy
 /// strips). Falls back to config.yaml `tags` field when the backend is
 /// unreachable.
-async fn fetch_backend_meta() -> std::collections::HashMap<String, ModelBackendMeta> {
+///
+/// The `ericai` CLI normally reads its own MSAL credential cache
+/// (`~/.ericai_authrecord` + MSAL token cache) and, when that is expired or
+/// missing, falls into an interactive QR-login path that *hangs* (no TTY in a
+/// subprocess). To avoid that, we inject the proxy's own freshly-refreshed
+/// access token via the `ERICAI_API_KEY` env var, which the CLI honors as a
+/// direct API-key override and short-circuits the SSO/MSAL path entirely.
+/// The subprocess is also wrapped in a timeout so a hung CLI cannot hold a
+/// tokio task indefinitely.
+async fn fetch_backend_meta(
+    token_mgr: &auth::TokenManager,
+) -> std::collections::HashMap<String, ModelBackendMeta> {
     let mut map = std::collections::HashMap::new();
     let ericai_bin = std::env::var("HOME")
         .ok()
         .map(|h| format!("{}/.local/bin/ericai", h))
         .unwrap_or_else(|| "ericai".to_string());
 
-    let result = tokio::process::Command::new(&ericai_bin)
-        .args(["api", "models.list"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+    // Resolve a fresh access token to inject as ERICAI_API_KEY. If the proxy
+    // itself has no valid token (e.g. not yet authenticated), skip the
+    // subprocess call entirely rather than letting it hang on QR login.
+    let access_token = match token_mgr.get_token().await {
+        Ok(t) => t,
+        Err(e) => {
+            logger::warn(
+                "backend_meta",
+                &format!("No proxy token to pass to ericai CLI ({}) — using config.yaml tags only", e),
+            );
+            return map;
+        }
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&ericai_bin)
+            .args(["api", "models.list"])
+            .env("ERICAI_API_KEY", &access_token)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await;
 
     let output = match result {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => {
-            logger::warn("backend_meta", "Could not fetch ericai api models.list — using config.yaml tags only");
+        Ok(Ok(o)) if o.status.success() => o.stdout,
+        Ok(Ok(o)) => {
+            // Non-zero exit. Log stderr (truncated) for diagnostics without
+            // spamming — this fires at most every 5 min.
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let stderr_trim = stderr.trim();
+            if stderr_trim.is_empty() {
+                logger::warn(
+                    "backend_meta",
+                    &format!("ericai api models.list exited {} — using config.yaml tags only", o.status),
+                );
+            } else {
+                logger::warn(
+                    "backend_meta",
+                    &format!("ericai api models.list exited {}: {} — using config.yaml tags only", o.status, truncate_for_log(stderr_trim, 200)),
+                );
+            }
+            return map;
+        }
+        Ok(Err(e)) => {
+            logger::warn(
+                "backend_meta",
+                &format!("Failed to spawn ericai api models.list ({}) — using config.yaml tags only", e),
+            );
+            return map;
+        }
+        Err(_) => {
+            // Timeout — the CLI hung (typically the QR-login path, which
+            // ERICAI_API_KEY should prevent, but guard against any hang).
+            logger::warn(
+                "backend_meta",
+                "ericai api models.list timed out after 30s — using config.yaml tags only",
+            );
             return map;
         }
     };
@@ -126,6 +185,19 @@ async fn fetch_backend_meta() -> std::collections::HashMap<String, ModelBackendM
     map
 }
 
+/// Truncate a string to `max` chars for inclusion in a log line, appending
+/// an ellipsis if truncated. Keeps warning messages bounded.
+fn truncate_for_log(s: &str, max: usize) -> String {
+    // Truncate by chars, not bytes, to avoid panicking when `max` lands
+    // inside a multi-byte UTF-8 character (e.g. the em-dash used in log
+    // messages or any non-ASCII stderr from the CLI).
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...[truncated]", s.chars().take(max).collect::<String>())
+    }
+}
+
 fn extract_meta(m: &Value, map: &mut std::collections::HashMap<String, ModelBackendMeta>) {
     let mid = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
     if mid.is_empty() || mid.starts_with("tag:") { return; }
@@ -147,9 +219,13 @@ fn extract_meta(m: &Value, map: &mut std::collections::HashMap<String, ModelBack
 }
 
 /// Background task that refreshes backend metadata every 5 minutes.
-async fn backend_meta_refresh_loop(cache: BackendMetaCache, shutdown: tokio_util::sync::CancellationToken) {
+async fn backend_meta_refresh_loop(
+    cache: BackendMetaCache,
+    token_mgr: Arc<auth::TokenManager>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     loop {
-        let new_meta = fetch_backend_meta().await;
+        let new_meta = fetch_backend_meta(&token_mgr).await;
         if !new_meta.is_empty() {
             let count = new_meta.len();
             let mut w = cache.write().await;
@@ -298,8 +374,9 @@ async fn main() {
     ));
     {
         let bm = backend_meta.clone();
+        let tm = token_mgr.clone();
         let st = shutdown_token.clone();
-        tokio::spawn(async move { backend_meta_refresh_loop(bm, st).await; });
+        tokio::spawn(async move { backend_meta_refresh_loop(bm, tm, st).await; });
     }
 
     let state = AppState {
@@ -326,6 +403,7 @@ async fn main() {
         // limit is 2MB, which causes "413 Payload Too Large" errors that
         // manifest as "stream disconnected before completion" in codex.
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB
+        .layer(middleware::from_fn(conn_id_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         // Fallback routes for codex's hardcoded ChatGPT-style base URL
         // (https://chatgpt.com/backend-api/codex). Only used if someone
@@ -555,6 +633,18 @@ fn json_byte_len(v: &Value) -> usize {
             len
         }
     }
+}
+
+// ─── Connection ID Middleware ───────────────────────────────────────────────
+/// Generates a short 8-char UUID per HTTP request and stores it in a
+/// task-local so all `logger::` calls within the request (including
+/// `tokio::spawn`ed sub-tasks) share the same identifier in the log.
+/// For WebSocket upgrades, the conn_id cannot propagate through
+/// `on_upgrade` (it spawns a new task), so the WS handler sets it
+/// manually inside the upgrade closure.
+async fn conn_id_middleware(request: Request, next: Next) -> Response {
+    let conn_id = logger::new_conn_id();
+    logger::set_conn_id(&conn_id, next.run(request)).await
 }
 
 // ─── Auth & Rate Limiting Middleware ─────────────────────────────────────────
@@ -804,8 +894,13 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
         let upstream_cancel = cancel_token.clone();
         let server_shutdown = state.shutdown.clone();
 
+        // Capture conn_id so the spawned task can re-scope it (tokio
+        // task-locals do not propagate into tokio::spawn).
+        let conn_id = logger::current_conn_id();
+
         // Spawn the upstream reader task
         tokio::spawn(async move {
+            let inner = async move {
             let mut stream = byte_stream;
             let mut buffer = String::new();
             // Read cursor: bytes before this offset have already been
@@ -982,16 +1077,24 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
 
           // Send [DONE]
           let events = translator.process_line("data: [DONE]");
-           for event in events {
-               if tx
-                   .send(Ok(axum::body::Bytes::from(event.into_bytes())))
-                   .await
-                   .is_err()
-               {
-                   return;
-               }
-           }
-       });
+          for event in events {
+              if tx
+                  .send(Ok(axum::body::Bytes::from(event.into_bytes())))
+                  .await
+                  .is_err()
+              {
+                  return;
+              }
+          }
+            };
+            // Re-scope the conn_id so log lines in the spawned task
+            // share the same UUID as the parent request handler.
+            if let Some(id) = conn_id {
+                logger::set_conn_id(&id, inner).await;
+            } else {
+                inner.await;
+            }
+        });
 
         // Convert the receiver into a stream for the response body.
         // When the client disconnects, Axum drops the Body, which drops rx,
@@ -1031,10 +1134,11 @@ pub async fn handle_responses_ws(
     ws.on_upgrade(move |mut socket| async move {
         use futures_util::StreamExt;
         // Per-connection UUID for log tracing — distinguishes multiple codex
-        // instances using the proxy simultaneously.
-        let conn_id = uuid::Uuid::new_v4().simple().to_string();
-        let conn_short = &conn_id[..8];
-        logger::info("ws", &format!("[{}] WebSocket connection opened for /v1/responses", conn_short));
+        // instances using the proxy simultaneously. Stored in task-local so
+        // all log calls (including spawned sub-tasks) share it automatically.
+        let conn_short = logger::new_conn_id();
+        logger::set_conn_id(&conn_short, async {
+        logger::info("ws", "WebSocket connection opened for /v1/responses");
 
         // ── Connection-reuse state ─────────────────────────────────────
         // Codex reuses a single WebSocket connection across multiple turns.
@@ -1091,11 +1195,11 @@ pub async fn handle_responses_ws(
             ).await {
                 Ok(Some(Ok(m))) => m,
                 Ok(Some(Err(_))) | Ok(None) => {
-                    logger::info("ws", &format!("[{}] WebSocket closed by client", conn_short));
+                    logger::info("ws", "WebSocket closed by client");
                     break 'connection;
                 }
                 Err(_) => {
-                    logger::info("ws", &format!("[{}] WebSocket idle timeout (300s between turns), closing", conn_short));
+                    logger::info("ws", "WebSocket idle timeout (300s between turns), closing");
                     let _ = socket.close().await;
                     break 'connection;
                 }
@@ -1103,7 +1207,7 @@ pub async fn handle_responses_ws(
 
             // Check if the server is shutting down (SIGINT/SIGTERM received).
             if state.shutdown.is_cancelled() {
-                logger::info("ws", &format!("[{}] Server shutting down, closing WebSocket", conn_short));
+                logger::info("ws", "Server shutting down, closing WebSocket");
                 let _ = socket.close().await;
                 break 'connection;
             }
@@ -1118,7 +1222,7 @@ pub async fn handle_responses_ws(
                 }
                 axum::extract::ws::Message::Pong(_) => continue 'connection,
                 axum::extract::ws::Message::Close(_) => {
-                    logger::info("ws", &format!("[{}] WebSocket close frame received", conn_short));
+                    logger::info("ws", "WebSocket close frame received");
                     break 'connection;
                 }
             };
@@ -1126,7 +1230,7 @@ pub async fn handle_responses_ws(
             let request_json: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(e) => {
-                    logger::error("ws", &format!("[{}] Invalid JSON: {}", conn_short, e));
+                    logger::error("ws", &format!("Invalid JSON: {}", e));
                     let _ = socket.send(axum::extract::ws::Message::Text(
                         format!("{{\"error\":\"Invalid JSON: {}\"}}", e)
                     )).await;
@@ -1151,7 +1255,7 @@ pub async fn handle_responses_ws(
                 // will see `last_response.response_id.is_empty()` and fall back to
                 // sending the full input (ResponseCreate without previous_response_id).
                 // This ensures the first real request includes the complete conversation.
-                logger::info("ws", &format!("[{}] Prewarm request (generate=false), acknowledging with empty response_id", conn_short));
+                logger::info("ws", "Prewarm request (generate=false), acknowledging with empty response_id");
                 let _ = socket.send(axum::extract::ws::Message::Text(
                     r#"{"type":"response.completed","response":{"id":"","status":"completed"}}"#.to_string()
                 )).await;
@@ -1227,8 +1331,8 @@ pub async fn handle_responses_ws(
                     }
 
                     logger::info("ws", &format!(
-                        "[{}] Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
-                        conn_short, prev_id, cached_count, new_count, total_count
+                        "Incremental request: previous_response_id={}, merged {} cached + {} new = {} total items",
+                        prev_id, cached_count, new_count, total_count
                     ));
                 } else {
                     // Cache miss: previous_response_id was evicted (FIFO
@@ -1238,8 +1342,8 @@ pub async fn handle_responses_ws(
                     // Instead, send an explicit 409 error so codex retries
                     // with a full request (no previous_response_id).
                     logger::error("ws", &format!(
-                        "[{}] previous_response_id={} not found in cache — sending 409 to force full retry",
-                        conn_short, prev_id
+                        "previous_response_id={} not found in cache — sending 409 to force full retry",
+                        prev_id
                     ));
                     let err_payload = json!({
                         "type": "error",
@@ -1282,7 +1386,7 @@ pub async fn handle_responses_ws(
             );
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
             if logger::is_enabled(logger::LogLevel::Debug) {
-                logger::debug("ws", &format!("[{}] cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {}", conn_short, cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(), cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0)));
+                logger::debug("ws", &format!("cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {}", cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(), cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0)));
 
                 // Debug: dump message roles and content previews
                 if let Some(msgs) = cc_payload.get("messages").and_then(|m| m.as_array()) {
@@ -1301,7 +1405,7 @@ pub async fn handle_responses_ws(
                             msg_summary.push(format!("  [{}] {}: {}", i, role, preview));
                         }
                     }
-                    logger::debug("ws", &format!("[{}] cc_payload messages:\n{}", conn_short, msg_summary.join("\n")));
+                    logger::debug("ws", &format!("cc_payload messages:\n{}", msg_summary.join("\n")));
                 }
             }
 
@@ -1368,8 +1472,8 @@ pub async fn handle_responses_ws(
                         if debug_on {
                             let new_items: &[String] = &curr_sigs[shared..];
                             logger::debug("ws", &format!(
-                                "[{}] msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
-                                conn_short, shared, new_count, curr_len, new_items.join(", ")
+                                "msg_diff: PURE APPEND | prefix={} new={} total={} | +{}",
+                                shared, new_count, curr_len, new_items.join(", ")
                             ));
                         }
                     } else if kv_break {
@@ -1381,27 +1485,27 @@ pub async fn handle_responses_ws(
                             &curr_sigs[shared..]
                         } else { &[] };
                         logger::warn("ws", &format!(
-                            "[{}] msg_diff: PREFIX CHANGED (KV-cache break!) | shared={} removed={} added={} total={}",
-                            conn_short, shared, removed.len(), added.len(), curr_len
+                            "msg_diff: PREFIX CHANGED (KV-cache break!) | shared={} removed={} added={} total={}",
+                            shared, removed.len(), added.len(), curr_len
                         ));
                         logger::warn("ws", &format!(
-                            "[{}]   removed: [{}]", conn_short, removed.join(", ")
+                            "  removed: [{}]", removed.join(", ")
                         ));
                         logger::warn("ws", &format!(
-                            "[{}]   added:   [{}]", conn_short, added.join(", ")
+                            "  added:   [{}]", added.join(", ")
                         ));
                     } else if prev_len == 0 {
                         // First turn (debug only)
                         if debug_on {
                             logger::debug("ws", &format!(
-                                "[{}] msg_diff: FIRST TURN | total={}", conn_short, curr_len
+                                "msg_diff: FIRST TURN | total={}", curr_len
                             ));
                         }
                     } else if debug_on {
                         // shared == prev_len, new_count == 0 (no change?) or edge case
                         logger::debug("ws", &format!(
-                            "[{}] msg_diff: no change | prev={} curr={} shared={}",
-                            conn_short, prev_len, curr_len, shared
+                            "msg_diff: no change | prev={} curr={} shared={}",
+                            prev_len, curr_len, shared
                         ));
                     }
 
@@ -1423,8 +1527,8 @@ pub async fn handle_responses_ws(
             let estimated_tokens = estimate_tokens(&cc_payload);
             if estimated_tokens as u64 > context_window {
                 logger::warn("ws", &format!(
-                    "[{}] Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
-                    conn_short, estimated_tokens, context_window, model_alias
+                    "Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
+                    estimated_tokens, context_window, model_alias
                 ));
             }
 
@@ -1441,9 +1545,9 @@ pub async fn handle_responses_ws(
            let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
            let url = format!("{}/chat/completions", base_url);
 
-           logger::info("ws", &format!("[{}] WS POST {} model={} stream={}", conn_short, url, backend_model, is_stream));
-            logger::info("ws", &format!("[{}] WS POST {} model={} stream={} input_items={}",
-                conn_short, url, backend_model, is_stream,
+           logger::info("ws", &format!("WS POST {} model={} stream={}", url, backend_model, is_stream));
+            logger::info("ws", &format!("WS POST {} model={} stream={} input_items={}",
+                url, backend_model, is_stream,
                 effective_request_arc.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)));
 
             // Send the request to EricAI.  While waiting for the upstream
@@ -1485,7 +1589,7 @@ pub async fn handle_responses_ws(
             if !resp.status().is_success() {
                 let status = resp.status();
                 let body_text = resp.text().await.unwrap_or_default();
-                logger::error("ws", &format!("[{}] Upstream {}: {}", conn_short, status, logger::extract_error_summary(&body_text, 300)));
+                logger::error("ws", &format!("Upstream {}: {}", status, logger::extract_error_summary(&body_text, 300)));
                 logger::error_request("ws-responses", &cc_payload.to_string(), &body_text, status.as_u16());
                 // Send error in the format codex's parse_wrapped_websocket_error_event expects:
                 //   {"type":"error","status":<code>,"error":{"message":"..."}}
@@ -1558,14 +1662,14 @@ pub async fn handle_responses_ws(
                                     // per upstream SSE line.
                                     if logger::is_enabled(logger::LogLevel::Debug) {
                                         let raw_line: String = buffer[read_pos..pos].chars().take(300).collect();
-                                        logger::debug("ws", &format!("[{}] ← upstream line: {}", conn_short, raw_line));
+                                        logger::debug("ws", &format!("← upstream line: {}", raw_line));
                                     }
                                     read_pos = pos + 1;
                                    for event in events {
                                        stream_event_count += 1;
                                        if logger::is_enabled(logger::LogLevel::Debug) {
                                            let preview: String = event.chars().take(500).collect();
-                                           logger::debug("ws", &format!("[{}] → codex #{} (stream): {}", conn_short, stream_event_count, preview));
+                                           logger::debug("ws", &format!("→ codex #{} (stream): {}", stream_event_count, preview));
                                        }
                                        // In raw JSON mode, process_line returns JSON objects directly.
                                        if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
@@ -1581,7 +1685,7 @@ pub async fn handle_responses_ws(
                                 }
                             }
                             Some(Err(e)) => {
-                                logger::error("ws", &format!("[{}] WS stream error: {}", conn_short, e));
+                                logger::error("ws", &format!("WS stream error: {}", e));
                                 stream_errored = true;
                                 break 'stream;
                             }
@@ -1601,7 +1705,7 @@ pub async fn handle_responses_ws(
                     // Without this, axum 0.7's with_graceful_shutdown waits forever
                     // for upgraded WebSocket connections that never close on their own.
                     _ = state.shutdown.cancelled() => {
-                        logger::info("ws", &format!("[{}] Server shutting down, closing WebSocket during stream", conn_short));
+                        logger::info("ws", "Server shutting down, closing WebSocket during stream");
                         let _ = socket.close().await;
                         break 'connection;
                     }
@@ -1633,8 +1737,8 @@ pub async fn handle_responses_ws(
            // 0 tokens, usage 0%) and the user sees no response.
            if let Some((code, msg)) = translator.upstream_error() {
                logger::error("ws", &format!(
-                   "[{}] Upstream in-stream error (code={}) — sending error event instead of response.completed: {}",
-                   conn_short, code, &msg[..msg.len().min(300)]
+                   "Upstream in-stream error (code={}) — sending error event instead of response.completed: {}",
+                   code, &msg[..msg.len().min(300)]
                ));
                let err_payload = json!({
                    "type": "error",
@@ -1662,7 +1766,7 @@ pub async fn handle_responses_ws(
                    stream_event_count += 1;
                    if logger::is_enabled(logger::LogLevel::Debug) {
                        let preview: String = event.chars().take(500).collect();
-                       logger::debug("ws", &format!("[{}] → codex #{} (flush): {}", conn_short, stream_event_count, preview));
+                       logger::debug("ws", &format!("→ codex #{} (flush): {}", stream_event_count, preview));
                    }
                     if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                         break 'connection; // socket dead
@@ -1675,7 +1779,7 @@ pub async fn handle_responses_ws(
             // treat the turn as successful with no output, leading to degenerate
             // model behavior (pwd/ls commands, 30-token responses, etc.).
             if stream_event_count == 0 {
-                logger::error("ws", &format!("[{}] Upstream stream ended with no content events — sending error instead of response.completed", conn_short));
+                logger::error("ws", "Upstream stream ended with no content events — sending error instead of response.completed");
                 let err_payload = json!({
                     "type": "error",
                     "status": 502,
@@ -1695,7 +1799,7 @@ pub async fn handle_responses_ws(
            // completed response with end_turn=true, and Codex treats the
            // truncated stream as a complete turn.
            if !translator.has_finish_reason() {
-               logger::error("ws", &format!("[{}] Upstream stream ended without finish_reason — sending error instead of response.completed", conn_short));
+               logger::error("ws", "Upstream stream ended without finish_reason — sending error instead of response.completed");
                let err_payload = json!({
                    "type": "error",
                    "status": 502,
@@ -1727,13 +1831,10 @@ pub async fn handle_responses_ws(
                {
                    let events = translator.inject_tool_calls_from_message(&message);
                    if !events.is_empty() {
-                       logger::info(
-                           "ws",
-                           &format!(
-                               "[{}] Recovered a dropped tool call via a non-streaming re-run",
-                               conn_short
-                           ),
-                       );
+                      logger::info(
+                          "ws",
+                          "Recovered a dropped tool call via a non-streaming re-run",
+                      );
                        for event in events {
                            if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                                break 'connection;
@@ -1751,7 +1852,7 @@ pub async fn handle_responses_ws(
             for event in done_events {
                 if logger::is_enabled(logger::LogLevel::Debug) {
                     let preview: String = event.chars().take(500).collect();
-                    logger::debug("ws", &format!("[{}] → codex (DONE flush): {}", conn_short, preview));
+                    logger::debug("ws", &format!("→ codex (DONE flush): {}", preview));
                 }
                 if socket.send(axum::extract::ws::Message::Text(event)).await.is_err() {
                     break 'connection; // socket dead
@@ -1782,7 +1883,7 @@ pub async fn handle_responses_ws(
             //      (same key, just round-trips through the map).
             let output_items = translator.get_output_items();
             if logger::is_enabled(logger::LogLevel::Debug) {
-                logger::debug("ws", &format!("[{}] get_output_items: {} items — types: [{}]", conn_short, output_items.len(), output_items.iter().map(|item| item.get("type").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>().join(", ")));
+                logger::debug("ws", &format!("get_output_items: {} items — types: [{}]", output_items.len(), output_items.iter().map(|item| item.get("type").and_then(|v| v.as_str()).unwrap_or("?")).collect::<Vec<_>>().join(", ")));
             }
             // Drop other strong refs to the cached request Arc BEFORE we
             // take it out of the cache. After these drops, the Arc inside
@@ -1797,8 +1898,8 @@ pub async fn handle_responses_ws(
                         let before_len = input_arr.len();
                         input_arr.extend(output_items);
                         logger::info("ws", &format!(
-                            "[{}] Appended {} assistant output items to cached request (input: {} → {})",
-                            conn_short, input_arr.len() - before_len, before_len, input_arr.len()
+                            "Appended {} assistant output items to cached request (input: {} → {})",
+                            input_arr.len() - before_len, before_len, input_arr.len()
                         ));
                     }
                     // Put the updated Arc back into the cache. The key is
@@ -1810,10 +1911,11 @@ pub async fn handle_responses_ws(
 
             // Turn complete — loop back to recv() the next request on the
             // SAME connection.  No log spam; only log on actual close.
-            logger::debug("ws", &format!("[{}] Turn complete ({} events sent), looping back to recv() next request", conn_short, stream_event_count));
+            logger::debug("ws", &format!("Turn complete ({} events sent), looping back to recv() next request", stream_event_count));
         }
 
-        logger::info("ws", &format!("[{}] WebSocket connection closed", conn_short));
+        logger::info("ws", "WebSocket connection closed");
+        }).await
     })
 }
 
@@ -2102,7 +2204,9 @@ pub async fn handle_chat_completions(
                 let (tx, rx) =
                     mpsc::channel::<Result<axum::body::Bytes, std::convert::Infallible>>(32);
 
+                let conn_id = logger::current_conn_id();
                 tokio::spawn(async move {
+                    let inner = async {
                    let mut stream = stream;
                    let mut buffer = String::new();
                    let mut read_pos: usize = 0;
@@ -2209,9 +2313,15 @@ pub async fn handle_chat_completions(
                           }
                       });
                       let err_event = format!("event: error\ndata: {}\n\n", err_payload);
-                      let _ = tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await;
-                  }
-               });
+                     let _ = tx.send(Ok(axum::body::Bytes::from(err_event.into_bytes()))).await;
+                 }
+                    };
+                    if let Some(id) = conn_id {
+                        logger::set_conn_id(&id, inner).await;
+                    } else {
+                        inner.await;
+                    }
+                });
 
                 let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
                 let body = Body::from_stream(translated_stream);
@@ -2789,7 +2899,9 @@ pub async fn handle_messages(
                 let retry_request = cc_request.clone();
 
                 let model_for_translator = backend_model.clone();
+                let conn_id = logger::current_conn_id();
                 tokio::spawn(async move {
+                    let inner = async {
                     let mut translator =
                         translate_anthropic::AnthropicStreamTranslator::new(&model_for_translator);
                     let mut stream = stream;
@@ -2985,9 +3097,15 @@ pub async fn handle_messages(
                            for event in finish_events {
                                let _ = tx.send(Ok(axum::body::Bytes::from(event))).await;
                            }
-                        }
+                       }
                    }
-               });
+                   };
+                    if let Some(id) = conn_id {
+                        logger::set_conn_id(&id, inner).await;
+                    } else {
+                        inner.await;
+                    }
+                });
 
                 let translated_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
                 let body = Body::from_stream(translated_stream);
@@ -3650,4 +3768,124 @@ fn select_summary_model_from_catalog(state: &AppState) -> String {
     }
 
     "Qwen/Qwen2.5-14B-Instruct-1M".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate_for_log("hello", 200), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate_for_log("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_appends_ellipsis() {
+        let s = "a".repeat(50);
+        let out = truncate_for_log(&s, 10);
+        assert_eq!(out, format!("{}...[truncated]", "a".repeat(10)));
+        assert!(out.len() < s.len());
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        // Multi-byte char: em-dash (3 UTF-8 bytes). Must not panic on
+        // a char-boundary slice and must truncate by chars, not bytes.
+        let s = "a—b—c—d—e—f"; // 11 chars, 17 bytes
+        let out = truncate_for_log(s, 5);
+        assert_eq!(out, "a—b—c...[truncated]");
+    }
+
+    #[test]
+    fn truncate_zero_returns_ellipsis_only() {
+        let out = truncate_for_log("abcdef", 0);
+        assert_eq!(out, "...[truncated]");
+    }
+
+    #[test]
+    fn truncate_empty_string_unchanged() {
+        assert_eq!(truncate_for_log("", 10), "");
+    }
+
+    #[test]
+    fn extract_meta_skips_tag_models() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(&json!({"id": "tag:fast"}), &mut map);
+        assert!(map.is_empty(), "tag: models must be skipped");
+    }
+
+    #[test]
+    fn extract_meta_skips_empty_id() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(&json!({"id": ""}), &mut map);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn extract_meta_collects_tags_and_lifecycle() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(
+            &json!({
+                "id": "zai-org/GLM-5.2-FP8",
+                "rayllm_metadata": {
+                    "engine_config": {
+                        "routing_tags": ["fast", "coding"],
+                        "lifecycle": "prod"
+                    }
+                }
+            }),
+            &mut map,
+        );
+        let meta = map.get("zai-org/GLM-5.2-FP8").expect("model inserted");
+        assert_eq!(meta.routing_tags, vec!["fast".to_string(), "coding".to_string()]);
+        assert_eq!(meta.lifecycle, "prod");
+    }
+
+    #[test]
+    fn extract_meta_ignores_models_without_tags_or_lifecycle() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(&json!({"id": "plain-model", "rayllm_metadata": {"engine_config": {}}}), &mut map);
+        assert!(map.is_empty(), "models without tags/lifecycle must be skipped");
+    }
+
+    #[test]
+    fn extract_meta_missing_rayllm_metadata() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(&json!({"id": "plain-model"}), &mut map);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn extract_meta_only_lifecycle_no_tags() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(
+            &json!({
+                "id": "model-with-lifecycle",
+                "rayllm_metadata": {"engine_config": {"lifecycle": "dev"}}
+            }),
+            &mut map,
+        );
+        let meta = map.get("model-with-lifecycle").expect("model inserted");
+        assert!(meta.routing_tags.is_empty());
+        assert_eq!(meta.lifecycle, "dev");
+    }
+
+    #[test]
+    fn extract_meta_routing_tags_wrong_type_ignored() {
+        let mut map = std::collections::HashMap::new();
+        extract_meta(
+            &json!({
+                "id": "model",
+                "rayllm_metadata": {"engine_config": {"routing_tags": "not-an-array"}}
+            }),
+            &mut map,
+        );
+        assert!(map.is_empty());
+    }
 }
