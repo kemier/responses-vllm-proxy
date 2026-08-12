@@ -8,7 +8,7 @@ vLLM-proxy is a Rust proxy that translates between the OpenAI Responses API (use
 
 | Repo | Path | Description |
 |---|---|---|
-| **ericli** | `../ericli` | vLLM CLI — a Codex CLI alternative that talks to this proxy. Provides `ericli acp` for ACP stdio. Key files: `src/acp/acp-server.ts` (ACP server), `src/core/tool-executor.ts` (tool flow + streaming), `src/vLLM/client.ts` (vLLM streaming client). Install: `bash scripts/install-acp.sh --local`. |
+| **codex-acp** | `../codex-acp` | ACP adapter for Codex CLI that talks to this proxy. Provides ACP stdio support. Key files: `src/acp/acp-server.ts` (ACP server), `src/core/tool-executor.ts` (tool flow + streaming), `src/vLLM/client.ts` (vLLM streaming client). Install: `bash scripts/install-acp.sh --local`. |
 | **vscode-acp** | `../vscode-acp` | VS Code extension implementing the Agent Client Protocol. Renders chat UI, spawns agent binaries via stdio/JSON-RPC. Key files: `src/ui/ChatWebviewProvider.ts` (webview + thought blocks + tool tooltips), `src/core/SessionManager.ts` (session lifecycle, cancel). Deploy: `npm run package && npx vsce package` → install VSIX to `~/.vscode-server/extensions/`. |
 | **codex-acp** | `../codex-acp` | ACP adapter for Codex CLI. The bridge between vscode-acp's JSON-RPC and Codex core. Key files: `src/CodexAcpServer.ts` (ACP server), `src/CodexEventHandler.ts` (reasoning/thought event mapping). |
 | **codex** | `../codex` | Codex CLI core (Rust). The actual agent engine. Key crate: `codex-rs/app-server/`. |

@@ -79,7 +79,7 @@ impl RateLimiter {
 }
 
 /// Per-model concurrency throttle. Prevents the upstream 429 storm observed
-/// when multiple agents (codex-acp, ericli, claude-code-acp, kiro) all hit the
+/// when multiple agents (codex-acp, claude-code-acp, kiro) all hit the
 /// same backend model (e.g. zai-org/GLM-5.2-FP8) with large contexts at once.
 /// `Semaphore::Permit`s are held for the DURATION of each upstream request
 /// (including streaming), so excess requests queue instead of being forwarded
@@ -1167,7 +1167,7 @@ pub async fn handle_responses_ws(
             let backend_model = state.cfg.resolve_model(&model_alias);
 
             // Per-model concurrency throttle — hold spot for the duration of
-            // this turn's upstream call. Multiple codex/ericli/ci instances
+            // this turn's upstream call. Multiple codex/ci instances
             // share the proxy; without this they all forward to the backend
             // simultaneously and GLM-5.2 returns 429 (queue full).
             let _permit = match throttle_model(&state, &backend_model).await {
@@ -2184,7 +2184,7 @@ pub async fn handle_chat_completions(
                    // In-stream error detection: vLLM/TGI backends sometimes return
                    // error objects (e.g. {"error":{"message":"...","code":429}}) as
                    // `data:` lines with no `choices` key. Without this, the
-                   // passthrough forwards them verbatim and the client (ericli)
+                   // passthrough forwards them verbatim and the client
                    // silently skips them, then treats the stream end as a successful
                    // empty response → premature end_turn. When detected, we inject
                    // an SSE error event so the client can retry/fallback.
@@ -2217,7 +2217,7 @@ pub async fn handle_chat_completions(
                                           // Check for in-stream upstream errors BEFORE
                                           // forwarding the line. This mirrors the
                                           // /v1/responses path's extract_upstream_error
-                                          // detection so ericli (which uses this
+                                          // detection so the client (which uses this
                                           // passthrough) gets the same error surfacing
                                           // as codex-acp.
                                           if upstream_error.is_none() {
@@ -2338,7 +2338,7 @@ pub async fn handle_chat_completions(
                       // produced a real answer or tool call. The client would
                       // otherwise see a clean `[DONE]` and treat the turn as
                       // complete (end_turn on a thinking trace). Inject an error
-                      // event instead so ericli/CCR retry: ericli throws on a
+                      // event instead so the client/CCR retry: the client throws on a
                       // `data:` line with an `error` key and falls back to
                       // directChat, whose non-streaming re-run hits the guard
                       // below and returns 502 — triggering model fallback instead

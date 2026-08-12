@@ -1,7 +1,7 @@
 # Model Tags — Fast Model Routing for Subagents
 
 The vLLM-proxy serves capability `tags` on each model in the `/v1/models`
-endpoint. These tags allow downstream clients (ericli, codex) to select
+endpoint. These tags allow downstream clients (codex, claude-code-acp) to select
 fast, cost-efficient models for subagent tasks instead of always inheriting
 the expensive default session model.
 
@@ -77,14 +77,14 @@ response and translates them into the Codex model catalog
 
 The catalog is regenerated on proxy startup and on config.yaml changes.
 
-## Ericli Tag Resolution Integration
+## Tag Resolution Integration
 
-EriCLI's `resolveTag('tag:fast', models)` function reads the `tags` field
+The client's `resolveTag('tag:fast', models)` function reads the `tags` field
 from the proxy response (as a fallback when `rayllm_metadata.routing_tags`
 is absent). Proxy-managed models (with `tags` but no `rayllm_metadata`) are
 marked `ACTIVE` automatically, since the proxy handles backend routing.
 
-See `ericli/docs/SUBAGENT_MODEL_SELECTION.md` for details.
+See the client docs for details.
 
 ## Adding a New Tagged Model
 

@@ -1071,7 +1071,7 @@ fn take_angle_tag_body(
 ///
 /// ```text
 /// <Agent
-/// description: "Check which ericli commits..."
+/// description: "Check which client commits..."
 /// prompt: "..."
 /// tools: "Bash"
 /// ```
@@ -2742,7 +2742,7 @@ mod tests {
     // GLM-5.2 also emits tool calls in the ANGLE form, e.g.:
     //
     //     <Agent
-    //     description: "Check which ericli commits..."
+    //     description: "Check which client commits..."
     //     prompt: "..."
     //     tools: "Bash"
     //
@@ -2758,7 +2758,7 @@ mod tests {
         // Use a literal newline in the JSON content via \n. The blank line
         // (two newlines) after the last attribute terminates the tag.
         let events = run_stream(&[
-            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"find recent client commits\"\ntools: \"Bash\"\n\n"},"finish_reason":"stop"}]}"#,
             r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
             "data: [DONE]",
         ]);
@@ -2774,7 +2774,7 @@ mod tests {
         let json = input_json_for(&events, 1).expect("should have input_json_delta");
         let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
         assert_eq!(parsed["description"], "Check commits");
-        assert_eq!(parsed["prompt"], "find recent ericli commits");
+        assert_eq!(parsed["prompt"], "find recent client commits");
         assert_eq!(parsed["tools"], "Bash");
 
         // stop_reason must be tool_use even though finish_reason was "stop".
@@ -2791,11 +2791,11 @@ mod tests {
     /// terminating blank line.
     #[test]
     fn test_angle_tool_call_split_across_chunks() {
-        let full = "<Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\"\ntools: \"Bash\"\n\n";
+        let full = "<Agent\ndescription: \"Check commits\"\nprompt: \"find recent client commits\"\ntools: \"Bash\"\n\n";
         let slices: &[&str] = &[
             "<Agent\ndescrip",
             "tion: \"Check commits\"\nprom",
-            "pt: \"find recent ericli com",
+            "pt: \"find recent client com",
             "mits\"\ntools: \"Bash\"\n",
             "\n",
         ];
@@ -2823,7 +2823,7 @@ mod tests {
         let json = input_json_for(&events, 1).expect("should have input_json_delta");
         let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
         assert_eq!(parsed["description"], "Check commits");
-        assert_eq!(parsed["prompt"], "find recent ericli commits");
+        assert_eq!(parsed["prompt"], "find recent client commits");
         assert_eq!(parsed["tools"], "Bash");
     }
 
@@ -2835,7 +2835,7 @@ mod tests {
     fn test_angle_tool_call_no_terminator_at_stream_end() {
         // No trailing blank line — the stream just ends after the last attr.
         let events = run_stream(&[
-            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\""},"finish_reason":"stop"}]}"#,
+            r#"data: {"id":"1","model":"test","choices":[{"index":0,"delta":{"content":"<Agent\ndescription: \"Check commits\"\nprompt: \"find recent client commits\""},"finish_reason":"stop"}]}"#,
             r#"data: {"id":"1","model":"test","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
             "data: [DONE]",
         ]);
@@ -2854,7 +2854,7 @@ mod tests {
         let json = input_json_for(&events, 1).expect("should have input_json_delta");
         let parsed: Value = serde_json::from_str(&json).expect("input_json should be valid JSON");
         assert_eq!(parsed["description"], "Check commits");
-        assert_eq!(parsed["prompt"], "find recent ericli commits");
+        assert_eq!(parsed["prompt"], "find recent client commits");
 
         let delta = find_message_delta(&events).expect("should have message_delta");
         let stop_reason = delta
@@ -3047,7 +3047,7 @@ mod tests {
         // Reconstructed from the transcript: prose, then the wrapper opener,
         // tool name "Agent", then colon attributes, NO close tag, NO blank line.
         let content = format!(
-            "I'll launch two parallel investigations: (1) check which ericli commits touch the ACP path, and (2) trace the context-usage growth + post-compaction 50% residual.{}Agent\ndescription: \"Check which ericli commits touch ACP path vs run path\"\nprompt: \"Check these 7 ericli commits in /workspace/git/ezennin/ericli and tell me which touch the ACP server path (src/acp/acp-server.ts) vs the ericli run CI path (src/cli-run/*). Commits: 0cf8310, 51ee75b, 37e4da8.\"\ntools: \"Bash\"\nagent: \"Explore\"\ntool_input: \"Explore\"",
+            "I'll launch two parallel investigations: (1) check which client commits touch the ACP path, and (2) trace the context-usage growth + post-compaction 50% residual.{}Agent\ndescription: \"Check which client commits touch ACP path vs run path\"\nprompt: \"Check these 7 client commits and tell me which touch the ACP server path (src/acp/acp-server.ts) vs the run CI path (src/cli-run/*). Commits: 0cf8310, 51ee75b, 37e4da8.\"\ntools: \"Bash\"\nagent: \"Explore\"\ntool_input: \"Explore\"",
             open
         );
         let content_json = serde_json::to_string(&content).unwrap();
@@ -3080,7 +3080,7 @@ mod tests {
                 if serde_json::from_str::<Value>(&j)
                     .ok()
                     .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()))
-                    == Some("Check which ericli commits touch ACP path vs run path".to_string())
+                    == Some("Check which client commits touch ACP path vs run path".to_string())
                 {
                     json = Some(j);
                     break;
@@ -3149,7 +3149,7 @@ mod tests {
     fn test_wrapper_tool_call_split_across_chunks() {
         let open = tc_open();
         let full = format!(
-            "{}Agent\ndescription: \"Check commits\"\nprompt: \"find recent ericli commits\"\ntools: \"Bash\"\n\n",
+            "{}Agent\ndescription: \"Check commits\"\nprompt: \"find recent client commits\"\ntools: \"Bash\"\n\n",
             open
         );
         // Split awkwardly: opener tag alone, then name+attrs in pieces.
