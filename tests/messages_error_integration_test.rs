@@ -1,6 +1,6 @@
 // Integration tests for /v1/messages when the upstream fails mid-stream.
 //
-// The EricAI backend rejects an oversized request with HTTP 200 and an SSE
+// The backend rejects an oversized request with HTTP 200 and an SSE
 // error event rather than a 4xx status:
 //
 //   event: error
@@ -19,9 +19,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ericai_proxy::main::auth::TokenManager;
-use ericai_proxy::main::config::Config;
-use ericai_proxy::main::{handle_messages, AppState};
+use vllm_proxy::main::config::Config;
+use vllm_proxy::main::{handle_messages, AppState};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -86,12 +85,12 @@ async fn run_messages_full(
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let tmp_dir = unique_tmp_dir("ericai-messages-test");
+    let tmp_dir = unique_tmp_dir("vllm-messages-test");
     let auth_dir = tmp_dir.join("auth");
     std::fs::create_dir_all(&auth_dir).unwrap();
     let expires = chrono::Utc::now() + chrono::Duration::hours(1);
     std::fs::write(
-        auth_dir.join("ericai-ericai-user.json"),
+        auth_dir.join("vllm-user.json"),
         json!({
             "access_token": "test-token",
             "refresh_token": "test-refresh",
@@ -110,8 +109,8 @@ debug: false
 logging-to-file: false
 log-level: "error"
 openai-compatibility:
-  - name: ericai
-    prefix: "ericai/"
+  - name: default
+    prefix: "default/"
     base-url: "http://127.0.0.1:{}"
     models:
       - name: "zai-org/GLM-5.2-FP8"
@@ -126,23 +125,17 @@ openai-compatibility:
     let cfg = Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
     let state = AppState {
         cfg,
-        token_mgr: Arc::new(TokenManager::new(
-            auth_dir.to_str().unwrap(),
-            "https://login.microsoftonline.com/test/oauth2/v2.0/token".to_string(),
-            "test-client-id".to_string(),
-        )),
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap(),
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
-        model_throttle: Arc::new(ericai_proxy::main::ModelThrottle::new(
+        rate_limiter: Arc::new(vllm_proxy::main::RateLimiter::new(0)),
+        model_throttle: Arc::new(vllm_proxy::main::ModelThrottle::new(
             0,
             &std::collections::HashMap::new(),
         )),
-        backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;

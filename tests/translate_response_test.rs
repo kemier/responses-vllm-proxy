@@ -1,4 +1,4 @@
-use ericai_proxy::translate_response::{chat_completion_to_response, ResponseTranslator};
+use vllm_proxy::translate_response::{chat_completion_to_response, ResponseTranslator};
 use serde_json::json;
 
 // ─── ResponseTranslator (streaming) tests ───────────────────────────────────

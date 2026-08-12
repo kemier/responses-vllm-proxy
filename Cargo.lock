@@ -270,29 +270,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "ericai-proxy"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "axum",
- "chrono",
- "futures-util",
- "log",
- "once_cell",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "socket2 0.5.10",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower",
- "tower-http 0.5.2",
- "uuid",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1661,6 +1638,29 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vllm-proxy"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "chrono",
+ "futures-util",
+ "log",
+ "once_cell",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tower-http 0.5.2",
+ "uuid",
+]
 
 [[package]]
 name = "want"

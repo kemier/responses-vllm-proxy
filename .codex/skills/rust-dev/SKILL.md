@@ -1,9 +1,9 @@
 ---
 name: rust-dev
-description: Rust development skill for ericai-proxy. Use when writing, editing, or reviewing Rust code in this repo. Enforces rustfmt, zero clippy warnings, proper logging via logger module, serde_json patterns, and the translation conventions specific to this proxy.
+description: Rust development skill for vLLM-proxy. Use when writing, editing, or reviewing Rust code in this repo. Enforces rustfmt, zero clippy warnings, proper logging via logger module, serde_json patterns, and the translation conventions specific to this proxy.
 ---
 
-# Rust Development — ericai-proxy
+# Rust Development — vLLM-proxy
 
 ## Build & Lint
 

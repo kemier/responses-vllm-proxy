@@ -1,5 +1,5 @@
 [package]
-name = "ericai-proxy"
+name = "vllm-proxy"
 version = "0.1.0"
 edition = "2021"
 

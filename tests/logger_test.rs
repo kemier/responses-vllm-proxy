@@ -1,4 +1,4 @@
-use ericai_proxy::logger;
+use vllm_proxy::logger;
 
 #[test]
 fn test_extract_error_summary_from_json() {

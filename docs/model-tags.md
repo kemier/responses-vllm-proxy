@@ -1,6 +1,6 @@
 # Model Tags — Fast Model Routing for Subagents
 
-The ericai-proxy serves capability `tags` on each model in the `/v1/models`
+The vLLM-proxy serves capability `tags` on each model in the `/v1/models`
 endpoint. These tags allow downstream clients (ericli, codex) to select
 fast, cost-efficient models for subagent tasks instead of always inheriting
 the expensive default session model.
@@ -13,8 +13,8 @@ The `/v1/models` response includes a `tags` field on each model entry:
 {
   "id": "gpt-oss-120b",
   "object": "model",
-  "owned_by": "ericai",
-  "ericai_backend_id": "openai/gpt-oss-120b",
+  "owned_by": "vLLM",
+  "vLLM_backend_id": "openai/gpt-oss-120b",
   "context_length": 131072,
   "tags": ["fast"]
 }
@@ -25,7 +25,7 @@ The `/v1/models` response includes a `tags` field on each model entry:
 Tags are resolved with this priority (in `handle_models`, `src/main.rs`):
 
 1. **Live backend metadata** — `fetch_backend_meta()` calls
-   `ericai api models.list` every 5 minutes and extracts
+   `vLLM api models.list` every 5 minutes and extracts
    `routing_tags` from `rayllm_metadata.engine_config`. Cached in a
    `BackendMetaCache` (RwLock HashMap).
 2. **config.yaml `tags` field** — static fallback when backend metadata is
@@ -36,7 +36,7 @@ Tags are resolved with this priority (in `handle_models`, `src/main.rs`):
 
 ```yaml
 openai-compatibility:
-  - name: ericai
+  - name: vLLM
     models:
       - name: openai/gpt-oss-120b
         alias: gpt-oss-120b
@@ -68,7 +68,7 @@ response and translates them into the Codex model catalog
 (`~/.codex/model_catalog.json`):
 
 1. **Cost-aware descriptions** — Instead of generic `"gpt-oss-120b via
-   EricAI"`, the LLM sees `"gpt-oss-120b — Fast and cost-efficient"`. This
+   vLLM"`, the LLM sees `"gpt-oss-120b — Fast and cost-efficient"`. This
    lets the LLM pick fast models for subagents via the `model` param in
    `spawn_agent`.
 2. **Service tiers** — Fast-tagged models get `service_tiers: [{id:
@@ -90,8 +90,8 @@ See `ericli/docs/SUBAGENT_MODEL_SELECTION.md` for details.
 
 1. Add the model to `config.yaml` with the appropriate `tags`
 2. Copy the updated config to the runtime location:
-   `~/.local/share/ericai-proxy/config.yaml`
-3. Restart the proxy: `~/.local/share/ericai-proxy/start.sh --restart`
+   `~/.local/share/vLLM-proxy/config.yaml`
+3. Restart the proxy: `~/.local/share/vLLM-proxy/start.sh --restart`
 4. The catalog script runs automatically and updates
    `~/.codex/model_catalog.json`
 

@@ -1,6 +1,6 @@
 // Tests for in-stream upstream error handling on the Anthropic path.
 //
-// The EricAI backend rejects an oversized request with HTTP 200 plus an SSE
+// The backend rejects an oversized request with HTTP 200 plus an SSE
 // error event rather than a 4xx:
 //
 //   event: error
@@ -15,8 +15,8 @@
 // abort_for_error() closes the stream without that fallback so the caller can
 // emit a real Anthropic `error` event instead.
 
-use ericai_proxy::main::translate_anthropic::AnthropicStreamTranslator;
-use ericai_proxy::main::translate_response::extract_upstream_error;
+use vllm_proxy::main::translate_anthropic::AnthropicStreamTranslator;
+use vllm_proxy::main::translate_response::extract_upstream_error;
 use serde_json::json;
 
 /// The exact error payload the backend returns for an oversized request.
@@ -112,7 +112,7 @@ fn non_error_json_lines_are_not_mistaken_for_errors() {
 
 // ─── Context-length error parsing ───────────────────────────────────────────
 
-use ericai_proxy::main::translate_response::parse_context_length_error;
+use vllm_proxy::main::translate_response::parse_context_length_error;
 
 #[test]
 fn parses_the_real_backend_context_error() {

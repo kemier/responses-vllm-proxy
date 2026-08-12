@@ -1,5 +1,5 @@
-use ericai_proxy::translate_request::inject_thinking;
-use ericai_proxy::translate_request::responses_to_chat_completions;
+use vllm_proxy::translate_request::inject_thinking;
+use vllm_proxy::translate_request::responses_to_chat_completions;
 use serde_json::{json, Value};
 
 #[test]
@@ -207,7 +207,7 @@ fn test_function_call_unquoted_value_recovers_parameter_name() {
     // history item): the model names the parameter correctly but writes the
     // value as RAW TEXT instead of a JSON string literal — no quotes, literal
     // newlines, unescaped inner quotes.
-    let malformed = "{\"command\": cd /workspace/git/ezennin/ericai-proxy && python3 -c \"\ncontent = open('src/config.rs').read()\n";
+    let malformed = "{\"command\": cd /workspace/git/ezennin/vllm-proxy && python3 -c \"\ncontent = open('src/config.rs').read()\n";
     assert!(
         serde_json::from_str::<serde_json::Value>(malformed).is_err(),
         "fixture must actually be invalid JSON"

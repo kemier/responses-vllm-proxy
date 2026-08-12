@@ -1,4 +1,4 @@
-# ericai-proxy minimal configuration
+# vLLM proxy minimal configuration
 port: 8317
 host: "127.0.0.1"
 debug: false
@@ -7,21 +7,15 @@ auth-dir: "~/.cli-proxy-api"
 # include a valid Bearer token. When empty, authentication is disabled.
 # Generate with: openssl rand -hex 32
 api-keys: []
-# Azure AD credentials — can also be set via env vars (preferred):
-#   ERICAI_TOKEN_ENDPOINT, ERICAI_CLIENT_ID
-token-endpoint: "https://login.microsoftonline.com/92e84ceb-fbfd-47ab-be52-080c6b87953f/oauth2/v2.0/token"
-client-id: "b46aa582-485a-4a7d-b30e-552dbd790b16"
 # Max requests per minute per client IP (0 = unlimited)
 rate-limit-per-minute: 60
 # Max concurrent in-flight requests per backend model (0 = unlimited).
-# Prevents upstream 429 "queue full" storms when multiple agents (codex,
-# ericli, claude-code, kiro) all hit the same model at once. Excess requests
-# queue up to 60s, then get 503 + Retry-After instead of being forwarded.
+# Prevents upstream 429 "queue full" storms when multiple agents all hit
+# the same model at once. Excess requests queue up to 60s, then get 503 +
+# Retry-After instead of being forwarded.
 max-concurrent-per-model: 3
 # Per-model overrides (keyed by backend model ID)
-model-concurrency:
-    zai-org/GLM-5.2-FP8: 2
-    zai-org/GLM-5.1-FP8: 2
+model-concurrency: {}
 request-retry: 3
 
 # Logging
@@ -34,65 +28,23 @@ log-dir: "logs"
 # Set to true to diagnose hallucination caused by missing system prompt on incremental requests.
 log-turn-debug: false
 
+# Standard vLLM OpenAI-compatible server (see https://docs.vllm.ai/en/stable/serving/online_serving/openai_compatible_server/)
+# Start with: vllm serve <model>   (no --api-key = no auth required)
+# The proxy connects with NO Authorization header (standard no-auth vLLM connection).
 openai-compatibility:
-    - name: "ericai"
-      prefix: "ericai"
-      base-url: "https://ray.sero.gic.ericsson.se/backendsso/v1"
+    - name: "default"
+      prefix: "default"
+      base-url: "http://localhost:8000/v1"
       models:
-          - name: zai-org/GLM-5.1-FP8
-            alias: glm-5.1
+          - name: meta-llama/Llama-3.1-8B-Instruct
+            alias: llama-3.1-8b
             context_length: 131072
-            tags: [sota, near_sota, thinking]
-          - name: Qwen/Qwen3-Coder-Next-FP8
-            alias: Qwen3-Coder
-            context_length: 262144
             tags: [fast, coding]
-          - name: XiaomiMiMo/MiMo-V2.5-Pro
-            alias: mimo-v2.5-pro
-            context_length: 131072
-            tags: [sota, near_sota]
-          - name: XiaomiMiMo/MiMo-V2.5
-            alias: mimo-v2.5
-            context_length: 131072
-            tags: [near_sota]
-          - name: moonshotai/Kimi-K2.7-Code
-            alias: kimi-k2.7-code
-            context_length: 262144
-            tags: [sota, near_sota, multimodal]
-          - name: moonshotai/Kimi-K2.6
-            alias: kimi-k2.6
-            context_length: 262144
-            tags: [sota, near_sota, multimodal]
-          - name: zai-org/GLM-5.2-FP8
-            alias: glm-5.2
-            context_length: 196608
-            tags: [sota, near_sota, thinking]
-          - name: deepseek-ai/DeepSeek-V4-Pro
-            alias: deepseek-v4-pro
-            context_length: 262144
-            tags: [near_sota, sota]
-          - name: Qwen/Qwen2.5-14B-Instruct-1M
-            alias: qwen2.5-14b-1m
-            context_length: 1048576
-            tags: [1M]
-          # Fast / coding models for subagents (tag:fast resolution)
-          - name: openai/gpt-oss-120b
-            alias: gpt-oss-120b
-            context_length: 131072
+          - name: Qwen/Qwen2.5-7B-Instruct
+            alias: qwen2.5-7b
+            context_length: 32768
+            tags: [fast, coding]
+          - name: mistralai/Mistral-7B-Instruct-v0.3
+            alias: mistral-7b
+            context_length: 32768
             tags: [fast]
-          - name: Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8
-            alias: Qwen3-Coder-480B
-            context_length: 262144
-            tags: [fast, coding]
-          - name: Qwen/Qwen3.6-27B-FP8
-            alias: Qwen3.6-27B
-            context_length: 131072
-            tags: [fast, multimodal, coding]
-          - name: Qwen/Qwen3.6-35B-A3B-FP8
-            alias: Qwen3.6-35B-A3B
-            context_length: 131072
-            tags: [fast, multimodal, coding]
-          - name: deepseek-ai/DeepSeek-V4-Flash-0731
-            alias: deepseek-v4-flash
-            context_length: 262144
-            tags: [fast, coding]

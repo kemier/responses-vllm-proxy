@@ -1,4 +1,4 @@
-use ericai_proxy::config::Config;
+use vllm_proxy::config::Config;
 
 #[test]
 fn test_load_minimal_config() {
@@ -11,8 +11,8 @@ api_keys: []
 request_retry: 3
 
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com/v1"
     models:
       - name: zai-org/GLM-5.2-FP8
@@ -20,13 +20,13 @@ openai-compatibility:
       - name: deepseek-ai/DeepSeek-V4-Pro
         alias: deepseek-v4-pro
 "#;
-    let path = "/tmp/test_ericai_config.yaml";
+    let path = "/tmp/test_vllm_config.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert_eq!(cfg.port, 8317);
     assert_eq!(cfg.host, "0.0.0.0");
     assert_eq!(cfg.auth_dir, "/tmp/test-auth");
-    assert!(cfg.ericai_provider().is_some());
+    assert!(cfg.provider().is_some());
     let models = cfg.all_models();
     assert_eq!(models.len(), 2);
     assert_eq!(
@@ -48,18 +48,18 @@ fn test_kebab_case_parsing() {
 port: 9999
 auth-dir: "/tmp/test"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://api.example.com"
     models:
       - name: model-1
         alias: m1
 "#;
-    let path = "/tmp/test_ericai_config2.yaml";
+    let path = "/tmp/test_vllm_config2.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert_eq!(
-        cfg.ericai_provider().unwrap().base_url,
+        cfg.provider().unwrap().base_url,
         "https://api.example.com"
     );
 }
@@ -70,14 +70,14 @@ fn test_default_logging_values() {
 port: 8317
 auth-dir: "/tmp/test"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
       - name: m1
         alias: a1
 "#;
-    let path = "/tmp/test_ericai_config3.yaml";
+    let path = "/tmp/test_vllm_config3.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert!(cfg.logging_to_file);
@@ -93,14 +93,14 @@ port: 8317
 debug: true
 auth-dir: "/tmp/test"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
       - name: m1
         alias: a1
 "#;
-    let path = "/tmp/test_ericai_config4.yaml";
+    let path = "/tmp/test_vllm_config4.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert_eq!(cfg.log_level, "debug");
@@ -113,14 +113,14 @@ port: 8317
 auth-dir: "~/.cli-proxy-api"
 log_dir: "logs"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
       - name: m1
         alias: a1
 "#;
-    let path = "/tmp/test_ericai_config5.yaml";
+    let path = "/tmp/test_vllm_config5.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     let home = std::env::var("HOME").unwrap_or("/home/user".to_string());
@@ -128,16 +128,16 @@ openai-compatibility:
 }
 
 #[test]
-fn test_no_ericai_provider() {
+fn test_no_provider() {
     let yaml = r#"
 port: 8317
 auth-dir: "/tmp/test"
 openai-compatibility: []
 "#;
-    let path = "/tmp/test_ericai_config6.yaml";
+    let path = "/tmp/test_vllm_config6.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
-    assert!(cfg.ericai_provider().is_none());
+    assert!(cfg.provider().is_none());
     assert_eq!(cfg.all_models().len(), 0);
 }
 
@@ -151,14 +151,14 @@ logs-max-total-size-mb: 50
 log-level: "debug"
 log-dir: "/tmp/test-logs"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
       - name: m1
         alias: a1
 "#;
-    let path = "/tmp/test_ericai_config7.yaml";
+    let path = "/tmp/test_vllm_config7.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert!(!cfg.logging_to_file);
@@ -173,8 +173,8 @@ fn test_resolve_model_known_alias() {
 port: 8317
 auth-dir: "/tmp/test"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
     - name: zai-org/GLM-5.2-FP8
@@ -182,7 +182,7 @@ openai-compatibility:
     - name: deepseek-ai/DeepSeek-V4-Pro
       alias: deepseek-v4-pro
 "#;
-    let path = "/tmp/test_ericai_resolve1.yaml";
+    let path = "/tmp/test_vllm_resolve1.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     assert_eq!(cfg.resolve_model("glm-5.2"), "zai-org/GLM-5.2-FP8");
@@ -198,14 +198,14 @@ fn test_resolve_model_unknown_alias_no_prefix() {
 port: 8317
 auth-dir: "/tmp/test"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
     - name: m1
       alias: a1
 "#;
-    let path = "/tmp/test_ericai_resolve2.yaml";
+    let path = "/tmp/test_vllm_resolve2.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
     // Unknown alias without prefix returns itself
@@ -213,21 +213,21 @@ openai-compatibility:
 }
 
 #[test]
-fn test_resolve_model_ericai_prefix_stripped() {
+fn test_resolve_model_default_prefix_stripped() {
     let yaml = r#"
 port: 8317
 auth-dir: "/tmp/test"
 openai-compatibility:
-  - name: "ericai"
-    prefix: "ericai"
+  - name: "default"
+    prefix: "default"
     base-url: "https://example.com"
     models:
     - name: m1
       alias: a1
 "#;
-    let path = "/tmp/test_ericai_resolve3.yaml";
+    let path = "/tmp/test_vllm_resolve3.yaml";
     std::fs::write(path, yaml).unwrap();
     let cfg = Config::load(path).unwrap();
-    // ericai/ prefix is stripped for unknown models
-    assert_eq!(cfg.resolve_model("ericai/foo-bar"), "foo-bar");
+    // default/ prefix is stripped for unknown models
+    assert_eq!(cfg.resolve_model("default/foo-bar"), "foo-bar");
 }

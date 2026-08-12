@@ -5,7 +5,7 @@
 //   - AnthropicStreamTranslator (streaming SSE translation)
 //   - chat_completions_to_anthropic (non-streaming response translation)
 
-use ericai_proxy::main::translate_anthropic::{
+use vllm_proxy::main::translate_anthropic::{
     anthropic_to_chat_completions, chat_completions_to_anthropic, AnthropicStreamTranslator,
 };
 use serde_json::{json, Value};

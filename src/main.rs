@@ -1,5 +1,4 @@
 #[allow(clippy::duplicate_mod)]
-pub mod auth;
 #[allow(clippy::duplicate_mod)]
 pub mod config;
 #[allow(clippy::duplicate_mod)]
@@ -32,215 +31,17 @@ use tokio::time::{interval, Duration};
 /// incremental requests. Now it's loaded once and shared via Arc.
 pub type ModelCatalog = Arc<Option<Value>>;
 
-/// Cached backend metadata (routing_tags, lifecycle) fetched from
-/// `ericai api models.list` at startup and refreshed every 5 minutes.
-/// Keyed by backend model ID (e.g. "zai-org/GLM-5.2-FP8").
-type BackendMetaCache = Arc<tokio::sync::RwLock<std::collections::HashMap<String, ModelBackendMeta>>>;
-
-#[derive(Clone, Debug, Default)]
-pub struct ModelBackendMeta {
-    pub routing_tags: Vec<String>,
-    pub lifecycle: String,
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Arc<config::Config>,
-    pub token_mgr: Arc<auth::TokenManager>,
     pub http_client: reqwest::Client,
     pub model_catalog: ModelCatalog,
     pub shutdown: tokio_util::sync::CancellationToken,
     pub rate_limiter: Arc<RateLimiter>,
     pub model_throttle: Arc<ModelThrottle>,
-    pub backend_meta: BackendMetaCache,
 }
 
-/// Pre-allocated SSE keepalive comment bytes — avoids allocating a new
-/// String on every 15-second keepalive tick.
 static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": keepalive\n\n");
-
-/// Fetch model metadata (routing_tags, lifecycle) from the EricAI backend
-/// via `ericai api models.list`. Returns a map keyed by backend model ID.
-/// Used to populate the `tags` field in /v1/models so ericli can resolve
-/// tag:fast / tag:coding without needing rayllm_metadata (which the proxy
-/// strips). Falls back to config.yaml `tags` field when the backend is
-/// unreachable.
-///
-/// The `ericai` CLI normally reads its own MSAL credential cache
-/// (`~/.ericai_authrecord` + MSAL token cache) and, when that is expired or
-/// missing, falls into an interactive QR-login path that *hangs* (no TTY in a
-/// subprocess). To avoid that, we inject the proxy's own freshly-refreshed
-/// access token via the `ERICAI_API_KEY` env var, which the CLI honors as a
-/// direct API-key override and short-circuits the SSO/MSAL path entirely.
-/// The subprocess is also wrapped in a timeout so a hung CLI cannot hold a
-/// tokio task indefinitely.
-async fn fetch_backend_meta(
-    token_mgr: &auth::TokenManager,
-) -> std::collections::HashMap<String, ModelBackendMeta> {
-    let mut map = std::collections::HashMap::new();
-    let ericai_bin = std::env::var("HOME")
-        .ok()
-        .map(|h| format!("{}/.local/bin/ericai", h))
-        .unwrap_or_else(|| "ericai".to_string());
-
-    // Resolve a fresh access token to inject as ERICAI_API_KEY. If the proxy
-    // itself has no valid token (e.g. not yet authenticated), skip the
-    // subprocess call entirely rather than letting it hang on QR login.
-    let access_token = match token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::warn(
-                "backend_meta",
-                &format!("No proxy token to pass to ericai CLI ({}) — using config.yaml tags only", e),
-            );
-            return map;
-        }
-    };
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::process::Command::new(&ericai_bin)
-            .args(["api", "models.list"])
-            .env("ERICAI_API_KEY", &access_token)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output(),
-    )
-    .await;
-
-    let output = match result {
-        Ok(Ok(o)) if o.status.success() => o.stdout,
-        Ok(Ok(o)) => {
-            // Non-zero exit. Log stderr (truncated) for diagnostics without
-            // spamming — this fires at most every 5 min.
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let stderr_trim = stderr.trim();
-            if stderr_trim.is_empty() {
-                logger::warn(
-                    "backend_meta",
-                    &format!("ericai api models.list exited {} — using config.yaml tags only", o.status),
-                );
-            } else {
-                logger::warn(
-                    "backend_meta",
-                    &format!("ericai api models.list exited {}: {} — using config.yaml tags only", o.status, truncate_for_log(stderr_trim, 200)),
-                );
-            }
-            return map;
-        }
-        Ok(Err(e)) => {
-            logger::warn(
-                "backend_meta",
-                &format!("Failed to spawn ericai api models.list ({}) — using config.yaml tags only", e),
-            );
-            return map;
-        }
-        Err(_) => {
-            // Timeout — the CLI hung (typically the QR-login path, which
-            // ERICAI_API_KEY should prevent, but guard against any hang).
-            logger::warn(
-                "backend_meta",
-                "ericai api models.list timed out after 30s — using config.yaml tags only",
-            );
-            return map;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output);
-    // The output is a stream of JSON objects (not a JSON array).
-    // Split on }{ boundaries and parse each.
-    let mut buf = String::new();
-    for line in stdout.lines() {
-        buf.push_str(line);
-        buf.push('\n');
-    }
-    // Try parsing as a single JSON first (some versions return {"data":[...]})
-    if let Ok(parsed) = serde_json::from_str::<Value>(&buf) {
-        let models = parsed.get("data").and_then(|d| d.as_array())
-            .or_else(|| parsed.as_array());
-        if let Some(models) = models {
-            for m in models {
-                extract_meta(m, &mut map);
-            }
-            return map;
-        }
-    }
-    // Fallback: split on object boundaries
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let bytes = buf.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'{' => { if depth == 0 { start = i; } depth += 1; }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Ok(obj) = serde_json::from_slice::<Value>(&bytes[start..=i]) {
-                        extract_meta(&obj, &mut map);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    map
-}
-
-/// Truncate a string to `max` chars for inclusion in a log line, appending
-/// an ellipsis if truncated. Keeps warning messages bounded.
-fn truncate_for_log(s: &str, max: usize) -> String {
-    // Truncate by chars, not bytes, to avoid panicking when `max` lands
-    // inside a multi-byte UTF-8 character (e.g. the em-dash used in log
-    // messages or any non-ASCII stderr from the CLI).
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}...[truncated]", s.chars().take(max).collect::<String>())
-    }
-}
-
-fn extract_meta(m: &Value, map: &mut std::collections::HashMap<String, ModelBackendMeta>) {
-    let mid = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    if mid.is_empty() || mid.starts_with("tag:") { return; }
-    let rayllm = m.get("rayllm_metadata");
-    let engine = rayllm.and_then(|r| r.get("engine_config"));
-    let tags: Vec<String> = engine
-        .and_then(|e| e.get("routing_tags"))
-        .and_then(|t| t.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    let lifecycle = engine
-        .and_then(|e| e.get("lifecycle"))
-        .and_then(|l| l.as_str())
-        .unwrap_or("")
-        .to_string();
-    if !tags.is_empty() || !lifecycle.is_empty() {
-        map.insert(mid.to_string(), ModelBackendMeta { routing_tags: tags, lifecycle });
-    }
-}
-
-/// Background task that refreshes backend metadata every 5 minutes.
-async fn backend_meta_refresh_loop(
-    cache: BackendMetaCache,
-    token_mgr: Arc<auth::TokenManager>,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    loop {
-        let new_meta = fetch_backend_meta(&token_mgr).await;
-        if !new_meta.is_empty() {
-            let count = new_meta.len();
-            let mut w = cache.write().await;
-            *w = new_meta;
-            drop(w);
-            logger::info("backend_meta", &format!("Fetched {} models with routing_tags from backend", count));
-        }
-        // Wait 5 minutes or until shutdown
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
-            _ = shutdown.cancelled() => break,
-        }
-    }
-}
 
 /// Simple per-IP rate limiter using a fixed window.
 /// Prevents abuse when the proxy is network-exposed (CWE-770).
@@ -440,16 +241,11 @@ async fn main() {
         &cfg.log_level,
     );
 
-    if cfg.ericai_provider().is_none() {
-        logger::error("main", "No 'ericai' provider found in config");
+    if cfg.provider().is_none() {
+        logger::error("main", "No provider found in config");
         std::process::exit(1);
     }
 
-    let token_mgr = Arc::new(auth::TokenManager::new(
-        &cfg.auth_dir,
-        cfg.token_endpoint.clone(),
-        cfg.client_id.clone(),
-    ));
     let rate_limiter = Arc::new(RateLimiter::new(cfg.rate_limit_per_minute));
     let model_throttle = Arc::new(ModelThrottle::new(
         cfg.max_concurrent_per_model,
@@ -495,28 +291,13 @@ async fn main() {
     // handlers can close their connections gracefully.
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
-    // Backend metadata cache — fetches routing_tags from `ericai api models.list`
-    // at startup and refreshes every 5 minutes. Used to populate the `tags`
-    // field in /v1/models so ericli can resolve tag:fast / tag:coding.
-    let backend_meta: BackendMetaCache = Arc::new(tokio::sync::RwLock::new(
-        std::collections::HashMap::new()
-    ));
-    {
-        let bm = backend_meta.clone();
-        let tm = token_mgr.clone();
-        let st = shutdown_token.clone();
-        tokio::spawn(async move { backend_meta_refresh_loop(bm, tm, st).await; });
-    }
-
     let state = AppState {
         cfg: cfg.clone(),
-        token_mgr,
         http_client,
         model_catalog,
         shutdown: shutdown_token.clone(),
         rate_limiter,
         model_throttle,
-        backend_meta,
     };
 
     let app = axum::Router::new()
@@ -553,7 +334,7 @@ async fn main() {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     logger::info(
         "main",
-        &format!("ericai-proxy listening on http://{}", addr),
+        &format!("vllm-proxy listening on http://{}", addr),
     );
 
     // Bind with retry — give the old process time to fully release the port.
@@ -848,13 +629,12 @@ async fn auth_middleware(
 // ─── GET /v1/models ─────────────────────────────────────────────────────────
 pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     let all_models = state.cfg.all_models();
-    let backend_meta = state.backend_meta.read().await;
     let mut models: Vec<Value> = Vec::with_capacity(all_models.len());
-    for (alias, name) in &all_models {
+    for (alias, _name) in &all_models {
             // Look up the optional context_length from the config model entry.
             let context_length = state
                 .cfg
-                .ericai_provider()
+                .provider()
                 .and_then(|p| {
                     p.models.iter().find(|m| &m.alias == alias).and_then(|m| m.context_length)
                 });
@@ -862,32 +642,22 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
                 "id": alias,
                 "object": "model",
                 "created": 1700000000,
-                "owned_by": "ericai",
-                "ericai_backend_id": name,
+                "owned_by": "vllm",
             });
             if let Some(ctx) = context_length {
                 entry["context_length"] = json!(ctx);
             }
-            // Pass capability tags so ericli can resolve tag:fast / tag:coding.
-            // Priority: 1) live backend metadata (routing_tags from ericai api models.list)
-            //           2) config.yaml `tags` field (static fallback)
-            let backend_name = state.cfg.resolve_model(alias);
-            let backend_tags = backend_meta.get(&backend_name).map(|m| m.routing_tags.clone());
-            if let Some(tags) = backend_tags.filter(|t| !t.is_empty()) {
-                entry["tags"] = json!(tags);
-            } else if let Some(tags) = state.cfg.model_tags(alias) {
+            if let Some(tags) = state.cfg.model_tags(alias) {
                 entry["tags"] = json!(tags);
             }
             models.push(entry);
     }
-    drop(backend_meta);
-
     Json(json!({"object": "list", "data": models}))
 }
 
 // ─── GET /health ────────────────────────────────────────────────────────────
 pub async fn handle_health() -> impl IntoResponse {
-    Json(json!({"status": "ok", "service": "ericai-proxy"}))
+    Json(json!({"status": "ok", "service": "vllm-proxy"}))
 }
 
 // ─── POST /v1/responses ────────────────────────────────────────────────────
@@ -952,15 +722,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     }
 
     // Get auth token
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::error("auth", &format!("Token error: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -971,7 +733,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     let resp = match state
         .http_client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .header("Accept", "text/event-stream")
         .json(&cc_payload)
         .send()
@@ -1016,8 +778,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
             && needs_noargs_retry(&backend_model);
         let retry_client = state.http_client.clone();
         let retry_url = url.clone();
-        let retry_token = token.clone();
-        let retry_request = cc_payload.clone();
+            let retry_request = cc_payload.clone();
 
         // Use a channel so we can detect client disconnects.  When the
         // client (codex) drops the connection — e.g. when the user clicks
@@ -1046,7 +807,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
             let mut read_pos: usize = 0;
             // SSE keepalive: send a comment line every 15 seconds while
             // waiting for upstream data.  This prevents the HTTP connection
-            // from timing out when EricAI takes a long time to process
+            // from timing out when the backend takes a long time to process
             // large resumed session contexts (60+ seconds).
             let mut sse_keepalive = tokio::time::interval(Duration::from_secs(15));
             sse_keepalive.tick().await; // consume immediate first tick
@@ -1189,7 +950,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
               && translator.should_retry_non_streaming(NOARGS_RETRY_MAX_TEXT)
           {
               if let Some(message) =
-                  retry_non_streaming(&retry_client, &retry_url, &retry_token, &retry_request)
+                  retry_non_streaming(&retry_client, &retry_url, &retry_request)
                       .await
               {
                   let events = translator.inject_tool_calls_from_message(&message);
@@ -1686,17 +1447,7 @@ pub async fn handle_responses_ws(
                 ));
             }
 
-            let token = match state.token_mgr.get_token().await {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = socket.send(axum::extract::ws::Message::Text(
-                        format!("{{\"error\":\"Auth failed: {}\"}}", e)
-                    )).await;
-                    continue 'connection; // keep connection alive for retry
-                }
-            };
-
-           let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+                       let base_url = state.cfg.provider().unwrap().base_url.clone();
            let url = format!("{}/chat/completions", base_url);
 
            logger::info("ws", &format!("WS POST {} model={} stream={}", url, backend_model, is_stream));
@@ -1704,13 +1455,13 @@ pub async fn handle_responses_ws(
                 url, backend_model, is_stream,
                 effective_request_arc.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)));
 
-            // Send the request to EricAI.  While waiting for the upstream
+            // Send the request to the backend.  While waiting for the upstream
             // response headers (which can take 60+ seconds for large resumed
             // sessions), send WebSocket pings every 15 seconds to keep the
             // connection alive and prevent "Connection reset by peer".
             let send_fut = state.http_client
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", token))
+
                 .header("Accept", "text/event-stream")
                 .json(&cc_payload)
                 .send();
@@ -1786,7 +1537,7 @@ pub async fn handle_responses_ws(
             let mut stream_errored = false;
 
             // Keepalive: send WebSocket Ping every 15 seconds to prevent idle timeout
-            // when the upstream (EricAI) takes a long time to process large contexts
+            // when the upstream takes a long time to process large contexts
             // (e.g. session resume with full conversation history).
             let mut ping_interval = interval(Duration::from_secs(15));
             ping_interval.tick().await; // consume immediate first tick
@@ -1978,7 +1729,6 @@ pub async fn handle_responses_ws(
                if let Some(message) = retry_non_streaming(
                    &state.http_client,
                    &url,
-                   &token,
                    &cc_payload,
                )
                .await
@@ -2376,15 +2126,7 @@ pub async fn handle_chat_completions(
         }
     }
 
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::error("chat", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -2395,7 +2137,7 @@ pub async fn handle_chat_completions(
     let resp = state
         .http_client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .header("Accept", "text/event-stream")
         .json(&request_json)
         .send()
@@ -2504,18 +2246,25 @@ pub async fn handle_chat_completions(
                                           } else {
                                               line.to_string()
                                           };
-                                          if thinking_enabled && !pending_done {
+                                          if !pending_done {
                                               // Defer `[DONE]` until the end of the
-                                              // stream so the thinking-only guard can
+                                              // stream so the empty-stream guard can
                                               // inject an error before the client sees
-                                              // a clean completion.
+                                              // a clean completion. This applies to
+                                              // BOTH thinking and non-thinking paths —
+                                              // vLLM sometimes returns a completely
+                                              // empty stream (just [DONE]) on
+                                              // high-context requests, and without
+                                              // deferring [DONE] the client treats it
+                                              // as a successful empty response.
                                               if output.trim() == "data: [DONE]" {
                                                   pending_done = true;
                                                   continue;
                                               }
-                                              // Classify the raw line BEFORE the
-                                              // rewrite so reasoning-only promotion
-                                              // stays distinguishable from real content.
+                                              // Classify the raw line (for both
+                                              // thinking and non-thinking paths) so
+                                              // the end-of-stream guard knows whether
+                                              // any real content/tool_calls were sent.
                                               if let Some(flags) = inspect_chat_delta(line) {
                                                   if flags.has_reasoning {
                                                       saw_reasoning = true;
@@ -2560,10 +2309,10 @@ pub async fn handle_chat_completions(
                               rewrite_reasoning_to_content(remaining)
                           } else {
                               remaining.to_string()
-                          };
-                          if thinking_enabled && !pending_done && output.trim() == "data: [DONE]" {
-                              pending_done = true;
-                          } else {
+                         };
+                         if !pending_done && output.trim() == "data: [DONE]" {
+                             pending_done = true;
+                         } else {
                            let framed = format!("{}\n", output);
                            let _ = tx.send(Ok(axum::body::Bytes::from(framed))).await;
                           }
@@ -2601,7 +2350,23 @@ pub async fn handle_chat_completions(
                       let _ = tx.send(Ok(axum::body::Bytes::from(
                           thinking_only_error_event().into_bytes(),
                       )))
-                      .await;
+                     .await;
+                 } else if !saw_real_content && !saw_tool_calls && !saw_reasoning {
+                     // Completely empty stream: vLLM returned no content deltas,
+                     // no reasoning, no tool_calls — just [DONE]. This happens
+                     // on high-context requests (150K+ tokens) when the model
+                     // fails to generate any output. Without this guard, the
+                     // client sees a clean stream end and treats it as a
+                     // successful empty response → premature end_turn.
+                     // Inject an error so the client retries/falls back.
+                     logger::error(
+                         "chat",
+                         "Empty stream detected (no content, no reasoning, no tool_calls) — injecting error instead of [DONE]",
+                     );
+                     let _ = tx.send(Ok(axum::body::Bytes::from(
+                         thinking_only_error_event().into_bytes(),
+                     )))
+                     .await;
                  } else if pending_done {
                       let _ = tx.send(Ok(axum::body::Bytes::from(
                           "data: [DONE]\n\n".to_string().into_bytes(),
@@ -2711,7 +2476,7 @@ pub async fn handle_chat_completions(
 // ─── POST /v1/embeddings (passthrough) ─────────────────────────────────────
 /// Thin non-streaming passthrough for OpenAI-compatible `/v1/embeddings`.
 ///
-/// The upstream ericai provider already serves embedding models (e.g.
+/// The upstream provider already serves embedding models (e.g.
 /// `BAAI/bge-m3`, `Qwen/Qwen3-Embedding-8B`, `intfloat/e5-mistral-7b-instruct`,
 /// `nomic-ai/nomic-embed-text-v1.5`); this route just exposes them through the
 /// proxy's auth/rate-limit layer so downstream clients (e.g. the TencentDB
@@ -2741,15 +2506,7 @@ pub async fn handle_embeddings(
     let backend_model = state.cfg.resolve_model(&model_alias);
     request_json["model"] = json!(backend_model);
 
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::error("embeddings", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let url = format!("{}/embeddings", base_url);
 
     logger::info(
@@ -2760,7 +2517,7 @@ pub async fn handle_embeddings(
     let resp = state
         .http_client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .json(&request_json)
         .send()
         .await;
@@ -2861,7 +2618,6 @@ fn responses_request_has_zero_parameter_tool(request_json: &Value) -> bool {
 async fn retry_non_streaming(
     client: &reqwest::Client,
     url: &str,
-    token: &str,
     cc_request: &Value,
 ) -> Option<Value> {
     let mut body = cc_request.clone();
@@ -2871,7 +2627,7 @@ async fn retry_non_streaming(
     }
     let resp = client
         .post(url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .json(&body)
         .send()
         .await;
@@ -3012,15 +2768,7 @@ pub async fn handle_messages(
         }
     }
 
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::error("messages", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -3127,7 +2875,7 @@ pub async fn handle_messages(
     let resp = state
         .http_client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .header("Accept", "text/event-stream")
         .json(&cc_request)
         .send()
@@ -3231,8 +2979,7 @@ pub async fn handle_messages(
                     has_zero_parameter_tool(&request_json) && needs_noargs_retry(&backend_model);
                 let retry_client = state.http_client.clone();
                 let retry_url = url.clone();
-                let retry_token = token.clone();
-                let retry_request = cc_request.clone();
+                            let retry_request = cc_request.clone();
 
                 let model_for_translator = backend_model.clone();
                 let conn_id = logger::current_conn_id();
@@ -3409,8 +3156,7 @@ pub async fn handle_messages(
                                if let Some(message) = retry_non_streaming(
                                    &retry_client,
                                    &retry_url,
-                                   &retry_token,
-                                   &retry_request,
+                                       &retry_request,
                                )
                                .await
                                {
@@ -3543,15 +3289,7 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
         translate_request::responses_to_chat_completions(&backend_model, &request_json, false);
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::error("compact", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
     // Context size warning: estimate tokens and log if exceeds model's context window.
@@ -3584,7 +3322,7 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
     let resp = match state
         .http_client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .header("Accept", "text/event-stream")
         .json(&cc_payload)
         .send()
@@ -3738,7 +3476,7 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
 // another session's context as a summary in the current conversation.
 //
 // Model selection strategy:
-//   1. Query the EricAI backend /models endpoint for models with >= 1M
+//   1. Query the backend /models endpoint for models with >= 1M
 //      context. Pick the first one that is loaded/healthy.
 //   2. If no 1M model is available, pick the model with the largest
 //      context_window from the cached model catalog.
@@ -3830,16 +3568,8 @@ Keep the summary under 500 words. Do not include code blocks — describe change
         "temperature": 0.3
     });
 
-    // ── Send to EricAI backend ─────────────────────────────────────────────
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(e) => {
-            logger::error("summarize", &format!("Auth failed: {}", e));
-            return (StatusCode::UNAUTHORIZED, format!("Auth failed: {}", e)).into_response();
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+    // ── Send to backend ───────────────────────────────────────────────────
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -3850,7 +3580,7 @@ Keep the summary under 500 words. Do not include code blocks — describe change
     let resp = match state
         .http_client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .header("Accept", "text/event-stream")
         .json(&cc_payload)
         .send()
@@ -3985,29 +3715,18 @@ Keep the summary under 500 words. Do not include code blocks — describe change
 }
 
 /// Select the best model for summarization.
-/// 1. Query EricAI backend /models for 1M+ context models that are loaded.
+/// 1. Query backend /models for 1M+ context models that are loaded.
 /// 2. Fall back to the largest context_window model from the catalog.
 /// 3. Fall back to the first model in config.
 async fn select_summary_model(state: &AppState) -> String {
     // ── Strategy 1: Query backend for 1M models ───────────────────────────
-    let token = match state.token_mgr.get_token().await {
-        Ok(t) => t,
-        Err(_) => {
-            logger::warn(
-                "summarize",
-                "No token for model query — using catalog fallback",
-            );
-            return select_summary_model_from_catalog(state);
-        }
-    };
-
-    let base_url = state.cfg.ericai_provider().unwrap().base_url.clone();
+        let base_url = state.cfg.provider().unwrap().base_url.clone();
     let models_url = format!("{}/models", base_url);
 
     let resp = state
         .http_client
         .get(&models_url)
-        .header("Authorization", format!("Bearer {}", token))
+
         .send()
         .await;
 
@@ -4109,122 +3828,6 @@ fn select_summary_model_from_catalog(state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn truncate_short_string_unchanged() {
-        assert_eq!(truncate_for_log("hello", 200), "hello");
-    }
-
-    #[test]
-    fn truncate_exact_length_unchanged() {
-        assert_eq!(truncate_for_log("hello", 5), "hello");
-    }
-
-    #[test]
-    fn truncate_long_string_appends_ellipsis() {
-        let s = "a".repeat(50);
-        let out = truncate_for_log(&s, 10);
-        assert_eq!(out, format!("{}...[truncated]", "a".repeat(10)));
-        assert!(out.len() < s.len());
-    }
-
-    #[test]
-    fn truncate_multibyte_does_not_panic() {
-        // Multi-byte char: em-dash (3 UTF-8 bytes). Must not panic on
-        // a char-boundary slice and must truncate by chars, not bytes.
-        let s = "a—b—c—d—e—f"; // 11 chars, 17 bytes
-        let out = truncate_for_log(s, 5);
-        assert_eq!(out, "a—b—c...[truncated]");
-    }
-
-    #[test]
-    fn truncate_zero_returns_ellipsis_only() {
-        let out = truncate_for_log("abcdef", 0);
-        assert_eq!(out, "...[truncated]");
-    }
-
-    #[test]
-    fn truncate_empty_string_unchanged() {
-        assert_eq!(truncate_for_log("", 10), "");
-    }
-
-    #[test]
-    fn extract_meta_skips_tag_models() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(&json!({"id": "tag:fast"}), &mut map);
-        assert!(map.is_empty(), "tag: models must be skipped");
-    }
-
-    #[test]
-    fn extract_meta_skips_empty_id() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(&json!({"id": ""}), &mut map);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn extract_meta_collects_tags_and_lifecycle() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(
-            &json!({
-                "id": "zai-org/GLM-5.2-FP8",
-                "rayllm_metadata": {
-                    "engine_config": {
-                        "routing_tags": ["fast", "coding"],
-                        "lifecycle": "prod"
-                    }
-                }
-            }),
-            &mut map,
-        );
-        let meta = map.get("zai-org/GLM-5.2-FP8").expect("model inserted");
-        assert_eq!(meta.routing_tags, vec!["fast".to_string(), "coding".to_string()]);
-        assert_eq!(meta.lifecycle, "prod");
-    }
-
-    #[test]
-    fn extract_meta_ignores_models_without_tags_or_lifecycle() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(&json!({"id": "plain-model", "rayllm_metadata": {"engine_config": {}}}), &mut map);
-        assert!(map.is_empty(), "models without tags/lifecycle must be skipped");
-    }
-
-    #[test]
-    fn extract_meta_missing_rayllm_metadata() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(&json!({"id": "plain-model"}), &mut map);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn extract_meta_only_lifecycle_no_tags() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(
-            &json!({
-                "id": "model-with-lifecycle",
-                "rayllm_metadata": {"engine_config": {"lifecycle": "dev"}}
-            }),
-            &mut map,
-        );
-        let meta = map.get("model-with-lifecycle").expect("model inserted");
-        assert!(meta.routing_tags.is_empty());
-        assert_eq!(meta.lifecycle, "dev");
-    }
-
-    #[test]
-    fn extract_meta_routing_tags_wrong_type_ignored() {
-        let mut map = std::collections::HashMap::new();
-        extract_meta(
-            &json!({
-                "id": "model",
-                "rayllm_metadata": {"engine_config": {"routing_tags": "not-an-array"}}
-            }),
-            &mut map,
-        );
-        assert!(map.is_empty());
-    }
-
 
     // ─── inspect_chat_delta / thinking-only guard tests ───────────────────
 

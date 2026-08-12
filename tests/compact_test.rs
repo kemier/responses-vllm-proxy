@@ -6,9 +6,8 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ericai_proxy::main::auth::TokenManager;
-use ericai_proxy::main::config::Config;
-use ericai_proxy::main::{handle_compact, AppState};
+use vllm_proxy::main::config::Config;
+use vllm_proxy::main::{handle_compact, AppState};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -79,22 +78,9 @@ async fn run_compact_test(upstream_sse: Vec<String>, request_body: Value) -> (St
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let tmp_dir = unique_tmp_dir("ericai-compact-test");
+    let tmp_dir = unique_tmp_dir("vllm-compact-test");
     let auth_dir = tmp_dir.join("auth");
     std::fs::create_dir_all(&auth_dir).unwrap();
-
-    let token_file = auth_dir.join("ericai-ericai-user.json");
-    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
-    std::fs::write(
-        &token_file,
-        serde_json::json!({
-            "access_token": "test-token",
-            "refresh_token": "test-refresh",
-            "expires_at": expires.to_rfc3339(),
-        })
-        .to_string(),
-    )
-    .unwrap();
 
     let config_yaml = format!(
         r#"
@@ -105,8 +91,8 @@ debug: false
 logging-to-file: false
 log-level: "error"
 openai-compatibility:
-  - name: ericai
-    prefix: "ericai/"
+  - name: default
+    prefix: "default/"
     base-url: "http://127.0.0.1:{}"
     models:
       - name: "zai-org/GLM-5.2-FP8"
@@ -120,11 +106,6 @@ openai-compatibility:
     std::fs::write(&config_path, &config_yaml).unwrap();
 
     let cfg = Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
-    let token_mgr = Arc::new(TokenManager::new(
-        auth_dir.to_str().unwrap(),
-        "https://login.microsoftonline.com/test/oauth2/v2.0/token".to_string(),
-        "test-client-id".to_string(),
-    ));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -132,16 +113,14 @@ openai-compatibility:
 
     let state = AppState {
         cfg: cfg.clone(),
-        token_mgr,
         http_client,
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
-        model_throttle: Arc::new(ericai_proxy::main::ModelThrottle::new(
+        rate_limiter: Arc::new(vllm_proxy::main::RateLimiter::new(0)),
+        model_throttle: Arc::new(vllm_proxy::main::ModelThrottle::new(
             0,
             &std::collections::HashMap::new(),
         )),
-        backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;
@@ -178,22 +157,9 @@ openai-compatibility:
 }
 
 async fn build_app() -> (axum::Router, std::path::PathBuf) {
-    let tmp_dir = unique_tmp_dir("ericai-compact-test-noup");
+    let tmp_dir = unique_tmp_dir("vllm-compact-test-noup");
     let auth_dir = tmp_dir.join("auth");
     std::fs::create_dir_all(&auth_dir).unwrap();
-    let token_file = auth_dir.join("ericai-ericai-user.json");
-    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
-    std::fs::write(
-        &token_file,
-        serde_json::json!({
-            "access_token": "test-token",
-            "refresh_token": "test-refresh",
-            "expires_at": expires.to_rfc3339(),
-        })
-        .to_string(),
-    )
-    .unwrap();
-
     let config_yaml = format!(
         r#"
 port: 0
@@ -203,8 +169,8 @@ debug: false
 logging-to-file: false
 log-level: "error"
 openai-compatibility:
-  - name: ericai
-    prefix: "ericai/"
+  - name: default
+    prefix: "default/"
     base-url: "http://127.0.0.1:9999"
     models:
       - name: "zai-org/GLM-5.2-FP8"
@@ -216,11 +182,6 @@ openai-compatibility:
     std::fs::write(&config_path, &config_yaml).unwrap();
 
     let cfg = Arc::new(Config::load(config_path.to_str().unwrap()).unwrap());
-    let token_mgr = Arc::new(TokenManager::new(
-        auth_dir.to_str().unwrap(),
-        "https://login.microsoftonline.com/test/oauth2/v2.0/token".to_string(),
-        "test-client-id".to_string(),
-    ));
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -228,16 +189,14 @@ openai-compatibility:
 
     let state = AppState {
         cfg,
-        token_mgr,
         http_client,
         model_catalog: std::sync::Arc::new(None),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        rate_limiter: Arc::new(ericai_proxy::main::RateLimiter::new(0)),
-        model_throttle: Arc::new(ericai_proxy::main::ModelThrottle::new(
+        rate_limiter: Arc::new(vllm_proxy::main::RateLimiter::new(0)),
+        model_throttle: Arc::new(vllm_proxy::main::ModelThrottle::new(
             0,
             &std::collections::HashMap::new(),
         )),
-        backend_meta: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;

@@ -1,19 +1,19 @@
-# ericai-proxy
+# vLLM-proxy
 
-Minimal Rust proxy that translates OpenAI Responses API ↔ Chat Completions for EricAI (vLLM backend).
+Minimal Rust proxy that translates OpenAI Responses API ↔ Chat Completions for vLLM (vLLM backend).
 
 ## Architecture
 
 ```
 Codex CLI / vscode-acp (codex-acp)
   └─ Sends OpenAI Responses API requests to localhost:8317
-      └─ ericai-proxy (Rust) translates:
+      └─ vLLM-proxy (Rust) translates:
           ├─ POST /v1/responses → /chat/completions (streaming SSE translation)
           ├─ GET  /v1/responses → WebSocket (same translation over WS)
           ├─ POST /v1/chat/completions → passthrough
           ├─ POST /backend-api/codex/responses/compact → compaction wrapper
           └─ GET  /v1/models → model list from config
-              └─ EricAI vLLM (https://ray.sero.gic.ericsson.se/backendsso/v1)
+              └─ vLLM vLLM (https://localhost:8000/v1/v1)
 ```
 
 ### High-Level Data Flow
@@ -25,7 +25,7 @@ flowchart LR
         ACP[vscode-acp]
     end
 
-    subgraph ericai-proxy
+    subgraph vLLM-proxy
         AX[Axum HTTP/WS Server]
         REQ[translate_request]
         RESP[translate_response]
@@ -33,7 +33,7 @@ flowchart LR
     end
 
     subgraph Backend
-        VLLM[EricAI vLLM<br/>Ray Serve]
+        VLLM[vLLM vLLM<br/>Ray Serve]
     end
 
     CC -->|"POST /v1/responses<br/>Responses API JSON"| AX
@@ -62,7 +62,7 @@ flowchart LR
 #### 1. HTTP SSE (`POST /v1/responses`)
 
 ```
-Codex CLI ──POST /v1/responses──▶ ericai-proxy
+Codex CLI ──POST /v1/responses──▶ vLLM-proxy
   │
   ├─ Parse request JSON, resolve model alias → backend model ID
   ├─ translate_request::responses_to_chat_completions()
@@ -99,7 +99,7 @@ Codex CLI ──POST /v1/responses──▶ ericai-proxy
 The WebSocket transport is the primary path for Codex's stateful, multi-turn sessions:
 
 ```
-Codex ACP ──WS upgrade──▶ ericai-proxy
+Codex ACP ──WS upgrade──▶ vLLM-proxy
   │
   ├─ Per-connection state:
   │    ├─ response_request_cache: HashMap<response_id, Arc<request_json>>  (max 50, FIFO eviction)
@@ -125,7 +125,7 @@ Codex ACP ──WS upgrade──▶ ericai-proxy
 #### 3. Compaction (`POST .../responses/compact`)
 
 ```
-Codex ──POST compact──▶ ericai-proxy
+Codex ──POST compact──▶ vLLM-proxy
   ├─ translate_request → Chat Completions (streaming)
   ├─ POST to upstream, collect all SSE deltas into single text
   └─ Return {object: "response.compaction", output: [{type: "compaction", summary_text: ...}]}
@@ -136,9 +136,9 @@ Codex ──POST compact──▶ ericai-proxy
 ```
                     ┌──────────────────────────────┐
                     │  start.sh (bootstraps token) │
-                    │  ericai.sso_auth.get_token() │
+                    │  vLLM.sso_auth.get_token() │
                     │  → ~/.cli-proxy-api/         │
-                    │    ericai-ericai-user.json   │
+                    │    vLLM-vLLM-user.json   │
                     └──────────┬───────────────────┘
                                │
                     ┌──────────▼───────────────────┐
@@ -167,11 +167,11 @@ Codex ──POST compact──▶ ericai-proxy
                     ┌──────────▼───────────────────┐
                     │  Bearer token in             │
                     │  Authorization header         │
-                    │  → EricAI vLLM backend        │
+                    │  → vLLM vLLM backend        │
                     └──────────────────────────────┘
 ```
 
-- **Token endpoint**: `login.microsoftonline.com` (MSAL OAuth2 v2.0)
+- **Token endpoint**: `login.localhost.com` (MSAL OAuth2 v2.0)
 - **Refresh trigger**: 5 minutes before `expires_at`
 - **Force refresh**: triggered on upstream HTTP 401
 - **Concurrency**: mutex held across check-or-refresh; concurrent callers deduplicate on a single refresh
@@ -187,9 +187,9 @@ Codex ──POST compact──▶ ericai-proxy
 Sequence:
 1. **Stop existing** (`--restart`): kill via PID file, then kill stray processes on port 8317
 2. **Build** (`--rebuild` or binary missing): `cargo build --release`
-3. **Token refresh**: run `ericai.sso_auth.get_token()` via `uv run` in the `lab` repo, extract MSAL refresh token, write to `~/.cli-proxy-api/ericai-ericai-user.json`
+3. **Token refresh**: run `vLLM.sso_auth.get_token()` via `uv run` in the `lab` repo, extract MSAL refresh token, write to `~/.cli-proxy-api/vLLM-vLLM-user.json`
 4. **RAM check**: warn if stale trace logs in `/dev/shm/.session-cache` exceed 200 MB
-5. **Start proxy**: launch binary, write PID to `/tmp/ericai-proxy-$USER.pid`
+5. **Start proxy**: launch binary, write PID to `/tmp/vLLM-proxy-$USER.pid`
 6. **Wait for ready**: poll `/v1/models` until responding
 7. **Catalog generation**: run `scripts/update_catalog.sh`
 8. **Patch codex-acp image capability**: see [Image Capability Patch](#image-capability-patch) below
@@ -199,7 +199,7 @@ Sequence:
 
 `codex-acp` (the ACP server that wraps Codex CLI) hardcodes `promptCapabilities.image: true` in its ACP `initialize` response. This is an agent-level capability that tells ACP clients (vscode-acp, Zed) whether to show the image attach button.
 
-Since EricAI models are typically text-only, the patch flips `image: true` to `image: false` so clients hide the attach button. The patch is **bidirectional** and **catalog-driven**:
+Since vLLM models are typically text-only, the patch flips `image: true` to `image: false` so clients hide the attach button. The patch is **bidirectional** and **catalog-driven**:
 
 1. After catalog generation, `start.sh` checks if **any** model in `~/.codex/model_catalog.json` has `"image"` in its `input_modalities`
 2. If yes: sets `image: true` (at least one model supports images)
@@ -210,7 +210,7 @@ Since EricAI models are typically text-only, the patch flips `image: true` to `i
 
 Per-model granularity (which specific models support images) is handled by the ACP client, not by this patch:
 
-- **vscode-acp**: reads `~/.codex/model_catalog.json` and builds a `modelImageMap` (slug to boolean). Shows/hides the attach button per active model. For Kiro CLI (which doesn't use the EricAI proxy), it uses model name pattern: `claude-*` supports images, all others are text-only.
+- **vscode-acp**: reads `~/.codex/model_catalog.json` and builds a `modelImageMap` (slug to boolean). Shows/hides the attach button per active model. For Kiro CLI (which doesn't use the vLLM proxy), it uses model name pattern: `claude-*` supports images, all others are text-only.
 - **Zed**: reads the same ACP `initialize` response for the agent-level capability.
 
 #### `scripts/update_catalog.sh` — Model Catalog Generation
@@ -219,7 +219,7 @@ Generates `~/.codex/model_catalog.json` — the file Codex reads to know which m
 
 1. **Extract schema** from `codex debug models` (canonical field set — adapts to new Codex versions)
 2. **Fetch proxy models** from `GET /v1/models` (alias list from config)
-3. **Fetch backend metadata** from `ericai api models.list` (context window, health status, GPU info, modalities)
+3. **Fetch backend metadata** from `vLLM api models.list` (context window, health status, GPU info, modalities)
 4. **Filter**: only include models that are `HEALTHY` + `loaded` + `running ≥ 1` replica
 5. **Build entries**: each entry includes slug, display name, context window, reasoning levels (per-model: DeepSeek/GLM/Kimi/MiMo), truncation policy, supported tools
 6. **base_instructions**: includes file link format, code fence discipline, and full apply_patch patch grammar (codex's tool description is only 32 chars — the proxy must supply the grammar)
@@ -232,8 +232,8 @@ Generates `~/.codex/model_catalog.json` — the file Codex reads to know which m
 
 Called every 30s by the `start.sh` watcher. Exits `1` if catalog regeneration is needed.
 
-- Loads current catalog, extracts `ericai_backend_id` set
-- Queries `ericai api models.list` for `HEALTHY` backends
+- Loads current catalog, extracts `vLLM_backend_id` set
+- Queries `vLLM api models.list` for `HEALTHY` backends
 - Detects: catalog models that became **unhealthy** (remove them)
 - Detects: configured models that became **newly healthy** (add them)
 - If any change → exit 1 → watcher calls `update_catalog.sh`
@@ -248,7 +248,7 @@ Called every 30s by the `start.sh` watcher. Exits `1` if catalog regeneration is
 - **Code Mode tool translation**: Codex's Code Mode uses freeform (grammar-based) tools (`exec`, `apply_patch`) that vLLM's Chat Completions API doesn't support. The proxy converts these to standard function tools with a single `input` string parameter. The `wait` tool is a regular `ToolSpec::Function` and passes through unchanged. Model catalog sets `tool_mode: "code_mode"` to enable Code Mode in Codex.
 - **apply_patch grammar in base_instructions**: Codex's `apply_patch` tool description is only 32 chars (`"Use the apply_patch tool to edit files..."`). For OpenAI's hosted GPT-5, the full patch grammar comes from the model's `base_instructions` and the Responses API's grammar-constrained decoding. Since vLLM supports neither, the proxy injects the complete patch grammar into `base_instructions` via `scripts/update_catalog.sh`. The `exec` tool description (~3000 chars) is built dynamically by codex and needs no extra injection.
 - **Image capability patch**: `codex-acp` hardcodes `promptCapabilities.image: true`. `start.sh` patches `dist/index.js` based on the model catalog: if no model supports images, flips to `false`; if any model supports images, sets to `true`. Bidirectional and re-runs on every config change. Per-model granularity is handled by the ACP client (vscode-acp reads the catalog; Kiro uses model name pattern).
-- **KV-cache prefix stability**: The proxy tracks message prefix hashes per turn and logs `KV-cache break!` when the prefix changes. Incremental requests (`previous_response_id`) merge new items into the cached request to preserve prefix stability. vLLM 0.23.0 does not return `prompt_tokens_details.cached_tokens` in API responses, so the proxy logs cache MISS per turn (will auto-detect hits if EricAI upgrades vLLM).
+- **KV-cache prefix stability**: The proxy tracks message prefix hashes per turn and logs `KV-cache break!` when the prefix changes. Incremental requests (`previous_response_id`) merge new items into the cached request to preserve prefix stability. vLLM 0.23.0 does not return `prompt_tokens_details.cached_tokens` in API responses, so the proxy logs cache MISS per turn (will auto-detect hits if vLLM upgrades vLLM).
 
 ## Endpoints
 
@@ -273,7 +273,7 @@ cargo build --release
 
 ```bash
 # Direct
-CONFIG_PATH=./config.yaml ./target/release/ericai-proxy
+CONFIG_PATH=./config.yaml ./target/release/vLLM-proxy
 
 # Via start.sh (builds + token refresh + catalog generation)
 ./start.sh
@@ -281,7 +281,7 @@ CONFIG_PATH=./config.yaml ./target/release/ericai-proxy
 
 ## Config
 
-See `config.yaml` — minimal config with only EricAI provider settings.
+See `config.yaml` — minimal config with only vLLM provider settings.
 
 ## Features
 

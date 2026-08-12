@@ -1,14 +1,14 @@
-# AGENTS.md — ericai-proxy
+# AGENTS.md — vLLM-proxy
 
 ## What This Repo Is
 
-ericai-proxy is a Rust proxy that translates between the OpenAI Responses API (used by Codex CLI) and the Chat Completions API (used by EricAI's vLLM backend). It enables Codex CLI, vscode-acp, and Zed's codex-acp to use EricAI-hosted models (GLM-5.2, Qwen3, Kimi-K2, DeepSeek-V4, etc.) instead of OpenAI's API.
+vLLM-proxy is a Rust proxy that translates between the OpenAI Responses API (used by Codex CLI) and the Chat Completions API (used by vLLM's vLLM backend). It enables Codex CLI, vscode-acp, and Zed's codex-acp to use vLLM-hosted models (GLM-5.2, Qwen3, Kimi-K2, DeepSeek-V4, etc.) instead of OpenAI's API.
 
 ## Related Repositories
 
 | Repo | Path | Description |
 |---|---|---|
-| **ericli** | `../ericli` | EricAI CLI — a Codex CLI alternative that talks to this proxy. Provides `ericli acp` for ACP stdio. Key files: `src/acp/acp-server.ts` (ACP server), `src/core/tool-executor.ts` (tool flow + streaming), `src/ericai/client.ts` (vLLM streaming client). Install: `bash scripts/install-acp.sh --local`. |
+| **ericli** | `../ericli` | vLLM CLI — a Codex CLI alternative that talks to this proxy. Provides `ericli acp` for ACP stdio. Key files: `src/acp/acp-server.ts` (ACP server), `src/core/tool-executor.ts` (tool flow + streaming), `src/vLLM/client.ts` (vLLM streaming client). Install: `bash scripts/install-acp.sh --local`. |
 | **vscode-acp** | `../vscode-acp` | VS Code extension implementing the Agent Client Protocol. Renders chat UI, spawns agent binaries via stdio/JSON-RPC. Key files: `src/ui/ChatWebviewProvider.ts` (webview + thought blocks + tool tooltips), `src/core/SessionManager.ts` (session lifecycle, cancel). Deploy: `npm run package && npx vsce package` → install VSIX to `~/.vscode-server/extensions/`. |
 | **codex-acp** | `../codex-acp` | ACP adapter for Codex CLI. The bridge between vscode-acp's JSON-RPC and Codex core. Key files: `src/CodexAcpServer.ts` (ACP server), `src/CodexEventHandler.ts` (reasoning/thought event mapping). |
 | **codex** | `../codex` | Codex CLI core (Rust). The actual agent engine. Key crate: `codex-rs/app-server/`. |
@@ -18,14 +18,14 @@ ericai-proxy is a Rust proxy that translates between the OpenAI Responses API (u
 ```
 Codex CLI / vscode-acp / Zed codex-acp
   └─ Sends Responses API requests to localhost:8317
-      └─ ericai-proxy (Rust/Axum) translates:
+      └─ vLLM-proxy (Rust/Axum) translates:
           ├─ POST /v1/responses        → HTTP streaming SSE translation
           ├─ GET  /v1/responses        → WebSocket streaming translation
           ├─ POST /v1/chat/completions → passthrough
           |- POST /v1/messages       -> Anthropic Messages API (Claude Code)
           ├─ POST /v1/responses/compact → compaction wrapper
           └─ GET  /v1/models           → model list from config
-              └─ EricAI vLLM (https://ray.sero.gic.ericsson.se/backendsso/v1)
+              └─ vLLM vLLM (https://localhost:8000/v1/v1)
 ```
 
 ## Key Files
@@ -39,7 +39,7 @@ Codex CLI / vscode-acp / Zed codex-acp
 | `src/auth.rs` | Microsoft SSO token management (refresh, caching) |
 | `src/config.rs` | YAML config parsing |
 | `src/logger.rs` | Custom async logger with file rotation and size limits |
-| `scripts/update_catalog.sh` | Regenerates `~/.codex/model_catalog.json` from codex binary schema + EricAI backend metadata |
+| `scripts/update_catalog.sh` | Regenerates `~/.codex/model_catalog.json` from codex binary schema + vLLM backend metadata |
 | `start.sh` | Build, start, restart the proxy; regenerates catalog on startup |
 | `config.yaml` | Proxy configuration (port, auth, model aliases, logging) |
 | `tests/` | Unit tests for translation logic |
@@ -105,7 +105,7 @@ Use conventional commits with gitemojis (Ericsson internal guideline):
 ### KV-Cache Considerations
 - The proxy tracks message prefix changes and logs `KV-cache break!` when the prefix changes between turns
 - Incremental requests (`previous_response_id`) merge new items into cached request to preserve prefix stability
-- vLLM 0.23.0 does not expose per-call cache hit rate — only Prometheus `/metrics` (not exposed by EricAI)
+- vLLM 0.23.0 does not expose per-call cache hit rate — only Prometheus `/metrics` (not exposed by vLLM)
 
 ### Config in `~/.codex/config.toml`
 - `[features]` section: `code_mode = true`, `code_mode_host = true`

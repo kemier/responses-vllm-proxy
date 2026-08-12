@@ -2,7 +2,7 @@
 
 ## Architecture
 
-Claude Code CLI sends Anthropic Messages API requests directly to ericai-proxy (localhost:8317).
+Claude Code CLI sends Anthropic Messages API requests directly to vLLM-proxy (localhost:8317).
 The proxy has a native /v1/messages endpoint that translates Anthropic format to OpenAI Chat
 Completions internally, then translates the streaming SSE response back to Anthropic format.
 
@@ -13,7 +13,7 @@ This eliminates CCR (Claude Code Router) entirely, fixing broken streaming.
 Edit ~/.claude/settings.json:
 - ANTHROPIC_BASE_URL: http://127.0.0.1:8317
 - ANTHROPIC_MODEL: glm-5.2
-- apiKeyHelper: ~/.local/bin/claude-api-key-direct.sh (outputs ericai-proxy)
+- apiKeyHelper: ~/.local/bin/claude-api-key-direct.sh (outputs vLLM-proxy)
 
 Unset ANTHROPIC_API_KEY env var if set (it overrides apiKeyHelper).
 

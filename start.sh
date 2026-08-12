@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start ericai-proxy (Rust) and regenerate Codex model catalog on startup + config changes
+# Start vllm-proxy (Rust) — a standard no-auth vLLM OpenAI-compatible proxy.
 #
 # Usage:
 #   ./start.sh --rebuild  Rebuild then restart
@@ -8,18 +8,15 @@
 #   ./start.sh --build    Build only (do not start the proxy)
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-CATALOG="$HOME/.codex/model_catalog.json"
 PORT=8317
-PIDFILE="/tmp/ericai-proxy-$USER.pid"
-
-LAB_DIR="${LAB_DIR:-/workspace/git/ezennin/lab}"
+PIDFILE="/tmp/vllm-proxy-$USER.pid"
 
 # Resolve the binary: prefer a release build in the source tree (dev mode),
 # otherwise fall back to an installed copy in $DIR/bin (installed mode).
-if [ -f "$DIR/target/release/ericai-proxy" ]; then
-    BIN_PATH="$DIR/target/release/ericai-proxy"
+if [ -f "$DIR/target/release/vllm-proxy" ]; then
+    BIN_PATH="$DIR/target/release/vllm-proxy"
 else
-    BIN_PATH="$DIR/bin/ericai-proxy"
+    BIN_PATH="$DIR/bin/vllm-proxy"
 fi
 
 # ─── Parse args ─────────────────────────────────────────────────────────────
@@ -55,7 +52,7 @@ fi
 
 # ─── Stop existing instance if --restart ────────────────────────────────────
 if [ "$RESTART" = true ]; then
-    echo "Restarting ericai-proxy..."
+    echo "Restarting vllm-proxy..."
 
     # Kill via PID file first
     if [ -f "$PIDFILE" ]; then
@@ -116,7 +113,7 @@ fi
 if [ -f "$PIDFILE" ]; then
     EXISTING_PID=$(cat "$PIDFILE" 2>/dev/null)
     if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
-        echo "ericai-proxy is already running (PID $EXISTING_PID)."
+        echo "vllm-proxy is already running (PID $EXISTING_PID)."
         echo "Use --restart to restart, or kill $EXISTING_PID first."
         exit 1
     fi
@@ -130,7 +127,7 @@ if [ "$REBUILD" = true ] || [ "$BUILD_ONLY" = true ] || [ ! -f "$BIN_PATH" ]; th
 fi
 
 if [ "$NEED_BUILD" = true ]; then
-    echo "Building ericai-proxy (release)..."
+    echo "Building vllm-proxy (release)..."
     cd "$DIR" && cargo build --release || { echo "Build failed!"; exit 1; }
 fi
 
@@ -140,74 +137,12 @@ if [ "$BUILD_ONLY" = true ]; then
     exit 0
 fi
 
-# ─── Refresh EricAI token ───────────────────────────────────────────────────
-echo "Refreshing EricAI token..."
-(cd "$LAB_DIR" && OPENAI_API_KEY="" OPENAI_BASE_URL="" uv run python3 -c "
-import json, os, time
-from ericai.sso_auth import get_token
-from ericai.eri_mix import _get_rt
-token = get_token(failOnInteractiveLogin=True)
-path = os.path.expanduser('~/.cli-proxy-api/ericai-ericai-user.json')
-os.makedirs(os.path.dirname(path), exist_ok=True)
-try:
-    with open(path) as f:
-        data = json.load(f)
-except:
-    data = {}
-data['access_token'] = token
-import base64, json as _json
-payload = token.split('.')[1]
-payload += '=' * (-len(payload) % 4)
-exp = _json.loads(base64.urlsafe_b64decode(payload)).get('exp', int(time.time()) + 3600)
-data['expires_at'] = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(exp))
-data['last_refresh'] = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime())
-# Extract refresh_token from MSAL cache for proxy auto-refresh
-rt = _get_rt()
-if rt and 'secret' in rt:
-    data['refresh_token'] = rt['secret']
-with open(path, 'w') as f:
-    json.dump(data, f, indent=2)
-print(f'Token refreshed (len={len(token)}, rt={\"yes\" if rt else \"no\"})')
-" 2>&1) 
-TOKEN_RC=$?
-if [ $TOKEN_RC -eq 0 ]; then
-    echo "Token synced"
-else
-    echo ""
-   echo "❌ Token refresh failed — MSAL refresh token likely expired (7-day max)."
-   echo "   Re-authenticate with:"
-   echo ""
-    echo "     cd \"$LAB_DIR\" && uv run ericai --ericsson-force-new-access-token"
-   echo ""
-   echo "   Then re-run: ./start.sh"
-    exit 1
-fi
-
-# ─── Warn if stale trace logs in RAM (/dev/shm) are too large ───────────────
-SHM_DIR="/dev/shm/.session-cache"
-if [ -d "$SHM_DIR" ]; then
-    SHM_SIZE=$(du -sk "$SHM_DIR" 2>/dev/null | cut -f1)
-    # 200 MB threshold (204800 KB)
-    if [ -n "$SHM_SIZE" ] && [ "$SHM_SIZE" -gt 204800 ]; then
-        SHM_MB=$((SHM_SIZE / 1024))
-        echo ""
-        echo "⚠️  WARNING: Stale trace logs in RAM (${SHM_DIR}) are using ${SHM_MB} MB"
-        echo "   This grows when codex sessions accumulate without cleanup."
-        echo "   Files:"
-        ls -lh "$SHM_DIR" 2>/dev/null | awk 'NR>1 {printf "     %s  %s\n", $5, $9}'
-        echo ""
-        echo "   To free RAM, kill stale codex processes and clean up:"
-        echo "     pkill -x codex 2>/dev/null; rm -f ${SHM_DIR}/logs_2.sqlite* ${SHM_DIR}/codex-tui.log"
-        echo ""
-    fi
-fi
-
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"
 (cd "$DIR" && "$BIN_PATH") &
 PID=$!
 echo "$PID" > "$PIDFILE"
-echo "ericai-proxy started (PID $PID)"
+echo "vllm-proxy started (PID $PID)"
 
 # Wait for proxy ready
 for i in $(seq 1 10); do
@@ -215,78 +150,9 @@ for i in $(seq 1 10); do
     sleep 0.5
 done
 
-# ─── Initial catalog generation ─────────────────────────────────────────────
-export CATALOG PORT CONFIG_PATH="$DIR/config.yaml"
-"$DIR/scripts/update_catalog.sh" "$LAB_DIR"
-echo "Catalog written to $CATALOG"
-
-patch_codex_acp_image() {
-    # Patch codex-acp dist/index.js based on model catalog: if ANY model
-    # has "image" in input_modalities, set image -> true; otherwise false.
-    # Called at startup and on every config/catalog change.
-    local js="$HOME/.npm-global/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js"
-    if [ ! -f "$js" ]; then return; fi
-    local support
-    support=$(python3 -c "
-import json, os
-try:
-    with open(os.path.expanduser('~/.codex/model_catalog.json')) as f:
-        models = json.load(f)['models']
-    print('true' if any('image' in m.get('input_modalities', []) for m in models) else 'false')
-except:
-    print('true')
-" 2>/dev/null)
-    if [ "$support" = "false" ]; then
-        perl -i -0pe 's/(promptCapabilities:\s*\{\s*embeddedContext:\s*true,\s*)image:\s*(?:true|false)/${1}image: false/s' "$js"
-        echo "Patched codex-acp: image capability -> false (no models support image in catalog)"
-    else
-        perl -i -0pe 's/(promptCapabilities:\s*\{\s*embeddedContext:\s*true,\s*)image:\s*(?:true|false)/${1}image: true/s' "$js"
-        echo "Patched codex-acp: image capability -> true (at least one model supports image in catalog)"
-    fi
-}
-
-patch_codex_acp_image
-
-# ─── Watch config + monitor health ──────────────────────────────────────────
-(
-    LAST_HASH=$(sha256sum "$DIR/config.yaml" 2>/dev/null | cut -d' ' -f1)
-    HEALTH_COUNTER=0
-    while kill -0 $PID 2>/dev/null; do
-        sleep 3
-        REBUILD=0
-
-        # Check config changes
-        NEW_HASH=$(sha256sum "$DIR/config.yaml" 2>/dev/null | cut -d' ' -f1)
-        if [ "$NEW_HASH" != "$LAST_HASH" ]; then
-            LAST_HASH="$NEW_HASH"
-            echo "Config change detected, updating catalog..."
-            sleep 1
-            REBUILD=1
-        fi
-
-        # Check model health every 30s (10 iterations x 3s)
-        HEALTH_COUNTER=$((HEALTH_COUNTER + 1))
-        if [ $HEALTH_COUNTER -ge 10 ]; then
-            HEALTH_COUNTER=0
-            "$DIR/scripts/check_health.sh" "$LAB_DIR" || REBUILD=1
-        fi
-
-        if [ $REBUILD -eq 1 ]; then
-            "$DIR/scripts/update_catalog.sh" "$LAB_DIR"
-            echo "Catalog written to $CATALOG"
-            patch_codex_acp_image
-        fi
-    done
-) &
-WATCHER_PID=$!
-
 # ─── Cleanup on exit ────────────────────────────────────────────────────────
 cleanup() {
     # Wait for the proxy to drain connections after receiving SIGINT/SIGTERM.
-    # Fix 1 in main.rs added with_graceful_shutdown via tokio::signal::ctrl_c(),
-    # so the proxy will finish in-flight requests before exiting. Give it up
-    # to 15s; force-kill if it hangs. The proxy now also handles SIGTERM
-    # (not just SIGINT) and cancels WebSocket connections on shutdown.
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         echo "Waiting for proxy (PID $PID) to drain connections..."
         for i in $(seq 1 30); do
@@ -298,7 +164,6 @@ cleanup() {
             kill -9 "$PID" 2>/dev/null
         fi
     fi
-    kill $WATCHER_PID 2>/dev/null
     rm -f "$PIDFILE"
 }
 trap cleanup EXIT INT TERM

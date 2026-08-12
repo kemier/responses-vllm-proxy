@@ -12,12 +12,6 @@ pub struct Config {
     pub auth_dir: String,
     #[serde(default)]
     pub api_keys: Vec<String>,
-    /// Azure AD token endpoint URL. Override via ERICAI_TOKEN_ENDPOINT env var.
-    #[serde(default)]
-    pub token_endpoint: String,
-    /// Azure AD client/application ID. Override via ERICAI_CLIENT_ID env var.
-    #[serde(default)]
-    pub client_id: String,
     /// Maximum requests per minute per client IP. 0 = unlimited.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
@@ -89,7 +83,7 @@ pub struct OpenAICompatModel {
     pub alias: String,
     #[serde(default)]
     pub context_length: Option<u64>,
-    /// Capability tags for routing (e.g. ["fast", "coding"]). Used by ericli
+    /// Capability tags for routing (e.g. ["fast", "coding"]). Used by clients
     /// to resolve `tag:fast` / `tag:coding` to concrete models when the proxy
     /// is in the path (the proxy strips rayllm_metadata from /v1/models).
     /// Without this, subagents fall back to the session's default model
@@ -111,19 +105,12 @@ impl Config {
         if cfg.log_dir.starts_with('~') {
             cfg.log_dir = shellexpand::tilde(&cfg.log_dir).to_string();
         }
-        // Override credentials from environment variables (more secure than config file)
-        if let Ok(ep) = std::env::var("ERICAI_TOKEN_ENDPOINT") {
-            cfg.token_endpoint = ep;
-        }
-        if let Ok(cid) = std::env::var("ERICAI_CLIENT_ID") {
-            cfg.client_id = cid;
-        }
         if cfg.debug {
             cfg.log_level = "debug".to_string();
         }
         // Build the alias → backend model lookup map once.
         let model_pairs: Vec<(String, String)> = cfg
-            .ericai_provider()
+            .provider()
             .map(|p| {
                 p.models
                     .iter()
@@ -137,22 +124,23 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn ericai_provider(&self) -> Option<&OpenAICompatProvider> {
+    pub fn provider(&self) -> Option<&OpenAICompatProvider> {
         self.openai_compatibility
             .iter()
-            .find(|p| p.name == "ericai")
+            .find(|p| p.name == "default")
+            .or_else(|| self.openai_compatibility.first())
     }
 
     /// Get tags for a model alias (for /v1/models metadata response).
     pub fn model_tags(&self, alias: &str) -> Option<&[String]> {
-        self.ericai_provider()
+        self.provider()
             .and_then(|p| p.models.iter().find(|m| m.alias == alias))
             .and_then(|m| m.tags.as_deref())
     }
 
     pub fn all_models(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        if let Some(p) = self.ericai_provider() {
+        if let Some(p) = self.provider() {
             for m in &p.models {
                 out.push((m.alias.clone(), m.name.clone()));
             }
@@ -161,21 +149,15 @@ impl Config {
     }
 
     /// Resolve a model alias to its backend model ID using the pre-built
-    /// lookup map. Falls back to stripping an `ericai/` prefix, then to
+    /// lookup map. Falls back to stripping a `default/` prefix, then to
     /// the alias itself. This replaces the per-request `all_models()` +
     /// `.find()` pattern on the hot path.
     pub fn resolve_model(&self, alias: &str) -> String {
         if let Some(name) = self.model_lookup.get(alias) {
             return name.clone();
         }
-        if let Some(stripped) = alias.strip_prefix("ericai/") {
+        if let Some(stripped) = alias.strip_prefix("default/") {
             return stripped.to_string();
-        }
-        // Claude Code compatibility: map any unmapped claude-* model to glm-5.2
-        if alias.starts_with("claude-") {
-            if let Some(name) = self.model_lookup.get("glm-5.2") {
-                return name.clone();
-            }
         }
         alias.to_string()
     }

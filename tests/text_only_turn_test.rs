@@ -8,7 +8,7 @@
 // block. The proxy detects the instruction and strips the tools so the
 // backend must answer in prose.
 
-use ericai_proxy::main::is_text_only_turn;
+use vllm_proxy::main::is_text_only_turn;
 use serde_json::json;
 
 /// The exact preamble Claude Code CLI prepends to a compaction prompt.
