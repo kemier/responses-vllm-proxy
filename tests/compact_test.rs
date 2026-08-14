@@ -121,6 +121,7 @@ openai-compatibility:
             0,
             &std::collections::HashMap::new(),
         )),
+        conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;
@@ -197,6 +198,7 @@ openai-compatibility:
             0,
             &std::collections::HashMap::new(),
         )),
+        conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     use axum::routing::post;

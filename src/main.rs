@@ -12,7 +12,7 @@ pub mod translate_response;
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Query, State, WebSocketUpgrade},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State, WebSocketUpgrade},
     http::{header::AUTHORIZATION, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -39,7 +39,27 @@ pub struct AppState {
     pub shutdown: tokio_util::sync::CancellationToken,
     pub rate_limiter: Arc<RateLimiter>,
     pub model_throttle: Arc<ModelThrottle>,
+    /// Maps a peer `SocketAddr` (IP:port — unique per TCP connection) to a
+    /// stable 8-char UUID. All HTTP requests arriving over the SAME TCP
+    /// connection share one UUID, so a burst of `/v1/chat/completions` POSTs
+    /// from one client can be traced as a single logical session.
+    ///
+    /// Without this, `conn_id_middleware` generates a fresh UUID per HTTP
+    /// request, so 11 requests from one connection produce 11 different IDs —
+    /// even though they came from the same client. This cache fixes that.
+    ///
+    /// The map is bounded (see `MAX_CONN_ID_CACHE`) to prevent unbounded
+    /// growth from short-lived connections; stale entries for closed
+    /// connections are harmless (a new connection gets a new port → new UUID).
+    /// Eviction order is unspecified (HashMap does not preserve insertion
+    /// order) — only the size bound is guaranteed.
+    pub conn_id_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
+
+/// Maximum number of peer→UUID entries to keep in `AppState::conn_id_cache`.
+/// Prevents unbounded memory growth from many short-lived TCP connections.
+/// When exceeded, entries are evicted so the map stays bounded.
+const MAX_CONN_ID_CACHE: usize = 1024;
 
 static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": keepalive\n\n");
 
@@ -298,6 +318,7 @@ async fn main() {
         shutdown: shutdown_token.clone(),
         rate_limiter,
         model_throttle,
+        conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = axum::Router::new()
@@ -314,7 +335,7 @@ async fn main() {
         // limit is 2MB, which causes "413 Payload Too Large" errors that
         // manifest as "stream disconnected before completion" in codex.
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB
-        .layer(middleware::from_fn(conn_id_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), conn_id_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         // Fallback routes for codex's hardcoded ChatGPT-style base URL
         // (https://chatgpt.com/backend-api/codex). Only used if someone
@@ -553,8 +574,61 @@ fn json_byte_len(v: &Value) -> usize {
 /// For WebSocket upgrades, the conn_id cannot propagate through
 /// `on_upgrade` (it spawns a new task), so the WS handler sets it
 /// manually inside the upgrade closure.
-async fn conn_id_middleware(request: Request, next: Next) -> Response {
-    let conn_id = logger::new_conn_id();
+/// Resolve the stable per-connection UUID for a peer key (e.g. `SocketAddr`
+/// string). Reuses the existing UUID if the peer is already cached, otherwise
+/// generates a fresh one and caches it. Bounds the cache at
+/// `MAX_CONN_ID_CACHE` entries, evicting arbitrary entries when over the cap
+/// so short-lived connections can't grow the map without limit. The eviction
+/// order is unspecified (std::collections::HashMap does not guarantee
+/// insertion order) — only the bound is guaranteed.
+///
+/// This is a pure function (no I/O) so it can be unit-tested directly.
+fn resolve_conn_id(
+    cache: &mut std::collections::HashMap<String, String>,
+    key: &str,
+) -> String {
+    if let Some(id) = cache.get(key) {
+        return id.clone();
+    }
+    if cache.len() >= MAX_CONN_ID_CACHE {
+        let drop_count = cache.len() - MAX_CONN_ID_CACHE + 1;
+        let keys: Vec<String> = cache.keys().cloned().collect();
+        for k in keys.iter().take(drop_count) {
+            cache.remove(k);
+        }
+    }
+    let id = logger::new_conn_id();
+    cache.insert(key.to_string(), id.clone());
+    id
+}
+
+/// Assigns a per-CONNECTION UUID (keyed by peer `SocketAddr`) to every HTTP
+/// request and stores it in a task-local so all `logger::` calls within the
+/// request (including `tokio::spawn`ed sub-tasks) share the same identifier.
+///
+/// Unlike the original per-REQUEST UUID, requests arriving over the SAME TCP
+/// connection (e.g. a keep-alive burst of `/v1/chat/completions` POSTs) now
+/// share ONE UUID, so a client's rapid request sequence is traceable as a
+/// single logical session.
+///
+/// The peer `SocketAddr` (IP:port) uniquely identifies a TCP connection. A
+/// new connection gets a new port → a new UUID. The cache is bounded by
+/// `MAX_CONN_ID_CACHE` to avoid unbounded growth.
+///
+/// For WebSocket upgrades, the conn_id cannot propagate through `on_upgrade`
+/// (it spawns a new task), so the WS handler sets it manually inside the
+/// upgrade closure (same as before).
+async fn conn_id_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let key = peer.to_string();
+    let conn_id = {
+        let mut cache = state.conn_id_cache.lock().unwrap();
+        resolve_conn_id(&mut cache, &key)
+    };
     logger::set_conn_id(&conn_id, next.run(request)).await
 }
 
@@ -3913,5 +3987,71 @@ mod tests {
             rewrite_reasoning_to_content("data: [DONE]"),
             "data: [DONE]"
         );
+    }
+
+    // --- resolve_conn_id: per-connection UUID ---
+    // The fix for "same connection should have the same UUID" in the
+    // /v1/chat/completions passthrough. `resolve_conn_id` reuses the cached
+    // UUID for the same peer key, so a burst of requests over one TCP
+    // connection shares a single identifier.
+
+    #[test]
+    fn resolve_conn_id_same_key_reuses_uuid() {
+        let mut cache = std::collections::HashMap::new();
+        let key = "127.0.0.1:52341";
+        let first = resolve_conn_id(&mut cache, key);
+        let second = resolve_conn_id(&mut cache, key);
+        // Same connection -> same UUID (the fix).
+        assert_eq!(first, second);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn resolve_conn_id_returns_8_hex_chars() {
+        let mut cache = std::collections::HashMap::new();
+        let id = resolve_conn_id(&mut cache, "10.0.0.1:8080");
+        assert_eq!(id.len(), 8);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "id not hex: {}", id);
+    }
+
+    #[test]
+    fn resolve_conn_id_distinct_keys_get_distinct_uuids() {
+        let mut cache = std::collections::HashMap::new();
+        let a = resolve_conn_id(&mut cache, "127.0.0.1:1000");
+        let b = resolve_conn_id(&mut cache, "127.0.0.1:2000");
+        // Different TCP connections -> different UUIDs.
+        assert_ne!(a, b);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn resolve_conn_id_bounds_cache_at_max() {
+        let mut cache = std::collections::HashMap::new();
+        // Fill past the cap so eviction kicks in.
+        for i in 0..(MAX_CONN_ID_CACHE + 10) {
+            resolve_conn_id(&mut cache, &format!("10.0.0.{}:{}", i % 250, 1000 + i));
+        }
+        // The cache must never exceed the cap.
+        assert!(cache.len() <= MAX_CONN_ID_CACHE, "cache grew to {}", cache.len());
+        // And it should sit right at the cap after eviction+insert.
+        assert_eq!(cache.len(), MAX_CONN_ID_CACHE);
+    }
+
+    #[test]
+    fn resolve_conn_id_evicts_when_over_cap() {
+        // std::collections::HashMap does NOT guarantee insertion order, so we
+        // can't assert which specific key is evicted — only that the cache
+        // stays bounded and the newest key is always present.
+        let mut cache = std::collections::HashMap::new();
+        // Fill past the cap so eviction kicks in.
+        for i in 0..(MAX_CONN_ID_CACHE + 5) {
+            resolve_conn_id(&mut cache, &format!("10.0.2.{}:{}", i % 250, 3000 + i));
+        }
+        // The cache must never exceed the cap.
+        assert!(cache.len() <= MAX_CONN_ID_CACHE);
+        // The most recently inserted key is always retrievable (it was just
+        // added, so it must be present regardless of which entry was evicted).
+        let newest = format!("10.0.2.{}:{}", (MAX_CONN_ID_CACHE + 4) % 250, 3000 + MAX_CONN_ID_CACHE + 4);
+        assert!(cache.contains_key(&newest));
     }
 }
