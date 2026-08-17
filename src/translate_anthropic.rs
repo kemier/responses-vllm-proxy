@@ -6,6 +6,23 @@ use serde_json::{json, Value};
 /// Convert an Anthropic Messages API request body to an OpenAI Chat
 /// Completions request body.
 pub fn anthropic_to_chat_completions(model: &str, body: &Value, stream: bool) -> Value {
+    // Default: assume the target can consume image content (image_url parts).
+    // The /v1/messages handler passes vision_capable=false for models without
+    // the `multimodal` routing tag so images are stripped before the backend
+    // rejects the request with a 500.
+    anthropic_to_chat_completions_with_vision(model, body, stream, true)
+}
+
+/// Same as [`anthropic_to_chat_completions`] but lets the caller control
+/// whether image blocks are forwarded as OpenAI `image_url` content parts.
+/// When `vision_capable` is false, image blocks are dropped (the backend has
+/// no vision encoder and returns HTTP 500 "not a multimodal model").
+pub fn anthropic_to_chat_completions_with_vision(
+    model: &str,
+    body: &Value,
+    stream: bool,
+    vision_capable: bool,
+) -> Value {
     let mut out = json!({
         "model": model,
         "messages": [],
@@ -47,10 +64,48 @@ pub fn anthropic_to_chat_completions(model: &str, body: &Value, stream: bool) ->
         }
     }
 
-    // Convert messages
+    // Convert messages. Claude Code CLI sometimes sends `system`-role messages
+    // INSIDE `messages` (e.g. the "Available agent types for the Agent tool"
+    // block injected mid-conversation when spawning a subagent). vLLM rejects
+    // any request where the first message is not the system message
+    // ("System message must be at the beginning."), so stray system messages
+    // must be merged into the leading system message (or hoisted to index 0)
+    // rather than emitted in place.
     if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
+        let mut system_buf: Vec<String> = Vec::new();
         for msg in msgs {
-            convert_anthropic_message(msg, messages);
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            if role == "system" {
+                let text = msg
+                    .get("content")
+                    .map(extract_text_from_content)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    system_buf.push(text);
+                }
+                continue;
+            }
+            convert_anthropic_message(msg, messages, vision_capable);
+        }
+        if !system_buf.is_empty() {
+            let sys_text = system_buf.join("\n\n");
+            let sys = json!({"role": "system", "content": sys_text});
+            match messages
+                .iter_mut()
+                .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+            {
+                Some(existing) => {
+                    let cur = existing["content"].as_str().unwrap_or("");
+                    existing["content"] = json!(if cur.is_empty() {
+                        sys_text
+                    } else {
+                        format!("{}\n\n{}", cur, sys_text)
+                    });
+                }
+                None => {
+                    messages.insert(0, sys);
+                }
+            }
         }
     }
 
@@ -91,8 +146,12 @@ pub fn anthropic_to_chat_completions(model: &str, body: &Value, stream: bool) ->
     if let Some(tc) = body.get("tool_choice") {
         if let Some(tc_str) = tc.as_str() {
             match tc_str {
-                "auto" => { out["tool_choice"] = json!("auto"); }
-                "any" => { out["tool_choice"] = json!("required"); }
+                "auto" => {
+                    out["tool_choice"] = json!("auto");
+                }
+                "any" => {
+                    out["tool_choice"] = json!("required");
+                }
                 _ => {}
             }
         } else if let Some(tc_obj) = tc.as_object() {
@@ -127,7 +186,7 @@ fn extract_text_from_content(content: &Value) -> String {
 }
 
 /// Convert a single Anthropic message to one or more OpenAI messages.
-fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
+fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>, vision_capable: bool) {
     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
 
     match msg.get("content") {
@@ -154,8 +213,8 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                             // rejects the whole request with HTTP 400
                             // ("Assistant tool call function.arguments must
                             // be valid JSON.") if it is not valid JSON.
-                            let arguments = serde_json::to_string(&input)
-                                .unwrap_or_else(|_| "{}".to_string());
+                            let arguments =
+                                serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
                             let arguments = if arguments.trim().is_empty() {
                                 "{}".to_string()
                             } else {
@@ -174,16 +233,27 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                     }
                 }
 
-                let content = if text_parts.is_empty() { Value::Null } else { json!(text_parts.join("\n")) };
+                let content = if text_parts.is_empty() {
+                    Value::Null
+                } else {
+                    json!(text_parts.join("\n"))
+                };
                 let mut assistant_msg = json!({"role": "assistant", "content": content});
                 if !tool_calls.is_empty() {
                     assistant_msg["tool_calls"] = json!(tool_calls);
                 }
                 messages.push(assistant_msg);
             } else {
-                // User message — may contain text and tool_result blocks
+                // User message — may contain text, image and tool_result blocks
                 let mut text_parts = Vec::new();
                 let mut tool_results: Vec<(String, String)> = Vec::new();
+                // Image blocks (Anthropic base64 source) are forwarded to the
+                // backend as OpenAI `image_url` content parts (data: URL). The
+                // backend vLLM accepts these for vision-capable models; for
+                // text-only models we still emit them and let the backend's
+                // chat template ignore/downcast them (same behavior as the
+                // Responses path's `input_image` handling).
+                let mut image_parts: Vec<Value> = Vec::new();
 
                 for block in blocks {
                     match block.get("type").and_then(|v| v.as_str()) {
@@ -192,9 +262,46 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                                 text_parts.push(text.to_string());
                             }
                         }
+                        Some("image") => {
+                            // Anthropic image block:
+                            //   { "type": "image", "source": { "type": "base64",
+                            //     "media_type": "image/png", "data": "..." } }
+                            // Non-vision models have no vision encoder: sending
+                            // image_url parts to a text-only backend returns a
+                            // hard 500 ("not a multimodal model"), so drop the
+                            // image. Same policy as the Responses path and
+                            // ericli's isVisionCapable guard.
+                            if vision_capable {
+                                if let Some(source) = block.get("source") {
+                                    if source.get("type").and_then(|v| v.as_str()) == Some("base64")
+                                    {
+                                        let media_type = source
+                                            .get("media_type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("image/png");
+                                        if let Some(data) =
+                                            source.get("data").and_then(|v| v.as_str())
+                                        {
+                                            let data_url =
+                                                format!("data:{};base64,{}", media_type, data);
+                                            image_parts.push(json!({
+                                                "type": "image_url",
+                                                "image_url": {"url": data_url}
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Some("tool_result") => {
-                            let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                            let content = block.get("content").map(extract_text_from_content).unwrap_or_default();
+                            let tool_use_id = block
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let content = block
+                                .get("content")
+                                .map(extract_text_from_content)
+                                .unwrap_or_default();
                             tool_results.push((tool_use_id.to_string(), content));
                         }
                         _ => {}
@@ -202,12 +309,35 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>) {
                 }
 
                 for (tool_use_id, content) in &tool_results {
-                    messages.push(json!({"role": "tool", "tool_call_id": tool_use_id, "content": content}));
+                    messages.push(
+                        json!({"role": "tool", "tool_call_id": tool_use_id, "content": content}),
+                    );
                 }
                 if !text_parts.is_empty() {
                     messages.push(json!({"role": role, "content": text_parts.join("\n")}));
                 }
-                if text_parts.is_empty() && tool_results.is_empty() {
+                let has_images = !image_parts.is_empty();
+                if has_images {
+                    // Merge trailing text into the image content array so the
+                    // backend sees one multimodal user message, matching the
+                    // OpenAI vision convention. Example:
+                    //   { "role":"user", "content":[{"type":"text","text":"..."},
+                    //     {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}] }
+                    let mut content_parts = image_parts;
+                    if let Some(last) = messages.last_mut() {
+                        if last.get("role").and_then(|v| v.as_str()) == Some(role)
+                            && last.get("content").and_then(|v| v.as_str()).is_some()
+                        {
+                            let text = last["content"].take().as_str().unwrap_or("").to_string();
+                            if !text.is_empty() {
+                                content_parts.insert(0, json!({"type": "text", "text": text}));
+                            }
+                            messages.pop();
+                        }
+                    }
+                    messages.push(json!({"role": role, "content": content_parts}));
+                }
+                if text_parts.is_empty() && tool_results.is_empty() && !has_images {
                     messages.push(json!({"role": role, "content": ""}));
                 }
             }
@@ -267,7 +397,10 @@ fn strip_placeholder_arg(arguments: &str) -> String {
 /// optional throwaway property — see [`NOARGS_PLACEHOLDER`].
 fn convert_anthropic_tool(tool: &Value, add_noargs_placeholder: bool) -> Option<Value> {
     let name = tool.get("name").and_then(|v| v.as_str())?;
-    let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let description = tool
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let mut input_schema = tool.get("input_schema").cloned().unwrap_or(json!({}));
     if add_noargs_placeholder {
         let has_properties = input_schema
@@ -564,7 +697,6 @@ fn opener_hold_suffix(buf: &str) -> usize {
     }
     0
 }
-
 
 /// if it looks like a tag opener. We require: `[`, ≥1 ident char (name),
 /// whitespace, ≥1 ident char (first attr key), then `=`. This is strict enough
@@ -967,11 +1099,7 @@ fn parse_tool_tag_body(body: &str) -> Option<ParsedToolCall> {
 /// the opener + body together into `body` here. Returns `Closed` once a
 /// terminator is reached (terminator NOT consumed unless it's a blank line),
 /// or `Pending` when more input is needed.
-fn take_angle_tag_body(
-    buf: &mut String,
-    body: &mut String,
-    in_string: &mut bool,
-) -> TagBodyResult {
+fn take_angle_tag_body(buf: &mut String, body: &mut String, in_string: &mut bool) -> TagBodyResult {
     let bytes = buf.as_bytes();
     let mut consumed = 0usize;
     let mut i = 0usize;
@@ -1220,11 +1348,7 @@ fn unquote_angle_value(inner: &str) -> String {
 ///
 /// Quoted values may contain newlines, so we honor `in_string` while scanning.
 /// Returns `Pending` when more input is needed.
-fn take_toolcall_body(
-    buf: &mut String,
-    body: &mut String,
-    in_string: &mut bool,
-) -> TagBodyResult {
+fn take_toolcall_body(buf: &mut String, body: &mut String, in_string: &mut bool) -> TagBodyResult {
     let bytes = buf.as_bytes();
     let mut consumed = 0usize;
     let mut i = 0usize;
@@ -1250,9 +1374,7 @@ fn take_toolcall_body(
         }
         // Check for the close tag at this position (only meaningful once we
         // have a body past the opener + name).
-        if !body.is_empty()
-            && buf[i..].starts_with(TOOL_CALL_CLOSE_TAG)
-        {
+        if !body.is_empty() && buf[i..].starts_with(TOOL_CALL_CLOSE_TAG) {
             let end = i + TOOL_CALL_CLOSE_TAG.len();
             body.push_str(TOOL_CALL_CLOSE_TAG);
             consumed = end;
@@ -1445,24 +1567,33 @@ impl AnthropicStreamTranslator {
             events.push(self.message_start_event());
         }
 
-       // Extract usage
-       if let Some(usage) = chunk.get("usage") {
-           crate::logger::debug(
-               "translate_anthropic",
-               &format!("[usage] raw vLLM usage chunk: {}", serde_json::to_string(usage).unwrap_or_default()),
-           );
+        // Extract usage
+        if let Some(usage) = chunk.get("usage") {
+            crate::logger::debug(
+                "translate_anthropic",
+                &format!(
+                    "[usage] raw vLLM usage chunk: {}",
+                    serde_json::to_string(usage).unwrap_or_default()
+                ),
+            );
             // vLLM streams usage in two chunks:
             //   1. Real usage (prompt_tokens > 0) — after finish_reason
             //   2. Zero-usage cleanup chunk — on connection close
             // Never overwrite real usage with zeros — the cleanup chunk
             // would reset token counts to 0, breaking the ACP usage UI.
-            let pt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            let ct = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pt = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let ct = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if pt > 0 || ct > 0 || (self.input_tokens == 0 && self.output_tokens == 0) {
                 self.input_tokens = pt;
                 self.output_tokens = ct;
             }
-       }
+        }
 
         if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
@@ -1493,7 +1624,8 @@ impl AnthropicStreamTranslator {
                         if !content.is_empty() {
                             // Close thinking block if open
                             if self.thinking_block_open {
-                                events.push(self.content_block_stop_event(self.current_block_index));
+                                events
+                                    .push(self.content_block_stop_event(self.current_block_index));
                                 self.current_block_index += 1;
                                 self.thinking_block_open = false;
                             }
@@ -1524,18 +1656,23 @@ impl AnthropicStreamTranslator {
                     // Tool calls (buffer arguments)
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tool_calls {
-                            let tc_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let tc_index =
+                                tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                             while self.pending_tool_calls.len() <= tc_index {
                                 self.pending_tool_calls.push(PendingToolCall::default());
                             }
                             let pending = &mut self.pending_tool_calls[tc_index];
                             pending.index = tc_index;
                             if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                if !id.is_empty() { pending.id = id.to_string(); }
+                                if !id.is_empty() {
+                                    pending.id = id.to_string();
+                                }
                             }
                             if let Some(func) = tc.get("function") {
                                 if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                    if !name.is_empty() { pending.name = name.to_string(); }
+                                    if !name.is_empty() {
+                                        pending.name = name.to_string();
+                                    }
                                 }
                                 if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
                                     pending.arguments_buffer.push_str(args);
@@ -1563,7 +1700,11 @@ impl AnthropicStreamTranslator {
                     for pending in &self.pending_tool_calls {
                         if !pending.emitted && !pending.name.is_empty() {
                             let block_index = self.current_block_index;
-                            events.push(self.tool_use_block_start_event(block_index, &pending.id, &pending.name));
+                            events.push(self.tool_use_block_start_event(
+                                block_index,
+                                &pending.id,
+                                &pending.name,
+                            ));
                             if !pending.arguments_buffer.is_empty() {
                                 // Drop the zero-argument workaround property so
                                 // the client's schema validation still passes.
@@ -1585,7 +1726,11 @@ impl AnthropicStreamTranslator {
                             // (not `end_turn`) so the client executes the tool —
                             // even though the upstream finish_reason is `stop`,
                             // because the model used the text channel.
-                            if self.inline_tool_emitted { "tool_use" } else { "end_turn" }
+                            if self.inline_tool_emitted {
+                                "tool_use"
+                            } else {
+                                "end_turn"
+                            }
                         }
                         "tool_calls" | "function_call" => "tool_use",
                         "length" => "max_tokens",
@@ -1779,10 +1924,7 @@ impl AnthropicStreamTranslator {
         // message; a contentless message yields "no assistant message in
         // summarization response" and breaks /compact. Synthesize an empty
         // text content block so every response carries an assistant message.
-        let has_tool_use = self
-            .pending_tool_calls
-            .iter()
-            .any(|t| !t.name.is_empty());
+        let has_tool_use = self.pending_tool_calls.iter().any(|t| !t.name.is_empty());
         if !self.text_ever_emitted && self.reasoning_text.is_empty() && !has_tool_use {
             events.push(self.text_block_start_event(self.current_block_index));
             events.push(self.content_block_stop_event(self.current_block_index));
@@ -1955,8 +2097,12 @@ impl AnthropicStreamTranslator {
                     // SQUARE grammar: body is `Name key="value" ...`; closing
                     // `]` at bracket depth 0 ends it. The opening `[` was
                     // already consumed; body accumulates the interior.
-                    match take_tool_tag_body(&mut self.text_buffer, &mut self.tool_tag_body,
-                                             &mut self.tool_tag_depth, &mut self.in_tool_tag_string) {
+                    match take_tool_tag_body(
+                        &mut self.text_buffer,
+                        &mut self.tool_tag_body,
+                        &mut self.tool_tag_depth,
+                        &mut self.in_tool_tag_string,
+                    ) {
                         TagBodyResult::Closed => {
                             if let Some(tc) = parse_tool_tag_body(&self.tool_tag_body) {
                                 out.extend(self.emit_inline_tool_use(&tc));
@@ -1983,8 +2129,11 @@ impl AnthropicStreamTranslator {
                     // + body together into `tool_tag_body` and returns Closed at
                     // a terminator (blank line / next opener / stream end
                     // handled by flush).
-                    match take_angle_tag_body(&mut self.text_buffer, &mut self.tool_tag_body,
-                                             &mut self.in_tool_tag_string) {
+                    match take_angle_tag_body(
+                        &mut self.text_buffer,
+                        &mut self.tool_tag_body,
+                        &mut self.in_tool_tag_string,
+                    ) {
                         TagBodyResult::Closed => {
                             if let Some(tc) = parse_angle_tag_body(&self.tool_tag_body) {
                                 out.extend(self.emit_inline_tool_use(&tc));
@@ -2010,8 +2159,11 @@ impl AnthropicStreamTranslator {
                     // newline + tool name + `key: "value"` lines. May be closed
                     // by the close tag, a blank line, the next opener, or
                     // stream end (handled by flush).
-                    match take_toolcall_body(&mut self.text_buffer, &mut self.tool_tag_body,
-                                             &mut self.in_tool_tag_string) {
+                    match take_toolcall_body(
+                        &mut self.text_buffer,
+                        &mut self.tool_tag_body,
+                        &mut self.in_tool_tag_string,
+                    ) {
                         TagBodyResult::Closed => {
                             if let Some(tc) = parse_toolcall_body(&self.tool_tag_body) {
                                 out.extend(self.emit_inline_tool_use(&tc));
@@ -2050,7 +2202,10 @@ impl AnthropicStreamTranslator {
             self.text_block_open = false;
         }
         let block_index = self.current_block_index;
-        let id = format!("chatcmpl-tool-{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+        let id = format!(
+            "chatcmpl-tool-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
+        );
         out.push(self.tool_use_block_start_event(block_index, &id, &tc.name));
         // Build the JSON input from the parsed key/value pairs and stream it
         // as a single input_json_delta. Values are JSON strings, so embedded
@@ -2276,15 +2431,25 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|c| c.as_array()) {
                     for tc in tool_calls {
                         let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
-                        let args_str = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}");
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let args_str = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
                         let mut input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
                         // Drop the zero-argument workaround property so the
                         // client's schema validation still passes.
                         if let Some(obj) = input.as_object_mut() {
                             obj.remove(NOARGS_PLACEHOLDER);
                         }
-                        content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+                        content.push(
+                            json!({"type": "tool_use", "id": id, "name": name, "input": input}),
+                        );
                     }
                 }
             }
@@ -2610,8 +2775,14 @@ mod tests {
             })
             .collect();
         let combined: String = text_deltas.concat();
-        assert!(combined.contains("I'll check that now."), "preceding text should pass through, got: {combined}");
-        assert!(!combined.contains("[Bash"), "tool tag should NOT leak into text, got: {combined}");
+        assert!(
+            combined.contains("I'll check that now."),
+            "preceding text should pass through, got: {combined}"
+        );
+        assert!(
+            !combined.contains("[Bash"),
+            "tool tag should NOT leak into text, got: {combined}"
+        );
     }
 
     /// A multi-line command value (newlines inside the quoted string) should
@@ -2678,8 +2849,14 @@ mod tests {
 
         let tool_uses = collect_tool_use(&events);
         assert_eq!(tool_uses.len(), 2, "expected two tool_use blocks");
-        assert_eq!(tool_uses[0].get("name").and_then(|n| n.as_str()), Some("Bash"));
-        assert_eq!(tool_uses[1].get("name").and_then(|n| n.as_str()), Some("Bash"));
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Bash")
+        );
+        assert_eq!(
+            tool_uses[1].get("name").and_then(|n| n.as_str()),
+            Some("Bash")
+        );
     }
 
     /// A bracket that does NOT look like a tool-call tag (array literal or
@@ -2693,7 +2870,11 @@ mod tests {
         ]);
 
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 0, "non-tool brackets must not become tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            0,
+            "non-tool brackets must not become tool_use"
+        );
         let text: String = events
             .iter()
             .filter_map(|ev| {
@@ -2705,8 +2886,14 @@ mod tests {
                 }
             })
             .collect();
-        assert!(text.contains("[1, 2, 3]"), "array literal should pass through, got: {text}");
-        assert!(text.contains("[see notes]"), "prose bracket should pass through, got: {text}");
+        assert!(
+            text.contains("[1, 2, 3]"),
+            "array literal should pass through, got: {text}"
+        );
+        assert!(
+            text.contains("[see notes]"),
+            "prose bracket should pass through, got: {text}"
+        );
     }
 
     /// A truncated tag at stream end (no closing `]`) should be emitted as
@@ -2721,7 +2908,11 @@ mod tests {
 
         // No tool_use block — the tag never closed.
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 0, "unclosed tag should not yield a tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            0,
+            "unclosed tag should not yield a tool_use"
+        );
         // The raw text should be present so nothing is silently lost.
         let text: String = events
             .iter()
@@ -2734,7 +2925,10 @@ mod tests {
                 }
             })
             .collect();
-        assert!(text.contains("[Bash"), "unclosed tag text should pass through, got: {text}");
+        assert!(
+            text.contains("[Bash"),
+            "unclosed tag text should pass through, got: {text}"
+        );
     }
 
     // ── Angle-bracket-colon grammar tests ────────────────────────────────
@@ -2764,7 +2958,12 @@ mod tests {
         ]);
 
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 1, "expected one tool_use block, got events: {:?}", events);
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "expected one tool_use block, got events: {:?}",
+            events
+        );
         assert_eq!(
             tool_uses[0].get("name").and_then(|n| n.as_str()),
             Some("Agent")
@@ -2815,7 +3014,11 @@ mod tests {
 
         let events = run_stream(&lines_ref);
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 1, "split angle tag should yield one tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "split angle tag should yield one tool_use"
+        );
         assert_eq!(
             tool_uses[0].get("name").and_then(|n| n.as_str()),
             Some("Agent")
@@ -2889,8 +3092,14 @@ mod tests {
                 }
             })
             .collect();
-        assert!(text.contains("I'll investigate that now."), "preceding text should pass through, got: {text}");
-        assert!(!text.contains("<Agent"), "angle tag should NOT leak into text, got: {text}");
+        assert!(
+            text.contains("I'll investigate that now."),
+            "preceding text should pass through, got: {text}"
+        );
+        assert!(
+            !text.contains("<Agent"),
+            "angle tag should NOT leak into text, got: {text}"
+        );
     }
 
     /// Two consecutive angle tool calls (each terminated by a blank line) in
@@ -2905,8 +3114,14 @@ mod tests {
 
         let tool_uses = collect_tool_use(&events);
         assert_eq!(tool_uses.len(), 2, "expected two tool_use blocks");
-        assert_eq!(tool_uses[0].get("name").and_then(|n| n.as_str()), Some("Agent"));
-        assert_eq!(tool_uses[1].get("name").and_then(|n| n.as_str()), Some("Agent"));
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
+        assert_eq!(
+            tool_uses[1].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
         let j1 = input_json_for(&events, 1).expect("first tool input");
         let p1: Value = serde_json::from_str(&j1).unwrap();
         assert_eq!(p1["description"], "first");
@@ -2923,7 +3138,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_second, "second angle tool call should have its input_json");
+        assert!(
+            found_second,
+            "second angle tool call should have its input_json"
+        );
     }
 
     /// An angle tool call whose value spans multiple lines (newlines inside the
@@ -2958,7 +3176,11 @@ mod tests {
         ]);
 
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 0, "HTML/comparison < must not become a tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            0,
+            "HTML/comparison < must not become a tool_use"
+        );
         let text: String = events
             .iter()
             .filter_map(|ev| {
@@ -2970,9 +3192,18 @@ mod tests {
                 }
             })
             .collect();
-        assert!(text.contains("<div"), "HTML tag should pass through, got: {text}");
-        assert!(text.contains("a < b"), "comparison should pass through, got: {text}");
-        assert!(text.contains("<br/>"), "self-closing tag should pass through, got: {text}");
+        assert!(
+            text.contains("<div"),
+            "HTML tag should pass through, got: {text}"
+        );
+        assert!(
+            text.contains("a < b"),
+            "comparison should pass through, got: {text}"
+        );
+        assert!(
+            text.contains("<br/>"),
+            "self-closing tag should pass through, got: {text}"
+        );
     }
 
     /// A lone `<` or a `<Word` prefix at stream end (no newline + key: yet)
@@ -2987,7 +3218,11 @@ mod tests {
         ]);
 
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 0, "incomplete opener must not yield a tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            0,
+            "incomplete opener must not yield a tool_use"
+        );
         let text: String = events
             .iter()
             .filter_map(|ev| {
@@ -2999,7 +3234,10 @@ mod tests {
                 }
             })
             .collect();
-        assert!(text.contains("<Ag"), "partial opener should flush as text, got: {text}");
+        assert!(
+            text.contains("<Ag"),
+            "partial opener should flush as text, got: {text}"
+        );
     }
 
     /// A square-bracket tool call followed by an angle tool call (both grammars
@@ -3013,9 +3251,19 @@ mod tests {
         ]);
 
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 2, "expected one square + one angle tool_use");
-        assert_eq!(tool_uses[0].get("name").and_then(|n| n.as_str()), Some("Bash"));
-        assert_eq!(tool_uses[1].get("name").and_then(|n| n.as_str()), Some("Agent"));
+        assert_eq!(
+            tool_uses.len(),
+            2,
+            "expected one square + one angle tool_use"
+        );
+        assert_eq!(
+            tool_uses[0].get("name").and_then(|n| n.as_str()),
+            Some("Bash")
+        );
+        assert_eq!(
+            tool_uses[1].get("name").and_then(|n| n.as_str()),
+            Some("Agent")
+        );
     }
 
     // ── HF tool-call-wrapper grammar (the REAL GLM-5.2 leak) ─────────────
@@ -3077,10 +3325,11 @@ mod tests {
         let mut json = None;
         for idx in 0..6 {
             if let Some(j) = input_json_for(&events, idx) {
-                if serde_json::from_str::<Value>(&j)
-                    .ok()
-                    .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(|s| s.to_string()))
-                    == Some("Check which client commits touch ACP path vs run path".to_string())
+                if serde_json::from_str::<Value>(&j).ok().and_then(|v| {
+                    v.get("description")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string())
+                }) == Some("Check which client commits touch ACP path vs run path".to_string())
                 {
                     json = Some(j);
                     break;
@@ -3099,7 +3348,11 @@ mod tests {
             .get("delta")
             .and_then(|d| d.get("stop_reason"))
             .and_then(|s| s.as_str());
-        assert_eq!(stop_reason, Some("tool_use"), "unclosed wrapper leak must force stop_reason=tool_use");
+        assert_eq!(
+            stop_reason,
+            Some("tool_use"),
+            "unclosed wrapper leak must force stop_reason=tool_use"
+        );
     }
 
     /// The exact leaked content from transcript 60867dfe line 3970 — a CLOSED
@@ -3125,7 +3378,11 @@ mod tests {
         ]);
 
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 1, "closed wrapper leak should yield one tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "closed wrapper leak should yield one tool_use"
+        );
         assert_eq!(
             tool_uses[0].get("name").and_then(|n| n.as_str()),
             Some("Bash")
@@ -3155,9 +3412,9 @@ mod tests {
         // Split awkwardly: opener tag alone, then name+attrs in pieces.
         let open_len = open.len();
         let slices: Vec<String> = vec![
-            full[..open_len].to_string(),               // just the opener tag
-            full[open_len..open_len + 7].to_string(),   // "Agent\n"
-            full[open_len + 7..].to_string(),           // rest
+            full[..open_len].to_string(),             // just the opener tag
+            full[open_len..open_len + 7].to_string(), // "Agent\n"
+            full[open_len + 7..].to_string(),         // rest
         ];
         assert_eq!(slices.concat(), full);
         let mut lines: Vec<String> = Vec::new();
@@ -3175,7 +3432,11 @@ mod tests {
 
         let events = run_stream(&lines_ref);
         let tool_uses = collect_tool_use(&events);
-        assert_eq!(tool_uses.len(), 1, "split wrapper tag should yield one tool_use");
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "split wrapper tag should yield one tool_use"
+        );
         assert_eq!(
             tool_uses[0].get("name").and_then(|n| n.as_str()),
             Some("Agent")
@@ -3270,7 +3531,12 @@ mod tests {
         assert_eq!(tool_uses[0]["name"], "TaskList");
         let json = input_json_for(&events, 0).expect("tool_use should carry input_json_delta");
         let parsed: Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(parsed, json!({}), "placeholder must be stripped, got {}", parsed);
+        assert_eq!(
+            parsed,
+            json!({}),
+            "placeholder must be stripped, got {}",
+            parsed
+        );
     }
 
     /// Stripping must not disturb real arguments sent alongside the placeholder.

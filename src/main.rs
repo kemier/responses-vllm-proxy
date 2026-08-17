@@ -240,6 +240,27 @@ pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
     196_608
 }
 
+/// True when the model catalog entry for `model_alias` declares image input
+/// support (`input_modalities` includes "image"). Used by the Anthropic
+/// Messages path to decide whether image blocks can be forwarded as OpenAI
+/// `image_url` content parts. Text-only models (or unknown entries) get
+/// `false` so image blocks are stripped before the vLLM backend rejects the
+/// request with a hard 500 ("not a multimodal model").
+pub fn get_model_supports_images(catalog: &ModelCatalog, model_alias: &str) -> bool {
+    if let Some(c) = catalog.as_ref() {
+        if let Some(arr) = c.get("models").and_then(|m| m.as_array()) {
+            for m in arr {
+                if m.get("slug").and_then(|s| s.as_str()) == Some(model_alias) {
+                    if let Some(mods) = m.get("input_modalities").and_then(|v| v.as_array()) {
+                        return mods.iter().any(|v| v.as_str() == Some("image"));
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() {
     let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
@@ -2774,11 +2795,18 @@ pub async fn handle_messages(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Vision capability: a model whose catalog entry declares `image` input
+    // modality can consume image_url content parts; text-only models must
+    // have image blocks stripped before translation or the backend returns a
+    // hard 500 ("not a multimodal model").
+    let vision_capable = get_model_supports_images(&state.model_catalog, &backend_model);
+
     // Translate Anthropic → OpenAI Chat Completions
-    let mut cc_request = translate_anthropic::anthropic_to_chat_completions(
+    let mut cc_request = translate_anthropic::anthropic_to_chat_completions_with_vision(
         &backend_model,
         &request_json,
         is_stream,
+        vision_capable,
     );
 
     // Inject enable_thinking for GLM models (same logic as handle_chat_completions)
@@ -4053,5 +4081,43 @@ mod tests {
         // added, so it must be present regardless of which entry was evicted).
         let newest = format!("10.0.2.{}:{}", (MAX_CONN_ID_CACHE + 4) % 250, 3000 + MAX_CONN_ID_CACHE + 4);
         assert!(cache.contains_key(&newest));
+    }
+
+    // ─── get_model_supports_images tests ──────────────────────────────────
+
+    fn catalog_with_modalities(model: &str, modalities: &[&str]) -> ModelCatalog {
+        let mods: Vec<Value> = modalities.iter().map(|m| json!(m)).collect();
+        Arc::new(Some(json!({
+            "models": [
+                {
+                    "slug": model,
+                    "input_modalities": mods,
+                }
+            ]
+        })))
+    }
+
+    #[test]
+    fn supports_images_when_catalog_declares_image_modality() {
+        let catalog = catalog_with_modalities("qwen3.8-27b", &["text", "image"]);
+        assert!(get_model_supports_images(&catalog, "qwen3.8-27b"));
+    }
+
+    #[test]
+    fn does_not_support_images_when_text_only() {
+        let catalog = catalog_with_modalities("llama-3.1-8b", &["text"]);
+        assert!(!get_model_supports_images(&catalog, "llama-3.1-8b"));
+    }
+
+    #[test]
+    fn does_not_support_images_when_catalog_entry_missing() {
+        let catalog = catalog_with_modalities("known", &["text"]);
+        assert!(!get_model_supports_images(&catalog, "unknown-model"));
+    }
+
+    #[test]
+    fn does_not_support_images_when_catalog_absent() {
+        let catalog: ModelCatalog = Arc::new(None);
+        assert!(!get_model_supports_images(&catalog, "qwen3.8-27b"));
     }
 }

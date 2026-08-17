@@ -6,7 +6,8 @@
 //   - chat_completions_to_anthropic (non-streaming response translation)
 
 use vllm_proxy::main::translate_anthropic::{
-    anthropic_to_chat_completions, chat_completions_to_anthropic, AnthropicStreamTranslator,
+    anthropic_to_chat_completions, anthropic_to_chat_completions_with_vision,
+    chat_completions_to_anthropic, AnthropicStreamTranslator,
 };
 use serde_json::{json, Value};
 
@@ -76,6 +77,66 @@ fn test_anthropic_system_array_becomes_system_message() {
 }
 
 #[test]
+fn test_anthropic_mid_array_system_message_merged_into_leading_system() {
+    // Claude Code CLI sometimes emits a `system`-role message inside `messages`
+    // (e.g. the "Available agent types for the Agent tool" block injected
+    // mid-conversation). vLLM rejects any request where the first message is
+    // not system ("System message must be at the beginning."), so stray system
+    // messages must be merged into the leading system message, never emitted
+    // in place after a user message.
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "system": "You are helpful.",
+        "messages": [
+            {"role": "user", "content": "Hi there"},
+            {"role": "system", "content": "Available agent types for the Agent tool:\n- claude: Catch-all"},
+            {"role": "user", "content": "Use the agent tool now"}
+        ]
+    });
+    let out = anthropic_to_chat_completions("glm", &body, false);
+    let messages = out["messages"].as_array().unwrap();
+    // No non-first system message may survive.
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, vec!["system", "user", "user"]);
+    // The leading system message absorbed the mid-array system text.
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Available agent types"));
+    assert!(messages[0]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("You are helpful."));
+    assert_eq!(messages[1]["content"], "Hi there");
+    assert_eq!(messages[2]["content"], "Use the agent tool now");
+}
+
+#[test]
+fn test_anthropic_system_message_inside_messages_hoisted_when_no_top_level_system() {
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "system", "content": "You are the system."},
+            {"role": "user", "content": "Hello"}
+        ]
+    });
+    let out = anthropic_to_chat_completions("glm", &body, false);
+    let messages = out["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, vec!["system", "user"]);
+    assert_eq!(messages[0]["content"], "You are the system.");
+    assert_eq!(messages[1]["content"], "Hello");
+}
+
+#[test]
 fn test_anthropic_assistant_with_tool_use() {
     let body = json!({
         "model": "claude-3",
@@ -96,7 +157,8 @@ fn test_anthropic_assistant_with_tool_use() {
     let tool_calls = messages[1]["tool_calls"].as_array().unwrap();
     assert_eq!(tool_calls[0]["id"], "toolu_1");
     assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
-    let args: Value = serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    let args: Value =
+        serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
     assert_eq!(args["city"], "Stockholm");
 }
 
@@ -140,7 +202,10 @@ fn test_anthropic_tools_converted_to_openai_function() {
     let tools = out["tools"].as_array().unwrap();
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "get_weather");
-    assert_eq!(tools[0]["function"]["parameters"]["properties"]["city"]["type"], "string");
+    assert_eq!(
+        tools[0]["function"]["parameters"]["properties"]["city"]["type"],
+        "string"
+    );
 }
 
 #[test]
@@ -228,8 +293,12 @@ fn test_anthropic_stream_simple_text() {
     let e1 = t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}"#);
     // Should emit message_start, content_block_start, content_block_delta
     assert!(e1.iter().any(|e| e.contains("message_start")));
-    assert!(e1.iter().any(|e| e.contains("content_block_start") && e.contains("\"type\":\"text\"")));
-    assert!(e1.iter().any(|e| e.contains("content_block_delta") && e.contains("Hello")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("content_block_start") && e.contains("\"type\":\"text\"")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("content_block_delta") && e.contains("Hello")));
 
     let done = t.translate_line("data: [DONE]");
     assert!(done.iter().any(|e| e.contains("content_block_stop")));
@@ -240,15 +309,24 @@ fn test_anthropic_stream_simple_text() {
 #[test]
 fn test_anthropic_stream_reasoning_then_text() {
     let mut t = AnthropicStreamTranslator::new("deepseek-v4");
-    let e1 = t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"Thinking..."}}]}"#);
-    assert!(e1.iter().any(|e| e.contains("content_block_start") && e.contains("\"type\":\"thinking\"")));
-    assert!(e1.iter().any(|e| e.contains("thinking_delta") && e.contains("Thinking...")));
+    let e1 =
+        t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"Thinking..."}}]}"#);
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("content_block_start") && e.contains("\"type\":\"thinking\"")));
+    assert!(e1
+        .iter()
+        .any(|e| e.contains("thinking_delta") && e.contains("Thinking...")));
 
     let e2 = t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Answer"}}]}"#);
     // Should close thinking block, open text block
     assert!(e2.iter().any(|e| e.contains("content_block_stop")));
-    assert!(e2.iter().any(|e| e.contains("content_block_start") && e.contains("\"type\":\"text\"")));
-    assert!(e2.iter().any(|e| e.contains("text_delta") && e.contains("Answer")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("content_block_start") && e.contains("\"type\":\"text\"")));
+    assert!(e2
+        .iter()
+        .any(|e| e.contains("text_delta") && e.contains("Answer")));
 }
 
 #[test]
@@ -259,8 +337,12 @@ fn test_anthropic_stream_tool_use() {
     // Argument fragment
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"STO\"}"}}]}}]}"#);
     // finish_reason triggers tool_use block emission
-    let finish = t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#);
-    assert!(finish.iter().any(|e| e.contains("content_block_start") && e.contains("\"type\":\"tool_use\"")));
+    let finish = t.translate_line(
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+    );
+    assert!(finish
+        .iter()
+        .any(|e| e.contains("content_block_start") && e.contains("\"type\":\"tool_use\"")));
     assert!(finish.iter().any(|e| e.contains("input_json_delta")));
     // message_delta (which carries stop_reason) is deliberately deferred to
     // [DONE]: vLLM sends the usage chunk *after* finish_reason, so emitting it
@@ -268,7 +350,9 @@ fn test_anthropic_stream_tool_use() {
     assert!(!finish.iter().any(|e| e.contains("message_delta")));
 
     let done = t.translate_line("data: [DONE]");
-    assert!(done.iter().any(|e| e.contains("\"stop_reason\":\"tool_use\"")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("\"stop_reason\":\"tool_use\"")));
     assert!(done.iter().any(|e| e.contains("message_stop")));
     // The tool_use block must not be duplicated by the empty-response fallback.
     assert!(!done.iter().any(|e| e.contains("content_block_start")));
@@ -278,10 +362,13 @@ fn test_anthropic_stream_tool_use() {
 fn test_anthropic_stream_finish_reason_stop() {
     let mut t = AnthropicStreamTranslator::new("glm-5.2");
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#);
-    let finish = t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
+    let finish =
+        t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
     assert!(finish.iter().any(|e| e.contains("content_block_stop")));
     let done = t.translate_line("data: [DONE]");
-    assert!(done.iter().any(|e| e.contains("\"stop_reason\":\"end_turn\"")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("\"stop_reason\":\"end_turn\"")));
 }
 
 #[test]
@@ -290,7 +377,9 @@ fn test_anthropic_stream_finish_reason_length() {
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"..."}}]}"#);
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#);
     let done = t.translate_line("data: [DONE]");
-    assert!(done.iter().any(|e| e.contains("\"stop_reason\":\"max_tokens\"")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("\"stop_reason\":\"max_tokens\"")));
 }
 
 #[test]
@@ -333,7 +422,9 @@ fn test_anthropic_stream_done_without_finish_defaults_end_turn() {
     let mut t = AnthropicStreamTranslator::new("glm-5.2");
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#);
     let done = t.translate_line("data: [DONE]");
-    assert!(done.iter().any(|e| e.contains("\"stop_reason\":\"end_turn\"")));
+    assert!(done
+        .iter()
+        .any(|e| e.contains("\"stop_reason\":\"end_turn\"")));
 }
 
 #[test]
@@ -480,7 +571,9 @@ fn test_non_streaming_anthropic_finish_reason_length() {
 fn test_stream_reasoning_only_synthesizes_text_block() {
     let mut t = AnthropicStreamTranslator::new("glm-5.2");
     // Reasoning-only stream: content never arrives.
-    t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"thinking step 1. "}}]}"#);
+    t.translate_line(
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning":"thinking step 1. "}}]}"#,
+    );
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"thinking step 2."}}]}"#);
     t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
     let done = t.translate_line("data: [DONE]");
@@ -493,8 +586,14 @@ fn test_stream_reasoning_only_synthesizes_text_block() {
         joined
     );
     // The synthesized text must contain BOTH reasoning fragments (accumulated).
-    assert!(joined.contains("thinking step 1. "), "missing first reasoning fragment");
-    assert!(joined.contains("thinking step 2."), "missing second reasoning fragment");
+    assert!(
+        joined.contains("thinking step 1. "),
+        "missing first reasoning fragment"
+    );
+    assert!(
+        joined.contains("thinking step 2."),
+        "missing second reasoning fragment"
+    );
     // And the text block must be properly closed.
     assert!(joined.contains("content_block_stop"));
     assert!(joined.contains("message_stop"));
@@ -506,9 +605,15 @@ fn test_stream_reasoning_plus_content_does_not_duplicate() {
     // Both reasoning and real content arrive — text block comes from content,
     // reasoning must NOT be synthesized again at finish().
     let mut all = Vec::new();
-    all.extend(t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"reasoning":"private thoughts"}}]}"#));
-    all.extend(t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"final answer"}}]}"#));
-    all.extend(t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#));
+    all.extend(t.translate_line(
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning":"private thoughts"}}]}"#,
+    ));
+    all.extend(
+        t.translate_line(r#"data: {"choices":[{"index":0,"delta":{"content":"final answer"}}]}"#),
+    );
+    all.extend(
+        t.translate_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+    );
     all.extend(t.translate_line("data: [DONE]"));
     let joined = all.join("\n");
 
@@ -558,4 +663,137 @@ fn test_non_streaming_content_present_not_promoted() {
     assert_eq!(content.len(), 2);
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "real answer");
+}
+
+// ─── Image block forwarding (user message) ────────────────────────────────
+
+#[test]
+fn test_anthropic_user_image_block_becomes_image_url_content() {
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGVsbG8="
+                }},
+                {"type": "text", "text": "What is in this image?"}
+            ]
+        }]
+    });
+    let out = anthropic_to_chat_completions("qwen3.8-27b", &body, false);
+    let messages = out["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    let content = messages[0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    // text first, then image_url
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "What is in this image?");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,aGVsbG8="
+    );
+    assert_eq!(messages[0]["role"], "user");
+}
+
+#[test]
+fn test_anthropic_user_image_only_no_empty_message() {
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": "Zm9v"
+                }}
+            ]
+        }]
+    });
+    let out = anthropic_to_chat_completions("qwen3.8-27b", &body, false);
+    let messages = out["messages"].as_array().unwrap();
+    // Exactly one message: the image content array. No spurious empty string.
+    assert_eq!(messages.len(), 1);
+    let content = messages[0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "image_url");
+    assert_eq!(
+        content[0]["image_url"]["url"],
+        "data:image/jpeg;base64,Zm9v"
+    );
+}
+
+#[test]
+fn test_anthropic_user_non_base64_image_skipped() {
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://x.com/i.png"}},
+                {"type": "text", "text": "hi"}
+            ]
+        }]
+    });
+    let out = anthropic_to_chat_completions("qwen3.8-27b", &body, false);
+    let messages = out["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    // Non-base64 image source is dropped; plain string content preserved.
+    assert_eq!(messages[0]["content"], "hi");
+}
+
+#[test]
+fn test_anthropic_image_stripped_for_non_vision_model() {
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aGVsbG8="
+                }},
+                {"type": "text", "text": "Describe the image"}
+            ]
+        }]
+    });
+    // glm-5.2 is text-only — image must be stripped, text preserved as plain string.
+    let out = anthropic_to_chat_completions_with_vision("zai-org/GLM-5.2-FP8", &body, false, false);
+    let messages = out["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "Describe the image");
+}
+
+#[test]
+fn test_anthropic_image_only_stripped_for_non_vision_model() {
+    let body = json!({
+        "model": "claude-3",
+        "max_tokens": 100,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": "Zm9v"
+                }}
+            ]
+        }]
+    });
+    // Image-only message on a text-only model → keep a plain empty-ish message
+    // so the request stays valid (the client still gets a turn).
+    let out = anthropic_to_chat_completions_with_vision("zai-org/GLM-5.2-FP8", &body, false, false);
+    let messages = out["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"], "");
 }
