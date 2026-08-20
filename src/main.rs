@@ -373,10 +373,35 @@ async fn main() {
         .route("/v1/summarize-session", post(handle_summarize_session))
         .with_state(state);
 
-    let addr = format!("{}:{}", cfg.host, cfg.port);
+    // ── IPv4-ONLY bind ──────────────────────────────────────────────────────
+    // The proxy binds strictly to IPv4. The socket is created with
+    // `Domain::IPV4`, so it can never accept IPv6 connections. The bind
+    // address is parsed as an IPv4 literal (`Ipv4Addr`) — if `cfg.host` is a
+    // hostname ("localhost") or an IPv6 literal ("::1"), `Ipv4Addr::from_str`
+    // fails and we fall back to the loopback address `127.0.0.1` with a
+    // warning, instead of panicking on startup.
+    //
+    // WHY: many clients (e.g. the ericli sidecar) resolve "localhost" to ::1
+    // (IPv6) FIRST. If the proxy ever bound to IPv6, those clients would get
+    // connection-refused because the proxy only listens on IPv4. Hard-coding
+    // IPv4 here makes the proxy's address unambiguous and reachable by all
+    // local clients regardless of their getaddrinfo() order.
+    let bind_v4: std::net::SocketAddrV4 = match cfg.host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => std::net::SocketAddrV4::new(ip, cfg.port),
+        Err(e) => {
+            logger::warn(
+                "main",
+                &format!(
+                    "config host {:?} is not a valid IPv4 literal ({}) — binding to 127.0.0.1:{} (IPv4 only)",
+                    cfg.host, e, cfg.port
+                ),
+            );
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, cfg.port)
+        }
+    };
     logger::info(
         "main",
-        &format!("vllm-proxy listening on http://{}", addr),
+        &format!("vllm-proxy listening on http://{}", bind_v4),
     );
 
     // Bind with retry — give the old process time to fully release the port.
@@ -396,11 +421,7 @@ async fn main() {
             .set_nonblocking(true)
             .expect("set_nonblocking failed");
         socket
-            .bind(&socket2::SockAddr::from(
-                format!("{}:{}", cfg.host, cfg.port)
-                    .parse::<std::net::SocketAddr>()
-                    .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port))),
-            ))
+            .bind(&socket2::SockAddr::from(bind_v4))
             .expect("Failed to bind");
         socket.listen(1024).expect("Failed to listen");
         tokio::net::TcpListener::from_std(socket.into()).expect("Failed to convert to TcpListener")
