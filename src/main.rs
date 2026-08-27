@@ -240,6 +240,55 @@ pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
     196_608
 }
 
+/// The effective context window for a model, as advertised by `/v1/models`.
+/// This branch (local/dev) has no `max_context_cap` concept, so it is the
+/// catalog `context_window` verbatim. (The EricAI `master` variant caps this
+/// at the shared vLLM's enforced `max_model_len`; here each model's nominal
+/// window is assumed to be what the backend enforces.)
+fn effective_context_window(state: &AppState, model_alias: &str) -> u64 {
+    get_context_window(&state.model_catalog, model_alias)
+}
+
+/// Build an HTTP 400 response when a request's estimated token count exceeds
+/// the model's effective context window. Returns `None` when the request fits
+/// (or the window is unknown), so callers fall through to normal forwarding.
+///
+/// WHY reject here instead of forwarding: the proxy's `estimate_tokens` is
+/// more accurate than codex's own `get_total_token_usage` for a single huge
+/// injected message (e.g. a pasted config file) — codex's tracked usage
+/// undercounts items after the last model-generated item, so its pre-turn
+/// auto-compaction (`run_pre_sampling_compact`, threshold = 90% of the
+/// hardcoded 272k fallback window) never fires and a multi-MB request goes
+/// to the backend. The backend then either 400s (model window exceeded) or
+/// 503s (shared-vLLM prefill saturated by the oversized request). Rejecting
+/// here turns that into a clean client-visible context-length error the
+/// client (codex/ericli) recognizes and compacts/retries against.
+///
+/// The message includes "context length" so `is_context_overflow_error`
+/// (logger.rs) classifies it as an overflow, not a transient overload.
+fn context_overflow_response(
+    state: &AppState,
+    model_alias: &str,
+    estimated_tokens: usize,
+) -> Option<Response> {
+    let window = effective_context_window(state, model_alias);
+    if estimated_tokens as u64 <= window {
+        return None;
+    }
+    logger::warn(
+        "context-overflow",
+        &format!(
+            "Rejecting before upstream: ~{} tokens > context_window {} for model {} — forwarding would fail with 400/503",
+            estimated_tokens, window, model_alias
+        ),
+    );
+    let msg = format!(
+        "The input ({} estimated tokens) is longer than the model's context length ({} tokens). Compact the conversation or switch to a larger-context model.",
+        estimated_tokens, window
+    );
+    Some((StatusCode::BAD_REQUEST, msg).into_response())
+}
+
 /// True when the model catalog entry for `model_alias` declares image input
 /// support (`input_modalities` includes "image"). Used by the Anthropic
 /// Messages path to decide whether image blocks can be forwarded as OpenAI
@@ -828,6 +877,13 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     // content, tool_calls, tool results, and the tools schema entirely), and the
     // `total > 4` guard allowed huge single messages through. Removing it lets
     // codex's proven context management handle this correctly.
+    //
+    // NEW: codex's auto-compaction is INERT for proxy-routed models — its
+    // pre-turn guard uses a hardcoded 272k fallback window and its tracked
+    // usage undercounts a single huge injected message, so an oversized
+    // request can still reach here. Hard-reject before forwarding: the proxy's
+    // estimate is accurate enough to catch the egregious overflow, and a clean
+    // 400 here beats a backend 400/503 storm on the shared vLLM.
     let context_window = get_context_window(&state.model_catalog, &model_alias);
     let estimated_tokens = estimate_tokens(&cc_payload);
     if estimated_tokens as u64 > context_window {
@@ -835,6 +891,9 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
            "Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
            estimated_tokens, context_window, model_alias
        ));
+    }
+    if let Some(resp) = context_overflow_response(&state, &model_alias, estimated_tokens) {
+        return resp;
     }
 
     // Get auth token
@@ -1554,6 +1613,13 @@ pub async fn handle_responses_ws(
             // content, tool_calls, tool results, and the tools schema entirely), and the
             // `total > 4` guard allowed huge single messages through. Removing it lets
             // codex's proven context management handle this correctly.
+            //
+            // NEW: codex's auto-compaction is INERT for proxy-routed models (hardcoded
+            // 272k fallback window + undercounted usage for a single huge message), so
+            // an oversized request can reach here. Hard-reject before forwarding: send
+            // an error event codex's parse_wrapped_websocket_error_event understands
+            // (same shape as the upstream-error path below) and keep the connection
+            // alive so codex can compact/retry on the next turn.
             let context_window = get_context_window(&state.model_catalog, &model_alias);
             let estimated_tokens = estimate_tokens(&cc_payload);
             if estimated_tokens as u64 > context_window {
@@ -1561,6 +1627,26 @@ pub async fn handle_responses_ws(
                     "Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
                     estimated_tokens, context_window, model_alias
                 ));
+            }
+            if let Some(window) = { let w = effective_context_window(&state, &model_alias); (estimated_tokens as u64 > w).then_some(w) } {
+                logger::warn(
+                    "context-overflow",
+                    &format!(
+                        "Rejecting before upstream: ~{} tokens > context_window {} for model {} — forwarding would fail with 400/503",
+                        estimated_tokens, window, model_alias
+                    ),
+                );
+                let err_payload = json!({
+                    "type": "error",
+                    "status": 400,
+                    "error": {
+                        "message": format!("The input ({} estimated tokens) is longer than the model's context length ({} tokens). Compact the conversation or switch to a larger-context model.", estimated_tokens, window)
+                    }
+                });
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    err_payload.to_string()
+                )).await;
+                continue 'connection; // keep connection alive for compact/retry
             }
 
                        let base_url = state.cfg.provider().unwrap().base_url.clone();
@@ -3422,6 +3508,11 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
     // content, tool_calls, tool results, and the tools schema entirely), and the
     // `total > 4` guard allowed huge single messages through. Removing it lets
     // codex's proven context management handle this correctly.
+    //
+    // NEW: hard-reject before forwarding when the estimated tokens exceed the
+    // model's effective window (see context_overflow_response). A compact
+    // request that is itself over-window can't be compacted further by the
+    // backend — reject it cleanly instead of letting the shared vLLM 400/503.
     let context_window = get_context_window(&state.model_catalog, &model_alias);
     let estimated_tokens = estimate_tokens(&cc_payload);
     if estimated_tokens as u64 > context_window {
@@ -3429,6 +3520,9 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
             "Context size warning: ~{} tokens may exceed context_window {} — codex should auto-compact",
             estimated_tokens, context_window
         ));
+    }
+    if let Some(resp) = context_overflow_response(&state, &model_alias, estimated_tokens) {
+        return resp;
     }
 
     cc_payload["stream"] = json!(true);
@@ -4140,5 +4234,66 @@ mod tests {
     fn does_not_support_images_when_catalog_absent() {
         let catalog: ModelCatalog = Arc::new(None);
         assert!(!get_model_supports_images(&catalog, "qwen3.8-27b"));
+    }
+
+    // ── Context-overflow hard-reject regression tests ────────────────────
+    // These guard the fix for dropped/503'd requests when a single huge
+    // injected message (e.g. a pasted config file) exceeds the model's
+    // effective context window. The proxy must reject BEFORE forwarding so
+    // the shared vLLM doesn't 400/503 the oversized request.
+
+    /// Build a minimal AppState with an optional model catalog. Used only
+    /// by tests. This branch (local/dev) has no token_mgr / max_context_cap.
+    fn test_state(catalog: Option<Value>) -> AppState {
+        let cfg: config::Config = serde_yaml::from_str(
+            "port: 8317\nauth-dir: \"/tmp\"\n",
+        )
+        .expect("test config");
+        AppState {
+            cfg: Arc::new(cfg),
+            http_client: reqwest::Client::new(),
+            model_catalog: Arc::new(catalog),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            rate_limiter: Arc::new(RateLimiter::new(0)),
+            model_throttle: Arc::new(ModelThrottle::new(3, &std::collections::HashMap::new())),
+            conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn context_overflow_rejects_over_window_request() {
+        // Model catalog: deepseek-v4-flash has window 262144.
+        let catalog = json!({ "models": [
+            {"slug": "deepseek-v4-flash", "context_window": 262144}
+        ]});
+        let state = test_state(Some(catalog));
+        // 1,035,488 estimated tokens (the observed oversized request) >> 262144.
+        let resp = context_overflow_response(&state, "deepseek-v4-flash", 1_035_488);
+        assert!(resp.is_some(), "oversized request must be rejected");
+        assert_eq!(
+            resp.unwrap().status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn context_overflow_allows_in_window_request() {
+        let catalog = json!({ "models": [
+            {"slug": "deepseek-v4-flash", "context_window": 262144}
+        ]});
+        let state = test_state(Some(catalog));
+        // 150K estimated tokens fits well within the 262144 window.
+        assert!(context_overflow_response(&state, "deepseek-v4-flash", 150_000).is_none());
+    }
+
+    #[test]
+    fn effective_window_uses_catalog_window() {
+        // local/dev has no max_context_cap, so the effective window is the
+        // catalog window verbatim.
+        let catalog = json!({ "models": [
+            {"slug": "qwen3.8-27b-1m", "context_window": 1010000}
+        ]});
+        let state = test_state(Some(catalog));
+        assert_eq!(effective_context_window(&state, "qwen3.8-27b-1m"), 1010000);
     }
 }
