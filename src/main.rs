@@ -3728,7 +3728,24 @@ pub async fn handle_summarize_session(
         .to_string();
 
     // ── Model selection ────────────────────────────────────────────────────
-    let summary_model = select_summary_model(&state).await;
+    // Client may override the model (e.g. "qwen38-27b"). Resolved via alias,
+    // then falls back to the existing auto-selection strategy.
+    let requested_model = request_json
+        .get("model")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty());
+
+    let summary_model = match requested_model {
+        Some(alias) => {
+            let resolved = state.cfg.resolve_model(alias);
+            logger::info(
+                "summarize",
+                &format!("Using client-requested model: {} → {}", alias, resolved),
+            );
+            resolved
+        }
+        None => select_summary_model(&state).await,
+    };
     logger::info(
         "summarize",
         &format!("Selected summary model: {}", summary_model),
