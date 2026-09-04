@@ -797,3 +797,72 @@ fn test_anthropic_image_only_stripped_for_non_vision_model() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["content"], "");
 }
+
+// ─── effort → reasoning_effort mapping ─────────────────────────────────────
+
+#[test]
+fn test_effort_output_config_mapping() {
+    let cases: [(&str, Option<&str>); 8] = [
+        ("minimal", Some("none")),
+        ("low", Some("low")),
+        ("medium", Some("medium")),
+        ("high", Some("xhigh")),
+        ("xhigh", Some("xhigh")),
+        ("max", Some("xhigh")),
+        ("off", Some("none")),
+        ("bogus", None),
+    ];
+    for (effort, expected) in cases {
+        let body = json!({
+            "model": "qwen38-27b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": effort},
+        });
+        let out = anthropic_to_chat_completions("qwen38-27b", &body, false);
+        match expected {
+            Some(e) => assert_eq!(out.get("reasoning_effort").and_then(|v| v.as_str()), Some(e), "effort={effort}"),
+            None => assert!(out.get("reasoning_effort").is_none(), "effort={effort}"),
+        }
+    }
+}
+
+#[test]
+fn test_effort_thinking_budget_mapping() {
+    let cases: [(i64, &str); 5] = [
+        (0, "none"),
+        (1024, "low"),
+        (2048, "low"),
+        (8192, "medium"),
+        (16384, "xhigh"),
+    ];
+    for (budget, expected) in cases {
+        let body = json!({
+            "model": "qwen38-27b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": budget},
+        });
+        let out = anthropic_to_chat_completions("qwen38-27b", &body, false);
+        assert_eq!(
+            out.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some(expected),
+            "budget={budget}"
+        );
+    }
+    let body = json!({
+        "model": "qwen38-27b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "disabled"},
+    });
+    let out = anthropic_to_chat_completions("qwen38-27b", &body, false);
+    assert_eq!(out.get("reasoning_effort").and_then(|v| v.as_str()), Some("none"));
+}
+
+#[test]
+fn test_effort_absent_keeps_template_default() {
+    let body = json!({
+        "model": "qwen38-27b",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let out = anthropic_to_chat_completions("qwen38-27b", &body, false);
+    assert!(out.get("reasoning_effort").is_none());
+}

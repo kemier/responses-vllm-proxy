@@ -54,6 +54,14 @@ pub fn anthropic_to_chat_completions_with_vision(
         }
     }
 
+    // effort → reasoning_effort. llama.cpp: "none" disables thinking;
+    // otherwise the value is passed to the jinja chat template. The Qwen3.8
+    // template only defines low/medium/xhigh (no "high"), so the Anthropic
+    // effort enum is folded onto those levels.
+    if let Some(re) = map_effort_to_reasoning_effort(body) {
+        out["reasoning_effort"] = json!(re);
+    }
+
     let messages = out["messages"].as_array_mut().unwrap();
 
     // system → first system message (string or array of content blocks)
@@ -439,6 +447,50 @@ fn convert_anthropic_tool(tool: &Value, add_noargs_placeholder: bool) -> Option<
 
 /// State machine for translating OpenAI streaming SSE chunks to Anthropic
 /// Messages SSE events.
+/// Map the Anthropic request's effort signal onto the backend's
+/// `reasoning_effort` field. Sources, in order:
+///   1. `output_config.effort` — Claude Code v2+ ("minimal"|"low"|"medium"|
+///      "high"|"xhigh"|"max")
+///   2. `thinking` — classic Anthropic shape ({"type":"disabled"} or
+///      {"type":"enabled","budget_tokens":N}); budget is folded onto levels.
+/// Returns None when neither is present → the template's own default applies
+/// (xhigh for Qwen3.8).
+pub fn map_effort_to_reasoning_effort(body: &Value) -> Option<String> {
+    if let Some(effort) = body
+        .get("output_config")
+        .and_then(|o| o.get("effort"))
+        .and_then(|v| v.as_str())
+    {
+        return match effort {
+            "minimal" | "none" | "off" => Some("none".to_string()),
+            "low" => Some("low".to_string()),
+            "medium" => Some("medium".to_string()),
+            "high" | "xhigh" | "max" => Some("xhigh".to_string()),
+            other => {
+                logger::warn(
+                    "translate_anthropic",
+                    &format!("unknown output_config.effort: {other} — leaving template default"),
+                );
+                None
+            }
+        };
+    }
+    if let Some(thinking) = body.get("thinking") {
+        if thinking.get("type").and_then(|v| v.as_str()) == Some("disabled") {
+            return Some("none".to_string());
+        }
+        if let Some(budget) = thinking.get("budget_tokens").and_then(|v| v.as_i64()) {
+            return Some(match budget {
+                0 => "none".to_string(),
+                b if b <= 2048 => "low".to_string(),
+                b if b <= 8192 => "medium".to_string(),
+                _ => "xhigh".to_string(),
+            });
+        }
+    }
+    None
+}
+
 pub struct AnthropicStreamTranslator {
     message_id: String,
     model: String,
