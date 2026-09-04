@@ -1,6 +1,8 @@
 # vLLM proxy minimal configuration
 port: 8317
-host: "127.0.0.1"
+# Bind all interfaces so Ubuntu Remote SSH (vscode-server) can reach this
+# proxy at http://192.168.124.5:8317 for /session summarization.
+host: "0.0.0.0"
 debug: false
 auth-dir: "~/.cli-proxy-api"
 # API keys for client authentication. When non-empty, all requests must
@@ -28,23 +30,18 @@ log-dir: "logs"
 # Set to true to diagnose hallucination caused by missing system prompt on incremental requests.
 log-turn-debug: false
 
-# Standard vLLM OpenAI-compatible server (see https://docs.vllm.ai/en/stable/serving/online_serving/openai_compatible_server/)
-# Start with: vllm serve <model>   (no --api-key = no auth required)
-# The proxy connects with NO Authorization header (standard no-auth vLLM connection).
+# Upstream OpenAI-compatible server.
+# NOTE: proxy picks provider named "default", else the first entry — single base-url.
 openai-compatibility:
     - name: "default"
       prefix: "default"
-      base-url: "http://localhost:8000/v1"
+      base-url: "http://192.168.124.14:8008/v1"
       models:
-          - name: meta-llama/Llama-3.1-8B-Instruct
-            alias: llama-3.1-8b
-            context_length: 131072
-            tags: [fast, coding]
-          - name: Qwen/Qwen2.5-7B-Instruct
-            alias: qwen2.5-7b
-            context_length: 32768
-            tags: [fast, coding]
-          - name: mistralai/Mistral-7B-Instruct-v0.3
-            alias: mistral-7b
-            context_length: 32768
-            tags: [fast]
+          - name: qwen38-27b
+            alias: qwen38-27b
+            context_length: 262144
+            tags: [coding, reasoning]
+          - name: qwen38-27b
+            alias: qwythos
+            context_length: 262144
+            tags: [coding, reasoning]
