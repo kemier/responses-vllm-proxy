@@ -74,13 +74,14 @@ pub fn anthropic_to_chat_completions_with_vision(
 
     // Convert messages. Claude Code CLI sometimes sends `system`-role messages
     // INSIDE `messages` (e.g. the "Available agent types for the Agent tool"
-    // block injected mid-conversation when spawning a subagent). vLLM rejects
-    // any request where the first message is not the system message
-    // ("System message must be at the beginning."), so stray system messages
-    // must be merged into the leading system message (or hoisted to index 0)
-    // rather than emitted in place.
+    // block injected mid-conversation when spawning a subagent). The Qwen chat
+    // template rejects system messages after index 0 ("System message must be
+    // at the beginning."), so stray system messages are converted to user
+    // messages IN PLACE. Keeping the position preserves the rendered token
+    // prefix turn-over-turn — merging them into the leading system message
+    // rewrote the prefix and forced a full re-prefill of the entire
+    // conversation on the next request.
     if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
-        let mut system_buf: Vec<String> = Vec::new();
         for msg in msgs {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             if role == "system" {
@@ -89,31 +90,11 @@ pub fn anthropic_to_chat_completions_with_vision(
                     .map(extract_text_from_content)
                     .unwrap_or_default();
                 if !text.is_empty() {
-                    system_buf.push(text);
+                    messages.push(json!({"role": "user", "content": text}));
                 }
                 continue;
             }
             convert_anthropic_message(msg, messages, vision_capable);
-        }
-        if !system_buf.is_empty() {
-            let sys_text = system_buf.join("\n\n");
-            let sys = json!({"role": "system", "content": sys_text});
-            match messages
-                .iter_mut()
-                .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
-            {
-                Some(existing) => {
-                    let cur = existing["content"].as_str().unwrap_or("");
-                    existing["content"] = json!(if cur.is_empty() {
-                        sys_text
-                    } else {
-                        format!("{}\n\n{}", cur, sys_text)
-                    });
-                }
-                None => {
-                    messages.insert(0, sys);
-                }
-            }
         }
     }
 
@@ -3635,5 +3616,37 @@ mod tests {
             .find(|b| b["type"] == "tool_use")
             .expect("expected a tool_use block");
         assert_eq!(tool_use["input"], json!({}));
+    }
+
+    /// Stray mid-conversation system messages (injected by Claude Code when
+    /// spawning a subagent) must be converted to user messages IN PLACE so the
+    /// rendered token prefix stays stable for KV cache reuse. They must NOT be
+    /// merged into the leading system message (that rewrote the prefix and
+    /// forced a full re-prefill on the next turn).
+    #[test]
+    fn test_stray_system_message_converted_in_place() {
+        let body = json!({
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "system", "content": "Available agent types: Explore"},
+                {"role": "user", "content": "now explore"}
+            ]
+        });
+        let out = anthropic_to_chat_completions("test-model", &body, false);
+        let msgs = out["messages"].as_array().unwrap();
+        // Leading system message untouched (no merge).
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "You are helpful.");
+        // Stray system became user at its original position (index 3).
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "Available agent types: Explore");
+        assert_eq!(msgs[4]["role"], "user");
+        assert_eq!(msgs[4]["content"], "now explore");
+        assert_eq!(msgs.len(), 5);
     }
 }
