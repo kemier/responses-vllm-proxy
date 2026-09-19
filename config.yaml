@@ -35,7 +35,7 @@ log-turn-debug: false
 openai-compatibility:
     - name: "default"
       prefix: "default"
-      base-url: "http://192.168.124.14:8008/v1"
+      base-url: "http://127.0.0.1:8008/v1"
       models:
           - name: qwen38-27b
             alias: qwen38-27b
