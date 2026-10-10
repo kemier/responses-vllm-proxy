@@ -182,9 +182,9 @@ impl ModelThrottle {
 /// Throttle timeout before returning 503. Long enough that a streaming model
 /// slot is unlikely to be held much longer; short enough that the client
 /// retries rather than hanging.
-const MODEL_THROTTLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MODEL_THROTTLE_TIMEOUT: Duration = Duration::from_secs(240);
 /// HTTP 503 Retry-After suggested to the client after a throttle timeout.
-const MODEL_THROTTLE_RETRY_AFTER: &str = "30";
+const MODEL_THROTTLE_RETRY_AFTER: &str = "60";
 
 /// Acquire a per-model permit for the given backend model. Logs when the
 /// request had to wait, and returns `Some(permit)` to hold for the duration
@@ -2450,7 +2450,20 @@ pub async fn handle_chat_completions(
                         });
                         if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
                             if !tcs.is_empty() {
-                                out_msg["tool_calls"] = json!(tcs);
+                                // Ollama-native tool_calls omit the OpenAI-required
+                                // "type":"function" field; the SDK's schema-validated
+                                // response handler rejects them → "Invalid JSON response"
+                                // (kills the agentic skill extractor). Normalize each entry.
+                                let normalized: Vec<Value> = tcs.iter().map(|tc| {
+                                    let mut e = tc.clone();
+                                    match e.get("type") {
+                                        None => e["type"] = json!("function"),
+                                        Some(t) if t.is_null() => e["type"] = json!("function"),
+                                        Some(_) => {}
+                                    }
+                                    e
+                                }).collect();
+                                out_msg["tool_calls"] = json!(normalized);
                             }
                         }
                         let openai = json!({
