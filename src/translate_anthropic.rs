@@ -1982,45 +1982,6 @@ impl AnthropicStreamTranslator {
         events.push(self.message_delta_event(sr));
         events.push(self.message_stop_event());
 
-        // Turn summary — the single line that makes a "silent end_turn"
-        // diagnosable. A client reporting "the agent ended the turn with no
-        // response" maps to one of: text=0 tool_uses=0 (nothing came back),
-        // tiny text with stop=end_turn (the model genuinely stopped early), or
-        // tool_uses>0 with stop=end_turn (the client never ran the tool).
-        let tool_names: Vec<&str> = self
-            .pending_tool_calls
-            .iter()
-            .filter(|t| !t.name.is_empty())
-            .map(|t| t.name.as_str())
-            .collect();
-        logger::info(
-            "translate_anthropic",
-            &format!(
-                "[turn-summary] stop={}{} out_tokens={} in_tokens={} text_chars={} raw_chars={} reasoning_chars={} tool_uses={}{} preview={:?}{}",
-                sr,
-                if self.recovered_non_streaming { " (recovered non-streaming)" } else { "" },
-                self.output_tokens,
-                self.input_tokens,
-                self.text_chars,
-                self.raw_chars,
-                self.reasoning_text.len(),
-                tool_names.len(),
-                if tool_names.is_empty() {
-                    String::new()
-                } else {
-                    format!(" tools=[{}]", tool_names.join(","))
-                },
-                self.text_preview,
-                // Only dump the raw upstream text when the scanner changed it.
-                // raw_chars != text_chars means markup was consumed (converted
-                // to a tool_use) or, in the bug case, silently dropped.
-                if self.raw_chars != self.text_chars {
-                    format!(" raw={:?}", self.raw_content)
-                } else {
-                    String::new()
-                },
-            ),
-        );
         events
     }
 
