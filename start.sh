@@ -50,6 +50,52 @@ if [ "$REBUILD" = true ]; then
     RESTART=true
 fi
 
+# ─── launchd delegation ─────────────────────────────────────────────────────
+# When the launchd service com.local.vllm-proxy is loaded
+# (~/Library/LaunchAgents/com.local.vllm-proxy.plist), the service owns the
+# process — delegate instead of managing PIDFILE/foreground. --rebuild = build
+# then kickstart (kill + restart, atomic swap); --restart = kickstart; plain
+# start = ensure running. KeepAlive restarts the service automatically, so
+# kickstart is the atomic swap. The plist resolves STRATA_UBUNTU_KEY and
+# CONFIG_PATH at launch, so no key resolution is needed here.
+SERVICE="com.local.vllm-proxy"
+if launchctl list "$SERVICE" >/dev/null 2>&1; then
+    if [ "$BUILD_ONLY" = true ]; then
+        echo "Building vllm-proxy (release)..."
+        cd "$DIR" && cargo build --release || { echo "Build failed!"; exit 1; }
+        echo "Build complete. (launchd service NOT restarted — use --rebuild to swap.)"
+        exit 0
+    fi
+    if [ "$REBUILD" = true ]; then
+        echo "Building vllm-proxy (release)..."
+        cd "$DIR" && cargo build --release || { echo "Build failed!"; exit 1; }
+    fi
+    if [ "$RESTART" = true ] || [ "$REBUILD" = true ]; then
+        echo "Restarting launchd service $SERVICE..."
+        launchctl kickstart -k "gui/$UID/$SERVICE" || { echo "kickstart failed!"; exit 1; }
+    else
+        # Plain start: loaded but not running (e.g. after a manual bootout) → start it.
+        # `launchctl list <name>` prints a plist dump; the 3-column "PID - Label"
+        # form only comes from the no-arg listing, so grep that line.
+        SERVICE_PID=$(launchctl list 2>/dev/null | awk -v s="$SERVICE" '$3==s {print $1}')
+        if [ "$SERVICE_PID" = "-" ]; then
+            echo "launchd service $SERVICE is loaded but not running — starting it..."
+            launchctl start "$SERVICE"
+        else
+            echo "vllm-proxy already running under launchd (service $SERVICE, PID $SERVICE_PID)."
+            echo "Use --restart / --rebuild to swap."
+            exit 0
+        fi
+    fi
+    # Wait for proxy ready
+    for i in $(seq 1 10); do
+        curl -s "http://localhost:$PORT/v1/models" >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    echo "vllm-proxy listening (launchd: $SERVICE)"
+    exit 0
+fi
+
 # ─── Stop existing instance if --restart ────────────────────────────────────
 if [ "$RESTART" = true ]; then
     echo "Restarting vllm-proxy..."
