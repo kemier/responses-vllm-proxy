@@ -65,3 +65,7 @@ openai-compatibility:
             alias: qwen25-7b
             context_length: 32768
             tags: [fast]
+          - name: "qwen3:30b-a3b"
+            alias: qwen30b-a3b
+            context_length: 32768
+            tags: [fast, moe]
