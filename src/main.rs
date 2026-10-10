@@ -2358,6 +2358,145 @@ pub async fn handle_chat_completions(
         &format!("Passthrough POST {} model={}", url, backend_model),
     );
 
+    // Ollama mac provider: its OpenAI-compat /v1/chat/completions ignores
+    // enable_thinking and burns reasoning tokens (see tdai-gateway.mac.yaml).
+    // For non-streaming calls, round-trip through Ollama-native /api/chat with
+    // think:false and translate the response back to OpenAI shape — mirrors the
+    // memory gateway's own ollama-openai-fetch.ts so both routes suppress
+    // thinking. Streaming stays on the passthrough path (native translation is
+    // out of scope, same as the gateway's fetch wrapper).
+    let ollama_native = base_url.contains(":11434");
+    let nonstream = !request_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if ollama_native && nonstream {
+        let root = if base_url.ends_with("/v1") {
+            base_url[..base_url.len() - 3].to_string()
+        } else {
+            base_url
+        };
+        let native_url = format!("{}/api/chat", root);
+
+        let mut native_body = json!({
+            "model": request_json.get("model").cloned().unwrap_or(json!(backend_model)),
+            "messages": request_json.get("messages").cloned().unwrap_or(json!([])),
+            "stream": false,
+            "think": thinking_enabled,
+        });
+        if let Some(tools) = request_json.get("tools") {
+            native_body["tools"] = tools.clone();
+        }
+        if let Some(tc) = request_json.get("tool_choice") {
+            native_body["tool_choice"] = tc.clone();
+        }
+        // Forward OpenAI response_format to Ollama-native `format` so JSON
+        // extraction gets constrained decoding (raw JSON, no markdown fences).
+        // Without this, newer models (qwen3.6) wrap JSON in ```json fences and
+        // the gateway's strict JSON.parse fails → skill-extract dead-letters.
+        if let Some(rf) = request_json.get("response_format") {
+            let rtype = rf.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if rtype == "json_object" {
+                native_body["format"] = json!("json");
+            } else if rtype == "json_schema" {
+                if let Some(schema) = rf.get("json_schema").and_then(|js| js.get("schema")) {
+                    native_body["format"] = schema.clone();
+                }
+            }
+        }
+        let mut opts = json!({});
+        if let Some(mt) = request_json
+            .get("max_completion_tokens")
+            .or_else(|| request_json.get("max_tokens"))
+        {
+            opts["num_predict"] = mt.clone();
+        }
+        if let Some(t) = request_json.get("temperature") {
+            opts["temperature"] = t.clone();
+        }
+        if let Some(p) = request_json.get("top_p") {
+            opts["top_p"] = p.clone();
+        }
+        if !opts.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+            native_body["options"] = opts;
+        }
+
+        logger::info(
+            "chat",
+            &format!("Ollama native POST {} model={} think={}", native_url, backend_model, thinking_enabled),
+        );
+
+        let nreq = state.http_client.post(&native_url).json(&native_body);
+        let nreq = if let Some(k) = upstream.api_key.clone() {
+            nreq.header("Authorization", format!("Bearer {}", k))
+        } else {
+            nreq
+        };
+        let nresp = nreq.send().await;
+        match nresp {
+            Ok(r) => {
+                let status = r.status();
+                if !status.is_success() {
+                    let eb = r.bytes().await.unwrap_or_default();
+                    return (status, eb).into_response();
+                }
+                let raw = r.json::<Value>().await;
+                match raw {
+                    Ok(nv) => {
+                        let msg = nv.get("message").cloned().unwrap_or(json!({}));
+                        let mut out_msg = json!({
+                            "role": msg.get("role").cloned().unwrap_or(json!("assistant")),
+                            "content": msg.get("content").cloned().unwrap_or(json!("")),
+                        });
+                        if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                            if !tcs.is_empty() {
+                                out_msg["tool_calls"] = json!(tcs);
+                            }
+                        }
+                        let openai = json!({
+                            "id": "chatcmpl-ollama-native",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": backend_model,
+                            "choices": json!([json!({
+                                "index": 0,
+                                "message": out_msg,
+                                "finish_reason": "stop",
+                            })]),
+                            "usage": json!({
+                                "prompt_tokens": nv.get("prompt_eval_count").cloned().unwrap_or(json!(0)),
+                                "completion_tokens": nv.get("eval_count").cloned().unwrap_or(json!(0)),
+                                "total_tokens": 0,
+                            }),
+                        });
+                        let body_bytes = serde_json::to_vec(&openai).unwrap_or_default();
+                        return (
+                            StatusCode::OK,
+                            axum::body::Bytes::from(body_bytes),
+                        )
+                            .into_response();
+                    }
+                    Err(e) => {
+                        logger::error("chat", &format!("Ollama native response unparseable: {}", e));
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("Ollama native parse error: {}", e),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            Err(e) => {
+                logger::error("chat", &format!("Ollama native POST failed: {}", e));
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Ollama native error: {}", e),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let req = state
         .http_client
         .post(&url)
