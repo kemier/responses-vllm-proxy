@@ -17,7 +17,15 @@ rate-limit-per-minute: 60
 # Retry-After instead of being forwarded.
 max-concurrent-per-model: 3
 # Per-model overrides (keyed by backend model ID)
-model-concurrency: {}
+# Mac has one GPU: serialize the Ollama-served models so concurrent subagents
+# don't thrash it. The proxy semaphore holds extra requests (up to 60s, then
+# 503+Retry-After) instead of forwarding them — this is the working "limit
+# subagents to 1" at CLI 2.1.204, where MAX_CONCURRENT_SUBAGENTS doesn't exist.
+model-concurrency:
+    "qwen3.8-4b-distill": 1
+    "qwen3.8-4b-distill-nothink": 1
+    "qwen3:30b-a3b": 1
+    "qwen2.5:7b": 1
 request-retry: 3
 
 # Logging
