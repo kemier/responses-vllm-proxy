@@ -2461,6 +2461,22 @@ pub async fn handle_chat_completions(
                                         Some(t) if t.is_null() => e["type"] = json!("function"),
                                         Some(_) => {}
                                     }
+                                    // OpenAI schema requires function.arguments to be a
+                                    // JSON-encoded STRING; Ollama-native returns it as an
+                                    // object → SDK schema validation rejects → "Invalid JSON
+                                    // response". Serialize when it's an object/array.
+                                    if let Some(fnv) = e.clone().get("function") {
+                                        if let Some(args) = fnv.get("arguments") {
+                                            if !args.is_null() && !args.is_string() {
+                                                let mut ee = e;
+                                                ee["function"] = json!({
+                                                    "name": fnv.get("name").cloned().unwrap_or(json!("")),
+                                                    "arguments": json!(serde_json::to_string(args).unwrap_or_default()),
+                                                });
+                                                return ee;
+                                            }
+                                        }
+                                    }
                                     e
                                 }).collect();
                                 out_msg["tool_calls"] = json!(normalized);
