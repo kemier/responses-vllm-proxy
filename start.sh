@@ -137,6 +137,21 @@ if [ "$BUILD_ONLY" = true ]; then
     exit 0
 fi
 
+# ─── Upstream keys ──────────────────────────────────────────────────────────
+# Providers read their upstream key from env (api-key-env in config.yaml) so
+# the tracked config never carries a secret. If the caller didn't export it,
+# resolve it from ~/.claude/settings.json — ANTHROPIC_AUTH_TOKEN is the key
+# this machine's sessions already authenticate the Ubuntu llama-server with.
+if [ -z "${STRATA_UBUNTU_KEY:-}" ]; then
+    STRATA_UBUNTU_KEY=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["env"]["ANTHROPIC_AUTH_TOKEN"])' "$HOME/.claude/settings.json" 2>/dev/null)
+    if [ -n "$STRATA_UBUNTU_KEY" ]; then
+        export STRATA_UBUNTU_KEY
+        echo "STRATA_UBUNTU_KEY resolved from $HOME/.claude/settings.json"
+    else
+        echo "WARNING: STRATA_UBUNTU_KEY unset and not resolvable — keyed providers will 401 upstream"
+    fi
+fi
+
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"
 (cd "$DIR" && "$BIN_PATH") &
