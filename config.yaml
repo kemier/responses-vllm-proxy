@@ -25,6 +25,7 @@ model-concurrency:
     "qwen3.8-4b-distill": 1
     "qwen3.8-4b-distill-nothink": 1
     "qwen3:30b-a3b": 1
+    "qwen3.6:35b": 1
     "qwen2.5:7b": 1
 request-retry: 3
 
@@ -75,5 +76,9 @@ openai-compatibility:
             tags: [fast]
           - name: "qwen3:30b-a3b"
             alias: qwen30b-a3b
+            context_length: 32768
+            tags: [fast, moe]
+          - name: "qwen3.6:35b"
+            alias: qwen36-35b
             context_length: 32768
             tags: [fast, moe]
