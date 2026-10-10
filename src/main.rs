@@ -2378,9 +2378,52 @@ pub async fn handle_chat_completions(
         };
         let native_url = format!("{}/api/chat", root);
 
+        // Ollama-native /api/chat expects tool-call `function.arguments` as an
+        // OBJECT; the OpenAI-compat request the SDK replays carries it as a JSON
+        // STRING (OpenAI format). On the extractor's multi-turn loop the step-1
+        // tool call is sent back as history, and Ollama's parser then fails:
+        // "Value looks like object, but can't find closing '}' symbol" → 400 →
+        // skill-extract dead-letters. Mirror of the response-path normalization
+        // (which stringifies object→string); here parse string→object.
+        let raw_messages = request_json
+            .get("messages")
+            .cloned()
+            .unwrap_or(json!([]));
+        let native_messages: Value = if let Some(arr) = raw_messages.as_array() {
+            let out: Vec<Value> = arr.iter().map(|msg| {
+                let mut m = msg.clone();
+                if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                    let normalized: Vec<Value> = tcs.iter().map(|tc| {
+                        let e = tc.clone();
+                        if let Some(fnv) = e.clone().get("function").and_then(|f| f.as_object()) {
+                            if let Some(args) = fnv.get("arguments") {
+                                if let Some(s) = args.as_str() {
+                                    let parsed = serde_json::from_str(s).unwrap_or(json!(null));
+                                    if parsed.is_object() {
+                                        let mut ee = e;
+                                        ee["function"] = json!({
+                                            "name": fnv.get("name").cloned().unwrap_or(json!("")),
+                                            "arguments": parsed,
+                                        });
+                                        return ee;
+                                    }
+                                }
+                            }
+                        }
+                        e
+                    }).collect();
+                    m["tool_calls"] = json!(normalized);
+                }
+                m
+            }).collect();
+            json!(out)
+        } else {
+            raw_messages
+        };
+
         let mut native_body = json!({
             "model": request_json.get("model").cloned().unwrap_or(json!(backend_model)),
-            "messages": request_json.get("messages").cloned().unwrap_or(json!([])),
+            "messages": native_messages,
             "stream": false,
             "think": thinking_enabled,
         });
