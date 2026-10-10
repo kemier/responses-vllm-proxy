@@ -231,3 +231,131 @@ openai-compatibility:
     // default/ prefix is stripped for unknown models
     assert_eq!(cfg.resolve_model("default/foo-bar"), "foo-bar");
 }
+
+#[test]
+fn test_upstream_for_routes_across_machines() {
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    models:
+      - name: qwen3.8-flash-next-coder-iq1_m
+        alias: strata-qwen
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    models:
+      - name: qwen3.8-4b-distill
+        alias: qwen38-4b
+"#;
+    let path = "/tmp/test_vllm_route1.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    let mac = cfg.upstream_for("qwen38-4b");
+    assert_eq!(mac.base_url, "http://127.0.0.1:11434/v1");
+    assert_eq!(mac.provider_name, "mac");
+    assert_eq!(mac.backend_model, "qwen3.8-4b-distill");
+    assert_eq!(mac.provider_idx, 1);
+    let ubuntu = cfg.upstream_for("strata-qwen");
+    assert_eq!(ubuntu.base_url, "http://192.168.124.14:8080/v1");
+    assert_eq!(ubuntu.provider_name, "default");
+    assert_eq!(ubuntu.provider_idx, 0);
+    // A model the catalog doesn't list still reaches the default machine
+    // with its name unchanged — routing must not swallow unknown slugs.
+    let unknown = cfg.upstream_for("not-in-catalog");
+    assert_eq!(unknown.base_url, "http://192.168.124.14:8080/v1");
+    assert_eq!(unknown.backend_model, "not-in-catalog");
+}
+
+#[test]
+fn test_qualified_alias_picks_machine() {
+    // Two machines carrying the SAME alias: the plain alias resolves to the
+    // first provider that declares it, the qualified form names the machine.
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    models:
+      - name: qwen-big
+        alias: qwen
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    models:
+      - name: qwen-small
+        alias: qwen
+"#;
+    let path = "/tmp/test_vllm_route2.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    assert_eq!(cfg.resolve_model("qwen"), "qwen-big");
+    assert_eq!(cfg.resolve_model("mac/qwen"), "qwen-small");
+    assert_eq!(cfg.upstream_for("mac/qwen").base_url, "http://127.0.0.1:11434/v1");
+    assert_eq!(cfg.upstream_for("qwen").base_url, "http://192.168.124.14:8080/v1");
+}
+
+#[test]
+fn test_all_models_lists_both_machines() {
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    models:
+      - name: qwen-big
+        alias: qwen
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    models:
+      - name: qwen-small
+        alias: qwen
+"#;
+    let path = "/tmp/test_vllm_route3.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    let models = cfg.all_models();
+    // Plain alias appears once (first provider wins); the non-default machine
+    // also gets a qualified entry so the picker can offer both.
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0], ("qwen".to_string(), "qwen-big".to_string()));
+    assert_eq!(models[1], ("mac/qwen".to_string(), "qwen-small".to_string()));
+}
+
+#[test]
+fn test_api_key_resolved_from_env() {
+    std::env::set_var("MAC_OLLAMA_KEY_TEST", "sekret-token");
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    models:
+      - name: qwen-big
+        alias: qwen
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    api-key-env: "MAC_OLLAMA_KEY_TEST"
+    models:
+      - name: qwen-small
+        alias: small
+"#;
+    let path = "/tmp/test_vllm_route4.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    let mac = cfg.upstream_for("small");
+    assert_eq!(mac.api_key, Some("sekret-token".to_string()));
+    // The default provider has no key configured: nothing is invented.
+    assert_eq!(cfg.upstream_for("qwen").api_key, None);
+}

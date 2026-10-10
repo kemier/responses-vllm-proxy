@@ -30,18 +30,38 @@ log-dir: "logs"
 # Set to true to diagnose hallucination caused by missing system prompt on incremental requests.
 log-turn-debug: false
 
-# Upstream OpenAI-compatible server.
-# NOTE: proxy picks provider named "default", else the first entry — single base-url.
+# Upstream servers. The proxy routes PER MODEL: the provider declaring the
+# requested alias serves it, so one ANTHROPIC_BASE_URL can front several
+# machines. The provider named "default" is the fallback for any slug the
+# catalog doesn't list. A client may also name the machine explicitly with the
+# qualified form, e.g. model "mac/qwen38-4b".
+#
+# Upstream keys come from env (api-key-env) so this tracked file never carries
+# a secret. Export them before start.sh — the value lives in ~/.claude/settings.json:
+#   export STRATA_UBUNTU_KEY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["env"]["ANTHROPIC_AUTH_TOKEN"])' /Users/zaedinzeng/.claude/settings.json)"
 openai-compatibility:
     - name: "default"
       prefix: "default"
-      base-url: "http://127.0.0.1:8008/v1"
+      base-url: "http://192.168.124.14:8080/v1"
+      api-key-env: "STRATA_UBUNTU_KEY"
       models:
-          - name: qwen38-27b
-            alias: qwen38-27b
+          - name: qwen3.8-flash-next-coder-iq1_m
+            alias: qwen3.8-flash-next-coder-iq1_m
             context_length: 262144
             tags: [coding, reasoning]
-          - name: qwen38-27b
-            alias: qwythos
-            context_length: 262144
-            tags: [coding, reasoning]
+    - name: "mac"
+      prefix: "mac"
+      base-url: "http://127.0.0.1:11434/v1"
+      models:
+          - name: qwen3.8-4b-distill
+            alias: qwen38-4b
+            context_length: 32768
+            tags: [fast]
+          - name: qwen3.8-4b-distill-nothink
+            alias: qwen38-4b-nothink
+            context_length: 32768
+            tags: [fast]
+          - name: "qwen2.5:7b"
+            alias: qwen25-7b
+            context_length: 32768
+            tags: [fast]

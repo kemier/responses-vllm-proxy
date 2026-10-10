@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -42,10 +43,11 @@ pub struct Config {
     /// Useful for diagnosing hallucination caused by missing system prompt.
     #[serde(default)]
     pub log_turn_debug: bool,
-    /// Alias → backend model name map, populated once at load time.
-    /// Used by `resolve_model()` to avoid per-request Vec allocation.
+    /// Alias → (provider index, backend model name) map, populated once at load
+    /// time. Keyed by plain alias AND by `provider/alias`, so a client can name
+    /// which machine serves a model when two providers carry the same family.
     #[serde(skip)]
-    pub model_lookup: HashMap<String, String>,
+    pub model_lookup: HashMap<String, UpstreamTarget>,
 }
 
 fn default_true() -> bool {
@@ -74,6 +76,18 @@ pub struct OpenAICompatProvider {
     #[allow(dead_code)]
     pub prefix: String,
     pub base_url: String,
+    /// Upstream key for THIS provider, sent as `Authorization: Bearer <key>` on
+    /// every request forwarded to it. A llama-server started with `--api-key`
+    /// rejects keyless requests, so a provider pointing at one must carry its
+    /// key here. The client's own token is deliberately NOT forwarded: it
+    /// authenticates the client against the proxy, not against the upstream.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Name of an environment variable holding this provider's upstream key.
+    /// Resolved into `api_key` at load time, so a tracked config file never
+    /// carries the secret itself.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     pub models: Vec<OpenAICompatModel>,
 }
 
@@ -92,6 +106,14 @@ pub struct OpenAICompatModel {
     pub tags: Option<Vec<String>>,
 }
 
+/// Which provider should serve a requested model, and the backend model ID that
+/// provider expects.
+#[derive(Debug, Clone)]
+pub struct UpstreamTarget {
+    pub provider_idx: usize,
+    pub backend_model: String,
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let raw = std::fs::read_to_string(path)?;
@@ -108,18 +130,31 @@ impl Config {
         if cfg.debug {
             cfg.log_level = "debug".to_string();
         }
-        // Build the alias → backend model lookup map once.
-        let model_pairs: Vec<(String, String)> = cfg
-            .provider()
-            .map(|p| {
-                p.models
-                    .iter()
-                    .map(|m| (m.alias.clone(), m.name.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (alias, name) in model_pairs {
-            cfg.model_lookup.insert(alias, name);
+        // Build the alias → (provider, backend model) lookup map once, across
+        // EVERY provider. This used to walk only the default provider, which
+        // pinned the whole proxy to a single base URL. First provider declaring
+        // a plain alias wins; the `provider/alias` form is always registered and
+        // is how a client picks a specific machine.
+        for (idx, p) in cfg.openai_compatibility.iter().enumerate() {
+            for m in &p.models {
+                let target = UpstreamTarget{ provider_idx: idx, backend_model: m.name.clone() };
+                if !cfg.model_lookup.contains_key(&m.alias) {
+                    cfg.model_lookup.insert(m.alias.clone(), target.clone());
+                }
+                let qualified = format!("{}/{}", p.name, m.alias);
+                if !cfg.model_lookup.contains_key(&qualified) {
+                    cfg.model_lookup.insert(qualified, target.clone());
+                }
+            }
+        }
+        // Resolve per-provider upstream keys from env so the tracked config
+        // file never carries a secret. An explicit `api-key` still wins.
+        for p in cfg.openai_compatibility.iter_mut() {
+            if p.api_key.is_none() {
+                if let Some(name) = p.api_key_env.clone() {
+                    p.api_key = std::env::var(name).ok();
+                }
+            }
         }
         Ok(cfg)
     }
@@ -131,36 +166,132 @@ impl Config {
             .or_else(|| self.openai_compatibility.first())
     }
 
-    /// Get tags for a model alias (for /v1/models metadata response).
-    pub fn model_tags(&self, alias: &str) -> Option<&[String]> {
-        self.provider()
-            .and_then(|p| p.models.iter().find(|m| m.alias == alias))
-            .and_then(|m| m.tags.as_deref())
+    /// Index of the fallback provider `provider()` picks, so `upstream_for()`
+    /// can hand back a client index even for models the catalog doesn't list.
+    pub fn default_provider_idx(&self) -> usize {
+        self.openai_compatibility
+            .iter()
+            .position(|p| p.name == "default")
+            .unwrap_or_else(|| 0)
     }
 
-    pub fn all_models(&self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        if let Some(p) = self.provider() {
+    /// Resolve a requested model key to the provider that should serve it.
+    /// `key` may be a plain alias, a `provider/alias` qualified alias, or an
+    /// already-resolved backend model ID (the summarize path resolves before
+    /// calling). None means "nothing declares it" — callers fall back to the
+    /// default provider.
+    pub fn upstream_target(&self, key: &str) -> Option<UpstreamTarget> {
+        if let Some(t) = self.model_lookup.get(key) {
+            return Some(t.clone());
+        }
+        if let Some(stripped) = key.strip_prefix("default/") {
+            if let Some(t) = self.model_lookup.get(stripped) {
+                return Some(t.clone());
+            }
+        }
+        for (idx, p) in self.openai_compatibility.iter().enumerate() {
+            if p.models.iter().any(|m| m.name == key) {
+                return Some(UpstreamTarget{ provider_idx: idx, backend_model: key.to_string() });
+            }
+        }
+        None
+    }
+
+    /// Everything one upstream request needs, from a single lookup: which
+    /// provider serves this model, that provider's base URL and optional key,
+    /// and the backend model ID. Unknown keys fall back to the default provider
+    /// and echo the key as the model ID — the same fallbacks resolve_model() has
+    /// always had, so a model the catalog doesn't list still reaches the
+    /// default machine unchanged.
+    pub fn upstream_for(&self, key: &str) -> Upstream {
+        let target = self.upstream_target(key);
+        let provider = target.as_ref()
+            .and_then(|t| self.openai_compatibility.get(t.provider_idx))
+            .or_else(|| self.provider());
+        let provider_idx = target.as_ref().map(|t| t.provider_idx).unwrap_or_else(|| self.default_provider_idx());
+        let backend_model = match target {
+            Some(t) => t.backend_model,
+            None => {
+                if let Some(stripped) = key.strip_prefix("default/") {
+                    stripped.to_string()
+                } else {
+                    key.to_string()
+                }
+            }
+        };
+        let (base_url, api_key, provider_name) = match provider {
+            Some(p) => (p.base_url.clone(), p.api_key.clone(), p.name.clone()),
+            None => ("".to_string(), None, "default".to_string()),
+        };
+        Upstream {
+            base_url,
+            api_key,
+            backend_model,
+            provider_name,
+            provider_idx,
+        }
+    }
+
+    /// Get tags for a model alias (for /v1/models metadata response). Matches a
+    /// plain alias, a `provider/alias` qualified alias, or a backend model name.
+    pub fn model_tags(&self, alias: &str) -> Option<&[String]> {
+        for p in self.openai_compatibility.iter() {
             for m in &p.models {
-                out.push((m.alias.clone(), m.name.clone()));
+                let qualified = format!("{}/{}", p.name, m.alias);
+                if m.alias == alias || m.name == alias || qualified == alias {
+                    return m.tags.as_deref();
+                }
+            }
+        }
+        None
+    }
+
+    /// Catalog for /v1/models: every model across every provider. Plain aliases
+    /// are listed once (first provider declaring one wins); non-default
+    /// providers also get a `provider/alias` entry so a client can name the
+    /// machine explicitly.
+    pub fn all_models(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<String> = std::collections::HashSet::new();
+        for p in self.openai_compatibility.iter() {
+            for m in &p.models {
+                if seen.insert(m.alias.clone()) {
+                    out.push((m.alias.clone(), m.name.clone()));
+                }
+                if p.name != "default" {
+                    let qualified = format!("{}/{}", p.name, m.alias);
+                    if seen.insert(qualified.clone()) {
+                        out.push((qualified, m.name.clone()));
+                    }
+                }
             }
         }
         out
     }
 
-    /// Resolve a model alias to its backend model ID using the pre-built
-    /// lookup map. Falls back to stripping a `default/` prefix, then to
-    /// the alias itself. This replaces the per-request `all_models()` +
-    /// `.find()` pattern on the hot path.
+    /// Resolve a model alias to its backend model ID. Falls back to stripping a
+    /// `default/` prefix, then to the alias itself.
     pub fn resolve_model(&self, alias: &str) -> String {
-        if let Some(name) = self.model_lookup.get(alias) {
-            return name.clone();
+        if let Some(t) = self.upstream_target(alias) {
+            return t.backend_model;
         }
         if let Some(stripped) = alias.strip_prefix("default/") {
             return stripped.to_string();
         }
         alias.to_string()
     }
+}
+
+/// A resolved upstream: base URL, optional key, backend model ID, provider name.
+pub struct Upstream {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub backend_model: String,
+    pub provider_name: String,
+    /// Index into `Config.openai_compatibility`, so a caller can pick the
+    /// per-provider `reqwest::Client` (which carries that provider's upstream
+    /// `Authorization` header) without re-resolving the model.
+    pub provider_idx: usize,
 }
 
 // Minimal shellexpand

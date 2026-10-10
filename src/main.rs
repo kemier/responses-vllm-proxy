@@ -134,11 +134,15 @@ impl ModelThrottle {
         limits.get(model).copied().unwrap_or(self.default_limit)
     }
 
-    /// Acquire a permit for `model`, waiting up to `timeout`. Returns None if
-    /// the wait timed out (caller should respond 503 + Retry-After).
+    /// Acquire a permit for `model` on the provider `provider_idx`, waiting up
+    /// to `timeout`. Returns None if the wait timed out (caller should respond
+    /// 503 + Retry-After).  The semaphore is keyed by provider + model so two
+    /// providers serving the same backend model ID get independent slots; the
+    /// per-model limit override still looks up the bare model ID.
     pub async fn acquire(
         &self,
         model: &str,
+        provider_idx: usize,
         timeout: Duration,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let limit = self.limit_for(model);
@@ -146,10 +150,11 @@ impl ModelThrottle {
             return None; // 0 = unlimited (config default is 3, but allow opt-out)
         }
 
-        // Lazily create the semaphore for this model.
+        // Lazily create the semaphore for this provider+model pair.
+        let sem_key = format!("{}/{}", provider_idx, model);
         let sem = {
             let mut sems = self.semaphores.lock().await;
-            sems.entry(model.to_string())
+            sems.entry(sem_key)
                 .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
                 .clone()
         };
@@ -193,9 +198,12 @@ async fn throttle_model<'a>(
     if limit == 0 {
         return Ok(None); // unlimited
     }
+    // Resolve which provider will serve this model so two providers carrying
+    // the same backend model ID get independent semaphore slots.
+    let provider_idx = state.cfg.upstream_for(&model).provider_idx;
     match state
         .model_throttle
-        .acquire(model, MODEL_THROTTLE_TIMEOUT)
+        .acquire(model, provider_idx, MODEL_THROTTLE_TIMEOUT)
         .await
     {
         Some(permit) => Ok(Some(permit)),
@@ -897,7 +905,8 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     }
 
     // Get auth token
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        let upstream = state.cfg.upstream_for(&backend_model);
+        let base_url = upstream.base_url;
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -905,11 +914,13 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
         &format!("POST {} model={} stream={}", url, backend_model, is_stream),
     );
 
-    let resp = match state
+    let req = state
         .http_client
         .post(&url)
 
-        .header("Accept", "text/event-stream")
+        .header("Accept", "text/event-stream");
+        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+        let resp = match req
         .json(&cc_payload)
         .send()
         .await
@@ -953,6 +964,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
             && needs_noargs_retry(&backend_model);
         let retry_client = state.http_client.clone();
         let retry_url = url.clone();
+        let retry_api_key = upstream.api_key.clone();
             let retry_request = cc_payload.clone();
 
         // Use a channel so we can detect client disconnects.  When the
@@ -1125,7 +1137,12 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
               && translator.should_retry_non_streaming(NOARGS_RETRY_MAX_TEXT)
           {
               if let Some(message) =
-                  retry_non_streaming(&retry_client, &retry_url, &retry_request)
+                  retry_non_streaming(
+                      &retry_client,
+                      &retry_url,
+                      &retry_request,
+                      retry_api_key.as_deref(),
+                  )
                       .await
               {
                   let events = translator.inject_tool_calls_from_message(&message);
@@ -1649,7 +1666,8 @@ pub async fn handle_responses_ws(
                 continue 'connection; // keep connection alive for compact/retry
             }
 
-                       let base_url = state.cfg.provider().unwrap().base_url.clone();
+                       let upstream = state.cfg.upstream_for(&backend_model);
+                       let base_url = upstream.base_url;
            let url = format!("{}/chat/completions", base_url);
 
            logger::info("ws", &format!("WS POST {} model={} stream={}", url, backend_model, is_stream));
@@ -1661,10 +1679,12 @@ pub async fn handle_responses_ws(
             // response headers (which can take 60+ seconds for large resumed
             // sessions), send WebSocket pings every 15 seconds to keep the
             // connection alive and prevent "Connection reset by peer".
-            let send_fut = state.http_client
+            let req = state.http_client
                 .post(&url)
 
-                .header("Accept", "text/event-stream")
+                .header("Accept", "text/event-stream");
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                let send_fut = req
                 .json(&cc_payload)
                 .send();
 
@@ -1932,6 +1952,7 @@ pub async fn handle_responses_ws(
                    &state.http_client,
                    &url,
                    &cc_payload,
+                   upstream.api_key.as_deref(),
                )
                .await
                {
@@ -2328,7 +2349,8 @@ pub async fn handle_chat_completions(
         }
     }
 
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        let upstream = state.cfg.upstream_for(&backend_model);
+        let base_url = upstream.base_url;
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -2336,12 +2358,14 @@ pub async fn handle_chat_completions(
         &format!("Passthrough POST {} model={}", url, backend_model),
     );
 
-    let resp = state
+    let req = state
         .http_client
         .post(&url)
 
         .header("Accept", "text/event-stream")
-        .json(&request_json)
+        .json(&request_json);
+        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+        let resp = req
         .send()
         .await;
 
@@ -2708,7 +2732,8 @@ pub async fn handle_embeddings(
     let backend_model = state.cfg.resolve_model(&model_alias);
     request_json["model"] = json!(backend_model);
 
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        let upstream = state.cfg.upstream_for(&backend_model);
+        let base_url = upstream.base_url;
     let url = format!("{}/embeddings", base_url);
 
     logger::info(
@@ -2716,9 +2741,11 @@ pub async fn handle_embeddings(
         &format!("Passthrough POST {} model={}", url, backend_model),
     );
 
-    let resp = state
+    let req = state
         .http_client
-        .post(&url)
+        .post(&url);
+        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+        let resp = req
 
         .json(&request_json)
         .send()
@@ -2821,15 +2848,20 @@ async fn retry_non_streaming(
     client: &reqwest::Client,
     url: &str,
     cc_request: &Value,
+    api_key: Option<&str>,
 ) -> Option<Value> {
     let mut body = cc_request.clone();
     if let Some(obj) = body.as_object_mut() {
         obj.insert("stream".to_string(), json!(false));
         obj.remove("stream_options");
     }
-    let resp = client
-        .post(url)
-
+    let req = client.post(url);
+    let req = if let Some(k) = api_key {
+        req.header("Authorization", format!("Bearer {}", k))
+    } else {
+        req
+    };
+    let resp = req
         .json(&body)
         .send()
         .await;
@@ -2977,7 +3009,8 @@ pub async fn handle_messages(
         }
     }
 
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        let upstream = state.cfg.upstream_for(&backend_model);
+        let base_url = upstream.base_url;
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -3081,11 +3114,13 @@ pub async fn handle_messages(
         );
     }
 
-    let resp = state
+    let req = state
         .http_client
         .post(&url)
 
-        .header("Accept", "text/event-stream")
+        .header("Accept", "text/event-stream");
+        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+        let resp = req
         .json(&cc_request)
         .send()
         .await;
@@ -3188,6 +3223,7 @@ pub async fn handle_messages(
                     has_zero_parameter_tool(&request_json) && needs_noargs_retry(&backend_model);
                 let retry_client = state.http_client.clone();
                 let retry_url = url.clone();
+                let retry_api_key = upstream.api_key.clone();
                             let retry_request = cc_request.clone();
 
                 let model_for_translator = backend_model.clone();
@@ -3366,6 +3402,7 @@ pub async fn handle_messages(
                                    &retry_client,
                                    &retry_url,
                                        &retry_request,
+                                   retry_api_key.as_deref(),
                                )
                                .await
                                {
@@ -3498,7 +3535,8 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
         translate_request::responses_to_chat_completions(&backend_model, &request_json, false);
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
 
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        let upstream = state.cfg.upstream_for(&backend_model);
+        let base_url = upstream.base_url;
     let url = format!("{}/chat/completions", base_url);
 
     // Context size warning: estimate tokens and log if exceeds model's context window.
@@ -3536,11 +3574,13 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
         ),
     );
 
-    let resp = match state
+    let req = state
         .http_client
         .post(&url)
 
-        .header("Accept", "text/event-stream")
+        .header("Accept", "text/event-stream");
+        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+        let resp = match req
         .json(&cc_payload)
         .send()
         .await
@@ -3803,7 +3843,8 @@ Keep the summary under 500 words. Do not include code blocks — describe change
     });
 
     // ── Send to backend ───────────────────────────────────────────────────
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        let upstream = state.cfg.upstream_for(&summary_model);
+        let base_url = upstream.base_url;
     let url = format!("{}/chat/completions", base_url);
 
     logger::info(
@@ -3811,11 +3852,13 @@ Keep the summary under 500 words. Do not include code blocks — describe change
         &format!("POST {} model={}", url, summary_model),
     );
 
-    let resp = match state
+    let req = state
         .http_client
         .post(&url)
 
-        .header("Accept", "text/event-stream")
+        .header("Accept", "text/event-stream");
+        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+        let resp = match req
         .json(&cc_payload)
         .send()
         .await
