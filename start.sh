@@ -154,7 +154,23 @@ fi
 
 # ─── Start proxy ────────────────────────────────────────────────────────────
 export CONFIG_PATH="$DIR/config.yaml"
-(cd "$DIR" && "$BIN_PATH") &
+
+# Detach mode: when stdout is not a TTY (piped, e.g. `start.sh --rebuild | tail`
+# from an agent/CI harness), the foreground `wait $PID` below would block the
+# caller forever — and even with it removed, the proxy would keep the pipeline's
+# write end open, so the pipe consumer still waits for EOF. In that case run the
+# proxy detached: its console goes to /dev/null (the file logger in logs/ still
+# captures everything) and the script exits once the proxy is ready.
+DETACH=false
+if [ ! -t 1 ]; then
+    DETACH=true
+fi
+
+if [ "$DETACH" = true ]; then
+    (cd "$DIR" && "$BIN_PATH" >/dev/null 2>&1) &
+else
+    (cd "$DIR" && "$BIN_PATH") &
+fi
 PID=$!
 echo "$PID" > "$PIDFILE"
 echo "vllm-proxy started (PID $PID)"
@@ -167,6 +183,11 @@ done
 
 # ─── Cleanup on exit ────────────────────────────────────────────────────────
 cleanup() {
+    # Detached: the proxy is meant to survive this script — keep its PIDFILE so
+    # a later --restart can find it; never kill it here.
+    if [ "$DETACH" = true ]; then
+        return
+    fi
     # Wait for the proxy to drain connections after receiving SIGINT/SIGTERM.
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         echo "Waiting for proxy (PID $PID) to drain connections..."
@@ -183,5 +204,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Keep proxy in foreground
+# Keep proxy in foreground (interactive mode only); detached callers return now.
+if [ "$DETACH" = true ]; then
+    exit 0
+fi
 wait $PID
