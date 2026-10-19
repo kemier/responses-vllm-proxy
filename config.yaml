@@ -10,19 +10,24 @@ auth-dir: "~/.cli-proxy-api"
 # Generate with: openssl rand -hex 32
 api-keys: []
 # Max requests per minute per client IP (0 = unlimited)
-rate-limit-per-minute: 60
+# Unlimited on this machine: the per-model semaphore is the real gate, and this
+# limiter is per-IP across ALL models — a 5-subagent burst (~50 POSTs/min plus
+# main-agent turns) grazes a 60/min budget and a 429 here is a hard rejection
+# with no queue. The limiter exists for a network-exposed proxy (CWE-770);
+# requests here are authenticated by API key.
+rate-limit-per-minute: 0
 # Max concurrent in-flight requests per backend model (0 = unlimited).
 # Prevents upstream 429 "queue full" storms when multiple agents all hit
 # the same model at once. Excess requests queue up to MODEL_THROTTLE_TIMEOUT
-# (240s in src/main.rs) for a free semaphore slot, then get 503 +
+# (600s in src/main.rs) for a free semaphore slot, then get 503 +
 # Retry-After: 60 instead of being forwarded.
 max-concurrent-per-model: 3
 # Per-model overrides (keyed by backend model ID)
 # Mac has one GPU: serialize the Ollama-served models so concurrent subagents
 # don't thrash it. The proxy semaphore holds extra requests for up to
-# MODEL_THROTTLE_TIMEOUT (240s) — the queue is FIFO, so a queued request
+# MODEL_THROTTLE_TIMEOUT (600s) — the queue is FIFO, so a queued request
 # proceeds the moment the previous generation frees the slot; only after a
-# 240s wait does it return 503 + Retry-After: 60. Observed worst wait on
+# 600s wait does it return 503 + Retry-After: 60. Observed worst wait on
 # qwen3.6:35b is ~56s, so the 503 path never fires in practice: waiting IS
 # the GPU gate. This is the working "limit subagents to 1" at CLI 2.1.204,
 # where MAX_CONCURRENT_SUBAGENTS doesn't exist.

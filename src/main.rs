@@ -181,8 +181,10 @@ impl ModelThrottle {
 
 /// Throttle timeout before returning 503. Long enough that a streaming model
 /// slot is unlikely to be held much longer; short enough that the client
-/// retries rather than hanging.
-const MODEL_THROTTLE_TIMEOUT: Duration = Duration::from_secs(240);
+/// retries rather than hanging. Sized above the longest observed upstream turn
+/// (~296s on qwen3.6:35b) so a queued request never 503s behind a live one —
+/// waiting IS the GPU gate, the 503 is only an escape hatch.
+const MODEL_THROTTLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// HTTP 503 Retry-After suggested to the client after a throttle timeout.
 const MODEL_THROTTLE_RETRY_AFTER: &str = "60";
 
