@@ -90,7 +90,12 @@ pub fn anthropic_to_chat_completions_with_vision(
                     .map(extract_text_from_content)
                     .unwrap_or_default();
                 if !text.is_empty() {
-                    messages.push(json!({"role": "user", "content": text}));
+                    // A system-role message that would land at index 0 is the
+                    // system prompt delivered through `messages` instead of the
+                    // top-level `system` field — keep it a system message. Only
+                    // mid-conversation ones are re-roled to user in place.
+                    let role_out = if messages.is_empty() { "system" } else { "user" };
+                    messages.push(json!({"role": role_out, "content": text}));
                 }
                 continue;
             }

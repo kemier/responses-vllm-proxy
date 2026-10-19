@@ -77,13 +77,13 @@ fn test_anthropic_system_array_becomes_system_message() {
 }
 
 #[test]
-fn test_anthropic_mid_array_system_message_merged_into_leading_system() {
+fn test_anthropic_mid_array_system_message_converted_in_place() {
     // Claude Code CLI sometimes emits a `system`-role message inside `messages`
     // (e.g. the "Available agent types for the Agent tool" block injected
-    // mid-conversation). vLLM rejects any request where the first message is
-    // not system ("System message must be at the beginning."), so stray system
-    // messages must be merged into the leading system message, never emitted
-    // in place after a user message.
+    // mid-conversation). Policy (fe70336, 2026-09-19): convert it to a user
+    // message IN PLACE — never merge into the leading system message, which
+    // rewrote the rendered token prefix and forced a full re-prefill (f_sim
+    // dropped below 0.1). In-place keeps f_sim=0.969 / f_keep=0.984.
     let body = json!({
         "model": "claude-3",
         "max_tokens": 100,
@@ -96,23 +96,21 @@ fn test_anthropic_mid_array_system_message_merged_into_leading_system() {
     });
     let out = anthropic_to_chat_completions("glm", &body, false);
     let messages = out["messages"].as_array().unwrap();
-    // No non-first system message may survive.
+    // The stray system survives at its original position, re-roled as user.
     let roles: Vec<&str> = messages
         .iter()
         .map(|m| m["role"].as_str().unwrap())
         .collect();
-    assert_eq!(roles, vec!["system", "user", "user"]);
-    // The leading system message absorbed the mid-array system text.
-    assert!(messages[0]["content"]
+    assert_eq!(roles, vec!["system", "user", "user", "user"]);
+    // The leading system message is untouched — it did NOT absorb the block.
+    assert_eq!(messages[0]["content"], "You are helpful.");
+    assert_eq!(messages[1]["content"], "Hi there");
+    assert_eq!(messages[2]["role"], "user");
+    assert!(messages[2]["content"]
         .as_str()
         .unwrap()
         .contains("Available agent types"));
-    assert!(messages[0]["content"]
-        .as_str()
-        .unwrap()
-        .starts_with("You are helpful."));
-    assert_eq!(messages[1]["content"], "Hi there");
-    assert_eq!(messages[2]["content"], "Use the agent tool now");
+    assert_eq!(messages[3]["content"], "Use the agent tool now");
 }
 
 #[test]
