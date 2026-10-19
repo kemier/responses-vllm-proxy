@@ -70,6 +70,17 @@ openai-compatibility:
             alias: qwen38-4b-nothink
             context_length: 32768
             tags: [fast]
+          # Claude Code auto mode probes `claude-sonnet-5` on the same base URL
+          # as the coding model. Serve that id from the Mac model so the probe
+          # does not fall through to Ubuntu and time out.
+          - name: qwen3.8-4b-distill-nothink
+            alias: claude-sonnet-5
+            context_length: 32768
+            tags: [fast]
+          - name: qwen3.8-4b-distill-nothink
+            alias: "claude-sonnet-5[1m]"
+            context_length: 32768
+            tags: [fast]
           - name: "qwen2.5:7b"
             alias: qwen25-7b
             context_length: 32768

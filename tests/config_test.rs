@@ -233,6 +233,40 @@ openai-compatibility:
 }
 
 #[test]
+fn test_claude_sonnet_5_classifier_routes_to_mac() {
+    let yaml = r#"
+port: 8317
+auth-dir: "/tmp/test"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    models:
+      - name: qwen3.8-flash-next-coder-iq1_m
+        alias: qwen3.8-flash-next-coder-iq1_m
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    models:
+      - name: qwen3.8-4b-distill-nothink
+        alias: claude-sonnet-5
+      - name: qwen3.8-4b-distill-nothink
+        alias: "claude-sonnet-5[1m]"
+"#;
+    let path = "/tmp/test_vllm_classifier_route.yaml";
+    std::fs::write(path, yaml).unwrap();
+    let cfg = Config::load(path).unwrap();
+    for id in ["claude-sonnet-5", "claude-sonnet-5[1m]"] {
+        let upstream = cfg.upstream_for(id);
+        assert_eq!(upstream.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(upstream.backend_model, "qwen3.8-4b-distill-nothink");
+    }
+    let coder = cfg.upstream_for("qwen3.8-flash-next-coder-iq1_m");
+    assert_eq!(coder.base_url, "http://192.168.124.14:8080/v1");
+    assert_eq!(coder.backend_model, "qwen3.8-flash-next-coder-iq1_m");
+}
+
+#[test]
 fn test_upstream_for_routes_across_machines() {
     let yaml = r#"
 port: 8317
