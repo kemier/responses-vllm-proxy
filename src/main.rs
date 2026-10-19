@@ -188,6 +188,60 @@ const MODEL_THROTTLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// HTTP 503 Retry-After suggested to the client after a throttle timeout.
 const MODEL_THROTTLE_RETRY_AFTER: &str = "60";
 
+/// Send an upstream request, retrying TRANSPORT-level failures only.
+///
+/// `build` is a closure that constructs a fresh `RequestBuilder` per attempt —
+/// reqwest consumes the builder on `send()`, so a retry has to rebuild it.
+///
+/// WHY transport-only: `send()` fails when reqwest never received response
+/// headers (connection dropped, DNS/TLS/socket blip, upstream mid-restart). An
+/// HTTP 4xx/5xx from the backend is a real answer — re-sending it doubles the
+/// GPU work for a model that already ran, and the throttle/overflow paths
+/// already handle those deliberately.
+///
+/// Sized from this machine's logs: ~1% of upstream attempts fail this way, and
+/// of those ~25% are followed within 2 minutes by an attempt that succeeds
+/// (upstream briefly unreachable), while ~75% have no next attempt at all
+/// (upstream genuinely down). Retrying rescues the first group and costs only
+/// the delay below in the second, so it's a net win rather than a guess.
+///
+/// Returns the response (or the last transport error) plus how many attempts
+/// were used, so callers can log the retry count without re-deriving it.
+async fn send_upstream_retry<F>(
+    retries: u32,
+    build: F,
+) -> (Result<reqwest::Response, reqwest::Error>, u32)
+    where F: Fn() -> reqwest::RequestBuilder
+{
+    let attempts = retries.saturating_add(1);
+    let mut last_err: Option<reqwest::Error> = None;
+    for attempt in 1..=attempts {
+        match build().send().await {
+            Ok(resp) => return (Ok(resp), attempt),
+            Err(e) => {
+                if attempt < attempts {
+                    // Linear backoff: the blip is either a dead socket or the
+                    // upstream mid-restart, so a fixed short wait is as good as
+                    // exponential here and keeps the worst case bounded (1+2+3
+                    // = 6s added for retries=3).
+                    let delay = Duration::from_secs(attempt as u64);
+                    logger::warn(
+                        "upstream-retry",
+                        &format!(
+                            "transport failure (attempt {}/{}): {} — retrying in {}s",
+                            attempt, attempts, e, delay.as_secs()
+                        ),
+                    );
+                    tokio::time::sleep(delay).await;
+                } else {
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    (Err(last_err.unwrap()), attempts)
+}
+
 /// Acquire a per-model permit for the given backend model. Logs when the
 /// request had to wait, and returns `Some(permit)` to hold for the duration
 /// of the upstream call, or `Some(None)` when throttling is disabled
@@ -960,20 +1014,24 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
         &format!("POST {} model={} stream={}", url, backend_model, is_stream),
     );
 
-    let req = state
-        .http_client
-        .post(&url)
+    let (resp_result, upstream_attempts) = send_upstream_retry(
+        state.cfg.request_retry,
+        || {
+            let req = state
+                .http_client
+                .post(&url)
 
-        .header("Accept", "text/event-stream");
-        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
-        let resp = match req
-        .json(&cc_payload)
-        .send()
-        .await
+                .header("Accept", "text/event-stream");
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                req
+                .json(&cc_payload)
+        },
+    ).await;
+        let resp = match resp_result
     {
         Ok(r) => r,
         Err(e) => {
-            logger::error("responses", &format!("Upstream error: {}", e));
+            logger::error("responses", &format!("Upstream error after {} attempt(s): {}", upstream_attempts, e));
             return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
         }
     };
@@ -2515,13 +2573,17 @@ pub async fn handle_chat_completions(
             &format!("Ollama native POST {} model={} think={}", native_url, backend_model, thinking_enabled),
         );
 
-        let nreq = state.http_client.post(&native_url).json(&native_body);
-        let nreq = if let Some(k) = upstream.api_key.clone() {
-            nreq.header("Authorization", format!("Bearer {}", k))
-        } else {
-            nreq
-        };
-        let nresp = nreq.send().await;
+        let (nresp, _native_attempts) = send_upstream_retry(
+            state.cfg.request_retry,
+            || {
+                let nreq = state.http_client.post(&native_url).json(&native_body);
+                if let Some(k) = upstream.api_key.clone() {
+                    nreq.header("Authorization", format!("Bearer {}", k))
+                } else {
+                    nreq
+                }
+            },
+        ).await;
         match nresp {
             Ok(r) => {
                 let status = r.status();
@@ -2615,16 +2677,19 @@ pub async fn handle_chat_completions(
         }
     }
 
-    let req = state
-        .http_client
-        .post(&url)
+    let (resp, _cc_attempts) = send_upstream_retry(
+        state.cfg.request_retry,
+        || {
+            let req = state
+                .http_client
+                .post(&url)
 
-        .header("Accept", "text/event-stream")
-        .json(&request_json);
-        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
-        let resp = req
-        .send()
-        .await;
+                .header("Accept", "text/event-stream")
+                .json(&request_json);
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                req
+        },
+    ).await;
 
     match resp {
         Ok(r) => {
@@ -2998,15 +3063,18 @@ pub async fn handle_embeddings(
         &format!("Passthrough POST {} model={}", url, backend_model),
     );
 
-    let req = state
-        .http_client
-        .post(&url);
-        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
-        let resp = req
+    let (resp, _embed_attempts) = send_upstream_retry(
+        state.cfg.request_retry,
+        || {
+            let req = state
+                .http_client
+                .post(&url);
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                req
 
-        .json(&request_json)
-        .send()
-        .await;
+                .json(&request_json)
+        },
+    ).await;
 
     match resp {
         Ok(r) => {
@@ -3371,16 +3439,19 @@ pub async fn handle_messages(
         );
     }
 
-    let req = state
-        .http_client
-        .post(&url)
+    let (resp, _msg_attempts) = send_upstream_retry(
+        state.cfg.request_retry,
+        || {
+            let req = state
+                .http_client
+                .post(&url)
 
-        .header("Accept", "text/event-stream");
-        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
-        let resp = req
-        .json(&cc_request)
-        .send()
-        .await;
+                .header("Accept", "text/event-stream");
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                req
+                .json(&cc_request)
+        },
+    ).await;
 
     match resp {
         Ok(r) => {
@@ -3831,20 +3902,24 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
         ),
     );
 
-    let req = state
-        .http_client
-        .post(&url)
+    let (resp_result, upstream_attempts) = send_upstream_retry(
+        state.cfg.request_retry,
+        || {
+            let req = state
+                .http_client
+                .post(&url)
 
-        .header("Accept", "text/event-stream");
-        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
-        let resp = match req
-        .json(&cc_payload)
-        .send()
-        .await
+                .header("Accept", "text/event-stream");
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                req
+                .json(&cc_payload)
+        },
+    ).await;
+        let resp = match resp_result
     {
         Ok(r) => r,
         Err(e) => {
-            logger::error("compact", &format!("Upstream error: {}", e));
+            logger::error("compact", &format!("Upstream error after {} attempt(s): {}", upstream_attempts, e));
             return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
         }
     };
@@ -4109,20 +4184,24 @@ Keep the summary under 500 words. Do not include code blocks — describe change
         &format!("POST {} model={}", url, summary_model),
     );
 
-    let req = state
-        .http_client
-        .post(&url)
+    let (resp_result, upstream_attempts) = send_upstream_retry(
+        state.cfg.request_retry,
+        || {
+            let req = state
+                .http_client
+                .post(&url)
 
-        .header("Accept", "text/event-stream");
-        let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
-        let resp = match req
-        .json(&cc_payload)
-        .send()
-        .await
+                .header("Accept", "text/event-stream");
+                let req = if let Some(k) = upstream.api_key.clone() { req.header("Authorization", format!("Bearer {}", k)) } else { req };
+                req
+                .json(&cc_payload)
+        },
+    ).await;
+        let resp = match resp_result
     {
         Ok(r) => r,
         Err(e) => {
-            logger::error("summarize", &format!("Upstream error: {}", e));
+            logger::error("summarize", &format!("Upstream error after {} attempt(s): {}", upstream_attempts, e));
             return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
         }
     };

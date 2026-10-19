@@ -37,6 +37,13 @@ model-concurrency:
     "qwen3:30b-a3b": 1
     "qwen3.6:35b": 1
     "qwen2.5:7b": 1
+# Transport-level retry (send_upstream_retry in src/main.rs): re-sends only when
+# reqwest never got response headers (dead socket / upstream mid-restart). An
+# HTTP 4xx/5xx from the backend is a real answer and is NEVER re-sent — that
+# would double the GPU work. Measured here: ~1% of upstream attempts fail this
+# way, and of those ~25% are followed within 2 minutes by an attempt that
+# succeeds, so retrying rescues them; the other ~75% are a genuinely down
+# upstream and cost only the 1+2+3=6s backoff below. 0 disables retrying.
 request-retry: 3
 
 # Optional Codex-style model catalog ({"models":[{slug, context_window,

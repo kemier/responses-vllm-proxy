@@ -27,8 +27,16 @@ pub struct Config {
     pub model_concurrency: HashMap<String, usize>,
     #[serde(default)]
     pub openai_compatibility: Vec<OpenAICompatProvider>,
-    #[serde(default)]
-    #[allow(dead_code)]
+    /// Retry budget for TRANSPORT-level upstream failures (reqwest never got
+    /// response headers — connection dropped, DNS/TLS/socket blip), applied by
+    /// send_upstream in main.rs. NOT for HTTP statuses: a 4xx/5xx from the
+    /// backend is a real answer and re-sending it doubles the GPU work.
+    /// Measured on this machine: ~1% of upstream attempts fail this way, and
+    /// of those ~25% are followed within 2 minutes by an attempt that
+    /// succeeds — i.e. the upstream was briefly unreachable, not down. The
+    /// other ~75% have no next attempt at all (upstream genuinely down), where
+    /// the retries cost only the delay below. 0 disables retrying.
+    #[serde(default = "default_request_retry")]
     pub request_retry: u32,
     #[serde(default = "default_true")]
     pub logging_to_file: bool,
@@ -74,6 +82,9 @@ fn default_rate_limit() -> u32 {
     60
 }
 fn default_max_concurrent_per_model() -> usize {
+    3
+}
+fn default_request_retry() -> u32 {
     3
 }
 

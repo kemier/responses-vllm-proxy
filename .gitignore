@@ -3,3 +3,7 @@
 *.log
 
 *.pid
+
+# Config backups left by hand edits (config.yaml.bak, config.yaml.bak-<ctx>-<ts>)
+*.bak
+*.bak-*
