@@ -61,6 +61,38 @@ pub struct AppState {
 /// When exceeded, entries are evicted so the map stays bounded.
 const MAX_CONN_ID_CACHE: usize = 1024;
 
+/// Lock a `std::sync::Mutex`, recovering the lock guard when the lock comes
+/// back poisoned (a panic happened while some other thread held it).
+///
+/// WHY not `.unwrap()`: `std::sync::Mutex` poisons on panic, so the FIRST
+/// panic poisons and every later `lock().unwrap()` panics too — the service
+/// goes permanently dead at that call site instead of failing one request.
+/// Every caller here guards plain bookkeeping state whose worst-case stale
+/// value is benign: rate-limit buckets (one IP's per-minute counter off by a
+/// little), model concurrency limits (immutable after construction, so
+/// provably unaffected), and the peer→connection cache (one peer re-keyed to
+/// a fresh UUID on the next request). Continuing is strictly better than
+/// dying, and the poison is logged so the originating panic stays visible in
+/// the ACP logs rather than being swallowed.
+///
+/// Returns the guard itself (not the payload) — moving out of a `MutexGuard`
+/// is not allowed, and the caller needs the guard alive for its whole scope.
+fn recover_poisoned_lock<R>(
+    locked: Result<R, std::sync::PoisonError<R>>,
+    what: &str,
+) -> R {
+    match locked {
+        Ok(held) => held,
+        Err(poisoned) => {
+            logger::error(
+                "poisoned-lock",
+                &format!("{} lock was poisoned by a panicking thread — recovering it and continuing", what),
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 static KEEPALIVE_BYTES: axum::body::Bytes = axum::body::Bytes::from_static(b": keepalive\n\n");
 
 /// Simple per-IP rate limiter using a fixed window.
@@ -82,7 +114,7 @@ impl RateLimiter {
         if self.max_per_minute == 0 {
             return true;
         }
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = recover_poisoned_lock(self.buckets.lock(), "rate-limiter bucket");
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_secs(60);
 
@@ -130,7 +162,7 @@ impl ModelThrottle {
     }
 
     pub fn limit_for(&self, model: &str) -> usize {
-        let limits = self.limits.lock().unwrap();
+        let limits = recover_poisoned_lock(self.limits.lock(), "model-concurrency limits");
         limits.get(model).copied().unwrap_or(self.default_limit)
     }
 
@@ -826,7 +858,7 @@ async fn conn_id_middleware(
 ) -> Response {
     let key = peer.to_string();
     let conn_id = {
-        let mut cache = state.conn_id_cache.lock().unwrap();
+        let mut cache = recover_poisoned_lock(state.conn_id_cache.lock(), "peer->connection-id cache");
         resolve_conn_id(&mut cache, &key)
     };
     logger::set_conn_id(&conn_id, next.run(request)).await
@@ -4333,7 +4365,19 @@ Keep the summary under 500 words. Do not include code blocks — describe change
 /// 3. Fall back to the first model in config.
 async fn select_summary_model(state: &AppState) -> String {
     // ── Strategy 1: Query backend for 1M models ───────────────────────────
-        let base_url = state.cfg.provider().unwrap().base_url.clone();
+        // `provider()` is Some for a running service — main() exits when it is
+        // None — but with no provider there is no backend to probe, so fall
+        // through to the catalog/first-model fallbacks instead of unwrapping.
+        let base_url = match state.cfg.provider() {
+            Some(p) => p.base_url.clone(),
+            None => {
+                logger::info(
+                    "summarize",
+                    "No provider configured — skipping the backend 1M-model probe",
+                );
+                return select_summary_model_from_catalog(state);
+            },
+        };
     let models_url = format!("{}/models", base_url);
 
     let resp = state
@@ -4441,6 +4485,53 @@ fn select_summary_model_from_catalog(state: &AppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── poison-tolerant lock recovery ───────────────────────────────────
+    // A panic while a std::sync::Mutex is held poisons it. Without recovery
+    // every later lock().unwrap() panics too, so the FIRST bad request kills
+    // that call site forever. These pin that recovery hands back the payload,
+    // and keeps doing so on every subsequent request (poison is permanent).
+
+    #[test]
+    fn poisoned_lock_still_yields_its_payload() {
+        // Arc so the poisoning thread can own a handle with 'static lifetime.
+        let mutex = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        {
+            let mut held = mutex.lock().unwrap();
+            held.insert("key".to_string(), 1);
+        }
+        // Poison by panicking while the guard is alive, in a child thread so
+        // the test process itself survives.
+        let shared = Arc::clone(&mutex);
+        let child = std::thread::spawn(move || {
+            let mut held = shared.lock().unwrap();
+            held.insert("child".to_string(), 2);
+            panic!("simulated panic while holding the lock");
+        });
+        assert!(child.join().is_err(), "the child panicked and poisoned the lock");
+
+        // Every later lock() now returns Err(PoisonError) — permanently. The
+        // helper must recover the payload each time, not just the first time.
+        let first = recover_poisoned_lock(mutex.lock(), "test mutex");
+        assert_eq!(first.get("key").copied(), Some(1));
+        drop(first);
+        let second = recover_poisoned_lock(mutex.lock(), "test mutex");
+        assert_eq!(second.get("key").copied(), Some(1));
+    }
+
+    // ─── select_summary_model must not trust provider() being Some ────────
+
+    #[tokio::test]
+    async fn summarize_skips_probe_when_no_provider_configured() {
+        // test_state() builds a config with NO providers — the exact shape that
+        // used to make provider().unwrap() panic. With no backend there is
+        // nothing to probe, so the fallback chain must answer instead.
+        let state = test_state(None);
+        assert_eq!(
+            select_summary_model(&state).await,
+            "Qwen/Qwen2.5-14B-Instruct-1M".to_string(),
+        );
+    }
 
     // ─── inspect_chat_delta / thinking-only guard tests ───────────────────
 
