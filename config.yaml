@@ -13,14 +13,19 @@ api-keys: []
 rate-limit-per-minute: 60
 # Max concurrent in-flight requests per backend model (0 = unlimited).
 # Prevents upstream 429 "queue full" storms when multiple agents all hit
-# the same model at once. Excess requests queue up to 60s, then get 503 +
-# Retry-After instead of being forwarded.
+# the same model at once. Excess requests queue up to MODEL_THROTTLE_TIMEOUT
+# (240s in src/main.rs) for a free semaphore slot, then get 503 +
+# Retry-After: 60 instead of being forwarded.
 max-concurrent-per-model: 3
 # Per-model overrides (keyed by backend model ID)
 # Mac has one GPU: serialize the Ollama-served models so concurrent subagents
-# don't thrash it. The proxy semaphore holds extra requests (up to 60s, then
-# 503+Retry-After) instead of forwarding them — this is the working "limit
-# subagents to 1" at CLI 2.1.204, where MAX_CONCURRENT_SUBAGENTS doesn't exist.
+# don't thrash it. The proxy semaphore holds extra requests for up to
+# MODEL_THROTTLE_TIMEOUT (240s) — the queue is FIFO, so a queued request
+# proceeds the moment the previous generation frees the slot; only after a
+# 240s wait does it return 503 + Retry-After: 60. Observed worst wait on
+# qwen3.6:35b is ~56s, so the 503 path never fires in practice: waiting IS
+# the GPU gate. This is the working "limit subagents to 1" at CLI 2.1.204,
+# where MAX_CONCURRENT_SUBAGENTS doesn't exist.
 model-concurrency:
     "qwen3.8-4b-distill": 1
     "qwen3.8-4b-distill-nothink": 1
