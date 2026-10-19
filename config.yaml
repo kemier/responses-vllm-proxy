@@ -39,6 +39,16 @@ model-concurrency:
     "qwen2.5:7b": 1
 request-retry: 3
 
+# Optional Codex-style model catalog ({"models":[{slug, context_window,
+# input_modalities}]}). This is a SECONDARY source: the provider blocks below
+# are the source of truth for the proxy's own models. Codex's own
+# model_catalog_json key (see ~/.codex/config.toml) points at ~/.codex/models.json
+# — NOT ~/.codex/model_catalog.json, which never existed, so the old hardcoded
+# name missed the file on every start. Its slugs are Anthropic-hosted ones
+# (deepseek-v4-flash …) that the proxy doesn't declare, so today it only
+# supplies metadata if Codex ever routes such a slug through here.
+model-catalog: "~/.codex/models.json"
+
 # Logging
 logging-to-file: true
 logs-max-total-size-mb: 10
@@ -103,3 +113,8 @@ openai-compatibility:
             alias: qwen36-35b
             context_length: 32768
             tags: [fast, moe]
+            # `ollama show qwen3.6:35b` reports a clip Projector, and a direct
+            # /v1/chat/completions call with an image_url part is accepted — so
+            # this model really does take images. Without the declaration the
+            # proxy strips every image block (unknown => text-only).
+            input_modalities: [text, image]

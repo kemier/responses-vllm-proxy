@@ -232,11 +232,21 @@ async fn throttle_model<'a>(
     }
 }
 
-/// Look up a model's context_window from the cached catalog.
-/// Falls back to 200000 (200K) if the catalog isn't loaded or the model
-/// isn't found.
-pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
-    if let Some(c) = catalog.as_ref() {
+/// Look up a model's context window.
+///
+/// Two sources, in priority order:
+/// 1. The provider block in `config.yaml` (`context_length`), which is what
+///    `/v1/models` already advertises — so the guard and the advertisement
+///    can never disagree.
+/// 2. The Codex model catalog (`slug` + `context_window`), kept for the
+///    Anthropic-hosted slugs Codex itself brings up.
+///
+/// Falls back to `DEFAULT_CONTEXT_WINDOW` when neither lists the model.
+pub fn get_context_window(state: &AppState, model_alias: &str) -> u64 {
+    if let Some(ctx) = state.cfg.model_context_window(model_alias) {
+        return ctx;
+    }
+    if let Some(c) = state.model_catalog.as_ref() {
         if let Some(arr) = c.get("models").and_then(|m| m.as_array()) {
             for m in arr {
                 if m.get("slug").and_then(|s| s.as_str()) == Some(model_alias) {
@@ -247,16 +257,23 @@ pub fn get_context_window(catalog: &ModelCatalog, model_alias: &str) -> u64 {
             }
         }
     }
-    196_608
+    DEFAULT_CONTEXT_WINDOW
 }
 
+/// Window used when neither `config.yaml` nor the Codex catalog declares a
+/// model. Deliberately conservative: an unknown model gets the smallest window
+/// we can defend rather than a generous one that lets an oversized request
+/// reach a backend that then 400s or 503s it.
+const DEFAULT_CONTEXT_WINDOW: u64 = 196_608;
+
 /// The effective context window for a model, as advertised by `/v1/models`.
-/// This branch (local/dev) has no `max_context_cap` concept, so it is the
-/// catalog `context_window` verbatim. (The EricAI `master` variant caps this
-/// at the shared vLLM's enforced `max_model_len`; here each model's nominal
-/// window is assumed to be what the backend enforces.)
+/// This branch (local/dev) has no `max_context_cap` concept, so it is whatever
+/// `get_context_window` resolves — `config.yaml` first, then the Codex catalog.
+/// (The EricAI `master` variant caps this at the shared vLLM's enforced
+/// `max_model_len`; here each model's declared window is assumed to be what the
+/// backend enforces.)
 fn effective_context_window(state: &AppState, model_alias: &str) -> u64 {
-    get_context_window(&state.model_catalog, model_alias)
+    get_context_window(&state, &model_alias)
 }
 
 /// Build an HTTP 400 response when a request's estimated token count exceeds
@@ -299,14 +316,21 @@ fn context_overflow_response(
     Some((StatusCode::BAD_REQUEST, msg).into_response())
 }
 
-/// True when the model catalog entry for `model_alias` declares image input
-/// support (`input_modalities` includes "image"). Used by the Anthropic
-/// Messages path to decide whether image blocks can be forwarded as OpenAI
-/// `image_url` content parts. Text-only models (or unknown entries) get
-/// `false` so image blocks are stripped before the vLLM backend rejects the
-/// request with a hard 500 ("not a multimodal model").
-pub fn get_model_supports_images(catalog: &ModelCatalog, model_alias: &str) -> bool {
-    if let Some(c) = catalog.as_ref() {
+/// True when the model declares image input support.
+///
+/// Two sources, in priority order:
+/// 1. `input_modalities` on the provider model entry in `config.yaml` — the
+///    proxy's own models live here, and Codex's catalog doesn't know their
+///    slugs, so without this every image block would be stripped unconditionally.
+/// 2. The Codex model catalog (`input_modalities`), for Anthropic-hosted slugs.
+///
+/// Unknown entries are text-only, so image blocks get stripped before the
+/// backend rejects the request with a hard 500 ("not a multimodal model").
+pub fn get_model_supports_images(state: &AppState, model_alias: &str) -> bool {
+    if let Some(mods) = state.cfg.model_input_modalities(model_alias) {
+        return mods.iter().any(|v| v.as_str() == "image");
+    }
+    if let Some(c) = state.model_catalog.as_ref() {
         if let Some(arr) = c.get("models").and_then(|m| m.as_array()) {
             for m in arr {
                 if m.get("slug").and_then(|s| s.as_str()) == Some(model_alias) {
@@ -367,23 +391,44 @@ async fn main() {
         .build()
         .expect("Failed to create HTTP client");
 
-    // Load model catalog once at startup — avoids per-request disk reads.
+    // Load the optional Codex-style model catalog once at startup — avoids
+    // per-request disk reads. This is a SECONDARY metadata source: model
+    // windows and modalities come from the provider blocks in config.yaml
+    // first (see get_context_window / get_model_supports_images). The catalog
+    // only has to exist for slugs the proxy doesn't declare itself, e.g. the
+    // Anthropic-hosted ones Codex brings up, and its path is whatever Codex
+    // configured (`model_catalog_json = "~/.codex/models.json"` in
+    // ~/.codex/config.toml) — it is NOT `model_catalog.json`, so hardcoding
+    // that name used to miss the file every time.
+    let catalog_path = cfg.model_catalog.clone()
+        .or_else(|| std::env::var("HOME").ok()
+            .map(|h| format!("{}/.codex/model_catalog.json", h)));
     let model_catalog: ModelCatalog = Arc::new(
-        std::env::var("HOME")
-            .ok()
-            .map(|h| format!("{}/.codex/model_catalog.json", h))
-            .and_then(|p| std::fs::read_to_string(&p).ok())
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok()),
+        catalog_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
     );
     if model_catalog.is_some() {
         logger::info(
             "main",
-            "Model catalog loaded from ~/.codex/model_catalog.json",
+            &format!("Model catalog loaded from {}", catalog_path.unwrap()),
+        );
+    } else if catalog_path.is_some() {
+        logger::info(
+            "main",
+            &format!(
+                "Model catalog not found at {} — model windows and modalities come from config.yaml (DEFAULT_CONTEXT_WINDOW {} only for slugs neither lists)",
+                catalog_path.unwrap(), DEFAULT_CONTEXT_WINDOW
+            ),
         );
     } else {
-        logger::warn(
+        logger::info(
             "main",
-            "Model catalog not found — using default context_window=200000",
+            &format!(
+                "No model catalog configured — model windows and modalities come from config.yaml (DEFAULT_CONTEXT_WINDOW {})",
+                DEFAULT_CONTEXT_WINDOW
+            ),
         );
     }
 
@@ -806,13 +851,9 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
     let all_models = state.cfg.all_models();
     let mut models: Vec<Value> = Vec::with_capacity(all_models.len());
     for (alias, _name) in &all_models {
-            // Look up the optional context_length from the config model entry.
-            let context_length = state
-                .cfg
-                .provider()
-                .and_then(|p| {
-                    p.models.iter().find(|m| &m.alias == alias).and_then(|m| m.context_length)
-                });
+            // Same lookup the overflow guard uses, so /v1/models and the
+            // 400-on-overflow path can never advertise different windows.
+            let context_length = state.cfg.model_context_window(alias);
             let mut entry = json!({
                 "id": alias,
                 "object": "model",
@@ -824,6 +865,9 @@ pub async fn handle_models(State(state): State<AppState>) -> impl IntoResponse {
             }
             if let Some(tags) = state.cfg.model_tags(alias) {
                 entry["tags"] = json!(tags);
+            }
+            if let Some(mods) = state.cfg.model_input_modalities(alias) {
+                entry["input_modalities"] = json!(mods);
             }
             models.push(entry);
     }
@@ -894,7 +938,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     // request can still reach here. Hard-reject before forwarding: the proxy's
     // estimate is accurate enough to catch the egregious overflow, and a clean
     // 400 here beats a backend 400/503 storm on the shared vLLM.
-    let context_window = get_context_window(&state.model_catalog, &model_alias);
+    let context_window = get_context_window(&state, &model_alias);
     let estimated_tokens = estimate_tokens(&cc_payload);
     if estimated_tokens as u64 > context_window {
         logger::warn("responses", &format!(
@@ -1639,7 +1683,7 @@ pub async fn handle_responses_ws(
             // an error event codex's parse_wrapped_websocket_error_event understands
             // (same shape as the upstream-error path below) and keep the connection
             // alive so codex can compact/retry on the next turn.
-            let context_window = get_context_window(&state.model_catalog, &model_alias);
+            let context_window = get_context_window(&state, &model_alias);
             let estimated_tokens = estimate_tokens(&cc_payload);
             if estimated_tokens as u64 > context_window {
                 logger::warn("ws", &format!(
@@ -3151,7 +3195,7 @@ pub async fn handle_messages(
     // modality can consume image_url content parts; text-only models must
     // have image blocks stripped before translation or the backend returns a
     // hard 500 ("not a multimodal model").
-    let vision_capable = get_model_supports_images(&state.model_catalog, &backend_model);
+    let vision_capable = get_model_supports_images(&state, &backend_model);
 
     // Translate Anthropic → OpenAI Chat Completions
     let mut cc_request = translate_anthropic::anthropic_to_chat_completions_with_vision(
@@ -3301,7 +3345,7 @@ pub async fn handle_messages(
             .unwrap_or(0);
         let total_req_bytes = serde_json::to_string(&cc_request).unwrap_or_default().len();
         let estimated_tokens = estimate_tokens(&cc_request);
-        let context_window = get_context_window(&state.model_catalog, &model);
+        let context_window = get_context_window(&state, &model);
         logger::info(
             "messages",
             &format!(
@@ -3764,7 +3808,7 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
     // model's effective window (see context_overflow_response). A compact
     // request that is itself over-window can't be compacted further by the
     // backend — reject it cleanly instead of letting the shared vLLM 400/503.
-    let context_window = get_context_window(&state.model_catalog, &model_alias);
+    let context_window = get_context_window(&state, &model_alias);
     let estimated_tokens = estimate_tokens(&cc_payload);
     if estimated_tokens as u64 > context_window {
         logger::warn("compact", &format!(
@@ -4473,40 +4517,129 @@ mod tests {
 
     // ─── get_model_supports_images tests ──────────────────────────────────
 
-    fn catalog_with_modalities(model: &str, modalities: &[&str]) -> ModelCatalog {
+    fn catalog_with_modalities(model: &str, modalities: &[&str]) -> Value {
         let mods: Vec<Value> = modalities.iter().map(|m| json!(m)).collect();
-        Arc::new(Some(json!({
+        json!({
             "models": [
                 {
                     "slug": model,
                     "input_modalities": mods,
                 }
             ]
-        })))
+        })
     }
 
     #[test]
     fn supports_images_when_catalog_declares_image_modality() {
         let catalog = catalog_with_modalities("qwen3.8-27b", &["text", "image"]);
-        assert!(get_model_supports_images(&catalog, "qwen3.8-27b"));
+        let state = test_state(Some(catalog));
+        assert!(get_model_supports_images(&state, "qwen3.8-27b"));
     }
 
     #[test]
     fn does_not_support_images_when_text_only() {
         let catalog = catalog_with_modalities("llama-3.1-8b", &["text"]);
-        assert!(!get_model_supports_images(&catalog, "llama-3.1-8b"));
+        let state = test_state(Some(catalog));
+        assert!(!get_model_supports_images(&state, "llama-3.1-8b"));
     }
 
     #[test]
     fn does_not_support_images_when_catalog_entry_missing() {
         let catalog = catalog_with_modalities("known", &["text"]);
-        assert!(!get_model_supports_images(&catalog, "unknown-model"));
+        let state = test_state(Some(catalog));
+        assert!(!get_model_supports_images(&state, "unknown-model"));
     }
 
     #[test]
     fn does_not_support_images_when_catalog_absent() {
-        let catalog: ModelCatalog = Arc::new(None);
-        assert!(!get_model_supports_images(&catalog, "qwen3.8-27b"));
+        let state = test_state(None);
+        assert!(!get_model_supports_images(&state, "qwen3.8-27b"));
+    }
+
+    // ── config.yaml is the primary metadata source ───────────────────────
+    // The proxy's own models are declared in the provider blocks, not in Codex's
+    // catalog, so a declared modality must win even with no catalog on disk —
+    // otherwise every image block is stripped unconditionally and a vision
+    // backend (qwen3.6:35b carries a CLIP projector) never sees the image.
+
+    /// Config with two providers: one declares image modalities, one is text-only.
+    fn state_with_provider_models(catalog: Option<Value>) -> AppState {
+        let yaml = r#"
+port: 8317
+auth-dir: "/tmp"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    models:
+      - name: qwen-big
+        alias: qwen-big
+        context_length: 262144
+        input_modalities: [text]
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    models:
+      - name: "qwen3.6:35b"
+        alias: qwen36-35b
+        context_length: 32768
+        input_modalities: [text, image]
+"#;
+        let cfg: config::Config = serde_yaml::from_str(yaml).expect("test config");
+        AppState {
+            cfg: Arc::new(cfg),
+            http_client: reqwest::Client::new(),
+            model_catalog: Arc::new(catalog),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            rate_limiter: Arc::new(RateLimiter::new(0)),
+            model_throttle: Arc::new(ModelThrottle::new(3, &std::collections::HashMap::new())),
+            conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn supports_images_from_config_declared_modalities_without_catalog() {
+        let state = state_with_provider_models(None);
+        assert!(get_model_supports_images(&state, "qwen36-35b"));
+        assert!(!get_model_supports_images(&state, "qwen-big"));
+    }
+
+    #[test]
+    fn config_modalities_override_the_catalog() {
+        // Catalog claims the mac alias is text-only; config.yaml says it takes
+        // images. config.yaml wins — it is the proxy's own model list.
+        let catalog = catalog_with_modalities("qwen36-35b", &["text"]);
+        let state = state_with_provider_models(Some(catalog));
+        assert!(get_model_supports_images(&state, "qwen36-35b"));
+    }
+
+    #[test]
+    fn context_window_comes_from_config_when_catalog_is_absent() {
+        // /v1/models advertises 262144 for the strata slug; the overflow guard
+        // must use the same number, not the DEFAULT_CONTEXT_WINDOW fallback.
+        let state = state_with_provider_models(None);
+        assert_eq!(get_context_window(&state, "qwen-big"), 262144);
+        assert_eq!(effective_context_window(&state, "qwen-big"), 262144);
+        assert_eq!(get_context_window(&state, "mac/qwen36-35b"), 32768);
+    }
+
+    #[test]
+    fn context_window_falls_back_to_default_for_unknown_slug() {
+        let state = state_with_provider_models(None);
+        assert_eq!(
+            get_context_window(&state, "slug-nobody-declares"),
+            DEFAULT_CONTEXT_WINDOW,
+        );
+    }
+
+    #[test]
+    fn catalog_window_still_used_when_config_does_not_declare_it() {
+        // A slug only the Codex catalog knows about (Anthropic-hosted) must
+        // still resolve through the catalog fallback.
+        let state = state_with_provider_models(Some(json!({ "models": [
+            {"slug": "deepseek-v4-flash", "context_window": 1_048_576}
+        ]})));
+        assert_eq!(get_context_window(&state, "deepseek-v4-flash"), 1_048_576);
     }
 
     // ── Context-overflow hard-reject regression tests ────────────────────

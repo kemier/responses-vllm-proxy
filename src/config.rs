@@ -43,6 +43,14 @@ pub struct Config {
     /// Useful for diagnosing hallucination caused by missing system prompt.
     #[serde(default)]
     pub log_turn_debug: bool,
+    /// Optional Codex-style model catalog: `{"models":[{slug, context_window,
+    /// input_modalities}]}`. Only needed for slugs the proxy does NOT declare
+    /// itself — the provider blocks below are the source of truth for the proxy's
+    /// own models, and Codex's catalog (its own `model_catalog_json` key points
+    /// at `~/.codex/models.json`) only knows Anthropic-hosted slugs.
+    /// Absent means no catalog: every window/modality comes from config.yaml.
+    #[serde(default)]
+    pub model_catalog: Option<String>,
     /// Alias → (provider index, backend model name) map, populated once at load
     /// time. Keyed by plain alias AND by `provider/alias`, so a client can name
     /// which machine serves a model when two providers carry the same family.
@@ -104,6 +112,13 @@ pub struct OpenAICompatModel {
     /// (often an expensive thinking model) because tag resolution fails.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Input modalities this backend model accepts (e.g. ["text"],
+    /// ["text","image"]). Declared here rather than in the Codex model
+    /// catalog because the proxy's own model list is the source of truth for
+    /// its models — Codex's catalog only knows Anthropic-hosted slugs.
+    /// Absent means text-only.
+    #[serde(default)]
+    pub input_modalities: Option<Vec<String>>,
 }
 
 /// Which provider should serve a requested model, and the backend model ID that
@@ -127,6 +142,10 @@ impl Config {
         if cfg.log_dir.starts_with('~') {
             cfg.log_dir = shellexpand::tilde(&cfg.log_dir).to_string();
         }
+        // Expand the catalog path here so main.rs can open it directly — the
+        // `shellexpand` helper is private to this module. `tilde` is a no-op
+        // for absolute paths.
+        cfg.model_catalog = cfg.model_catalog.as_ref().map(|p| shellexpand::tilde(p).to_string());
         if cfg.debug {
             cfg.log_level = "debug".to_string();
         }
@@ -235,11 +254,30 @@ impl Config {
     /// Get tags for a model alias (for /v1/models metadata response). Matches a
     /// plain alias, a `provider/alias` qualified alias, or a backend model name.
     pub fn model_tags(&self, alias: &str) -> Option<&[String]> {
+        self.model_entry(alias).and_then(|m| m.tags.as_deref())
+    }
+
+    /// Declared context window for a model alias, from `context_length` in the
+    /// provider block. Same matching rules as `model_tags`.
+    pub fn model_context_window(&self, alias: &str) -> Option<u64> {
+        self.model_entry(alias).and_then(|m| m.context_length)
+    }
+
+    /// Declared input modalities for a model alias. Same matching rules as
+    /// `model_tags`; absent means text-only.
+    pub fn model_input_modalities(&self, alias: &str) -> Option<&[String]> {
+        self.model_entry(alias).and_then(|m| m.input_modalities.as_deref())
+    }
+
+    /// The provider model entry a key resolves to: plain alias, `provider/alias`
+    /// qualified alias, or backend model name (the summarize path resolves to a
+    /// backend ID before looking metadata up).
+    fn model_entry(&self, alias: &str) -> Option<&OpenAICompatModel> {
         for p in self.openai_compatibility.iter() {
             for m in &p.models {
                 let qualified = format!("{}/{}", p.name, m.alias);
                 if m.alias == alias || m.name == alias || qualified == alias {
-                    return m.tags.as_deref();
+                    return Some(m);
                 }
             }
         }
