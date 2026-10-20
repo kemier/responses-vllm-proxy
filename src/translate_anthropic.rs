@@ -1638,8 +1638,17 @@ impl AnthropicStreamTranslator {
                 let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
 
                 if let Some(delta) = choice.get("delta") {
-                    // Reasoning → thinking content block
-                    if let Some(reasoning) = delta.get("reasoning").and_then(|v| v.as_str()) {
+                    // Reasoning → thinking content block. GLM streams
+                    // `delta.reasoning`; Strata / llama.cpp / DeepSeek stream the
+                    // same channel as `delta.reasoning_content`. Missing the
+                    // second name drops the whole thinking trace (often 1k+
+                    // tokens) and the client only sees the short preamble that
+                    // follows, then end_turn.
+                    if let Some(reasoning) = delta
+                        .get("reasoning")
+                        .or_else(|| delta.get("reasoning_content"))
+                        .and_then(|v| v.as_str())
+                    {
                         if !reasoning.is_empty() {
                             // Accumulate for the reasoning-only fallback in finish().
                             self.reasoning_text.push_str(reasoning);
@@ -2410,7 +2419,11 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
     if let Some(choices) = response.get("choices").and_then(|c| c.as_array()) {
         if let Some(choice) = choices.first() {
             if let Some(msg) = choice.get("message") {
-                let reasoning = msg.get("reasoning").and_then(|v| v.as_str()).unwrap_or("");
+                let reasoning = msg
+                    .get("reasoning")
+                    .or_else(|| msg.get("reasoning_content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if !reasoning.is_empty() {
                     content.push(json!({"type": "thinking", "thinking": reasoning}));
                 }
@@ -2535,6 +2548,24 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Strata streams the think channel as `reasoning_content`, not `reasoning`.
+    /// Those deltas must become a thinking block, not be discarded.
+    #[test]
+    fn test_reasoning_content_becomes_thinking_block() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"strata-proxy","choices":[{"index":0,"delta":{"reasoning_content":"plan the rewrite"},"finish_reason":null}]}"#,
+            r#"data: {"id":"1","model":"strata-proxy","choices":[{"index":0,"delta":{"content":"section A first:"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ]);
+        let joined = events.join("\n");
+        assert!(
+            joined.contains("plan the rewrite"),
+            "reasoning_content must be forwarded, got: {joined}"
+        );
+        assert!(joined.contains("thinking_delta") || joined.contains("\"thinking\""));
+        assert!(joined.contains("section A first:"));
     }
 
     /// When finish_reason is "stop", stop_reason should be "end_turn".
