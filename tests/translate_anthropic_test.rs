@@ -804,7 +804,7 @@ fn test_effort_output_config_mapping() {
         ("minimal", Some("none")),
         ("low", Some("low")),
         ("medium", Some("medium")),
-        ("high", Some("xhigh")),
+        ("high", Some("high")),
         ("xhigh", Some("xhigh")),
         ("max", Some("xhigh")),
         ("off", Some("none")),

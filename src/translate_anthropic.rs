@@ -55,9 +55,10 @@ pub fn anthropic_to_chat_completions_with_vision(
     }
 
     // effort → reasoning_effort. llama.cpp: "none" disables thinking;
-    // otherwise the value is passed to the jinja chat template. The Qwen3.8
-    // template only defines low/medium/xhigh (no "high"), so the Anthropic
-    // effort enum is folded onto those levels.
+    // otherwise the value is passed to the jinja chat template. low, medium,
+    // and high are the client's three levels and are forwarded unchanged.
+    // The Qwen template aliases high to xhigh itself. Only xhigh and max,
+    // which that template has no other name for, are sent as xhigh.
     if let Some(re) = map_effort_to_reasoning_effort(body) {
         out["reasoning_effort"] = json!(re);
     }
@@ -436,7 +437,7 @@ fn convert_anthropic_tool(tool: &Value, add_noargs_placeholder: bool) -> Option<
 /// Map the Anthropic request's effort signal onto the backend's
 /// `reasoning_effort` field. Sources, in order:
 ///   1. `output_config.effort` — Claude Code v2+ ("minimal"|"low"|"medium"|
-///      "high"|"xhigh"|"max")
+///      "high"|"xhigh"|"max"). low, medium, and high pass through.
 ///   2. `thinking` — classic Anthropic shape ({"type":"disabled"} or
 ///      {"type":"enabled","budget_tokens":N}); budget is folded onto levels.
 /// Returns None when neither is present → the template's own default applies
@@ -451,7 +452,8 @@ pub fn map_effort_to_reasoning_effort(body: &Value) -> Option<String> {
             "minimal" | "none" | "off" => Some("none".to_string()),
             "low" => Some("low".to_string()),
             "medium" => Some("medium".to_string()),
-            "high" | "xhigh" | "max" => Some("xhigh".to_string()),
+            "high" => Some("high".to_string()),
+            "xhigh" | "max" => Some("xhigh".to_string()),
             other => {
                 logger::warn(
                     "translate_anthropic",
