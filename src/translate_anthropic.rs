@@ -1957,7 +1957,18 @@ impl AnthropicStreamTranslator {
         // breaks /compact. Synthesize a text content block from the accumulated
         // reasoning so the response always carries an assistant text message.
         // (Mirrors rewrite_reasoning_to_content() used by /v1/chat/completions.)
-        if !self.text_ever_emitted && !self.reasoning_text.is_empty() {
+        //
+        // NOT when the turn produced tool calls: a `thinking + tool_use +
+        // no prose` turn is a complete, valid assistant message on its own
+        // (Claude models emit exactly that shape natively). Synthesizing a
+        // text block there duplicates the entire thinking trace as a visible
+        // user-facing message — observed 2026-10-30 with the strata coder
+        // model, which routinely skips the prose preamble before its tool
+        // calls: the webview rendered the same 1.3k–3.5k chars twice per
+        // turn, once as thought and once as text.
+        let has_tool_use = self.pending_tool_calls.iter().any(|t| !t.name.is_empty())
+            || self.inline_tool_emitted;
+        if !self.text_ever_emitted && !self.reasoning_text.is_empty() && !has_tool_use {
             events.push(self.text_block_start_event(self.current_block_index));
             let reasoning = std::mem::take(&mut self.reasoning_text);
             events.push(self.text_delta_event(self.current_block_index, &reasoning));
@@ -1973,7 +1984,6 @@ impl AnthropicStreamTranslator {
         // message; a contentless message yields "no assistant message in
         // summarization response" and breaks /compact. Synthesize an empty
         // text content block so every response carries an assistant message.
-        let has_tool_use = self.pending_tool_calls.iter().any(|t| !t.name.is_empty());
         if !self.text_ever_emitted && self.reasoning_text.is_empty() && !has_tool_use {
             events.push(self.text_block_start_event(self.current_block_index));
             events.push(self.content_block_stop_event(self.current_block_index));
@@ -2568,6 +2578,46 @@ mod tests {
         );
         assert!(joined.contains("thinking_delta") || joined.contains("\"thinking\""));
         assert!(joined.contains("section A first:"));
+    }
+
+    /// A `thinking + tool_use + no prose` turn must NOT get a synthesized
+    /// text block: the message is already complete, and copying the reasoning
+    /// into a text block renders the same content twice in the client (once
+    /// as thought, once as message). Observed 2026-10-30 with the strata
+    /// coder model, which routinely skips prose before its tool calls.
+    #[test]
+    fn test_reasoning_only_with_tool_calls_does_not_synthesize_text() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"strata-proxy","choices":[{"index":0,"delta":{"reasoning_content":"check the mount first, then rsync"},"finish_reason":null}]}"#,
+            r#"data: {"id":"1","model":"strata-proxy","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{\"command\":\"mount | grep data\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ]);
+        let joined = events.join("\n");
+        assert!(joined.contains("thinking_delta"), "thinking forwarded: {joined}");
+        assert!(
+            joined.contains("tool_use"),
+            "tool call forwarded: {joined}"
+        );
+        assert!(
+            !joined.contains("\"text_delta\""),
+            "no text may be synthesized from reasoning when tool calls exist: {joined}"
+        );
+    }
+
+    /// The fallback itself stays: reasoning-only output with neither text nor
+    /// tool calls still yields a synthesized text block (Claude Code CLI
+    /// builds the assistant message from text blocks; /compact depends on it).
+    #[test]
+    fn test_reasoning_only_without_tool_calls_still_synthesizes_text() {
+        let events = run_stream(&[
+            r#"data: {"id":"1","model":"strata-proxy","choices":[{"index":0,"delta":{"reasoning_content":"the summary goes here"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+        ]);
+        let joined = events.join("\n");
+        assert!(
+            joined.contains("\"text_delta\"") && joined.contains("the summary goes here"),
+            "reasoning-only turn without tool calls must synthesize a text block: {joined}"
+        );
     }
 
     /// When finish_reason is "stop", stop_reason should be "end_turn".

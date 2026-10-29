@@ -362,6 +362,40 @@ fn effective_context_window(state: &AppState, model_alias: &str) -> u64 {
     get_context_window(&state, &model_alias)
 }
 
+/// Merge the model's configured `logit_bias` (config.yaml, per provider model)
+/// into an outgoing chat-completions payload. Configured entries win over any
+/// client-sent ones: these are sampler guards, not preferences. The driving
+/// case is the strata coder pack, where the ChatML role-boundary opener must
+/// never be sampled — the model occasionally emits it as content, role-plays
+/// a fake user turn ("... user\n... user\nContinue") and then hits its stop
+/// token, which the client sees as a premature end_turn mid-task (observed
+/// 2026-10-29, 8 output tokens, strata logged the stop; GitHub class:
+/// claude-code#88211). A no-op for models without a configured bias.
+fn apply_configured_logit_bias(payload: &mut Value, cfg: &config::Config, backend_model: &str) {
+    let Some(bias) = cfg.effective_logit_bias(backend_model) else {
+        return;
+    };
+    if bias.is_empty() {
+        return;
+    }
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    let entry = obj
+        .entry("logit_bias")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        // A client-sent logit_bias that is not an object is invalid per the
+        // OpenAI schema; replace it rather than dropping the guard.
+        *entry = Value::Object(serde_json::Map::new());
+    }
+    if let Some(map) = entry.as_object_mut() {
+        for (token, b) in &bias {
+            map.insert(token.clone(), json!(b));
+        }
+    }
+}
+
 /// Build an HTTP 400 response when a request's estimated token count exceeds
 /// the model's effective context window. Returns `None` when the request fits
 /// (or the window is unknown), so callers fall through to normal forwarding.
@@ -999,6 +1033,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     let mut cc_payload =
         translate_request::responses_to_chat_completions(&backend_model, &request_json, is_stream);
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
+    apply_configured_logit_bias(&mut cc_payload, &state.cfg, &backend_model);
 
     logger::debug("responses", &format!(
         "[responses] cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {} | is_stream: {}",
@@ -1628,6 +1663,7 @@ pub async fn handle_responses_ws(
                 is_stream,
             );
             cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
+            apply_configured_logit_bias(&mut cc_payload, &state.cfg, &backend_model);
             if logger::is_enabled(logger::LogLevel::Debug) {
                 logger::debug("ws", &format!("cc_payload keys: {} | max_tokens: {} | reasoning_effort: {} | chat_template_kwargs: {} | messages: {}", cc_payload.as_object().map(|o| o.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(), cc_payload.get("max_tokens").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("reasoning_effort").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("chat_template_kwargs").map(|v| v.to_string()).unwrap_or("none".to_string()), cc_payload.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0)));
 
@@ -2484,6 +2520,8 @@ pub async fn handle_chat_completions(
             );
         }
     }
+
+    apply_configured_logit_bias(&mut request_json, &state.cfg, &backend_model);
 
         let upstream = state.cfg.upstream_for(&backend_model);
         let base_url = upstream.base_url;
@@ -3365,6 +3403,7 @@ pub async fn handle_messages(
             }
         }
     }
+    apply_configured_logit_bias(&mut cc_request, &state.cfg, &backend_model);
 
         let upstream = state.cfg.upstream_for(&backend_model);
         let base_url = upstream.base_url;
@@ -3894,6 +3933,7 @@ pub async fn handle_compact(State(state): State<AppState>, body: axum::body::Byt
     let mut cc_payload =
         translate_request::responses_to_chat_completions(&backend_model, &request_json, false);
     cc_payload = translate_request::inject_thinking(cc_payload, &backend_model);
+    apply_configured_logit_bias(&mut cc_payload, &state.cfg, &backend_model);
 
         let upstream = state.cfg.upstream_for(&backend_model);
         let base_url = upstream.base_url;
@@ -4791,6 +4831,110 @@ openai-compatibility:
         assert_eq!(get_context_window(&state, "qwen-big"), 262144);
         assert_eq!(effective_context_window(&state, "qwen-big"), 262144);
         assert_eq!(get_context_window(&state, "mac/qwen36-35b"), 32768);
+    }
+
+    fn cfg_with_logit_bias() -> config::Config {
+        let yaml = r#"
+port: 8317
+auth-dir: "/tmp"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    logit-bias:
+      "248044": -100
+      "248045": -100
+    models:
+      - name: coder-pack
+        alias: coder-pack
+  - name: "mac"
+    prefix: "mac"
+    base-url: "http://127.0.0.1:11434/v1"
+    models:
+      - name: plain
+        alias: plain
+      - name: tuned
+        alias: tuned
+        logit_bias:
+          "248045": -50
+"#;
+        serde_yaml::from_str(yaml).expect("test config")
+    }
+
+    #[test]
+    fn provider_logit_bias_is_merged_into_the_payload() {
+        let cfg = cfg_with_logit_bias();
+        let mut payload = json!({"model": "coder-pack", "messages": []});
+        apply_configured_logit_bias(&mut payload, &cfg, "coder-pack");
+        let bias = payload.get("logit_bias").expect("bias merged");
+        assert_eq!(bias.get("248044").and_then(|v| v.as_f64()), Some(-100.0));
+        assert_eq!(bias.get("248045").and_then(|v| v.as_f64()), Some(-100.0));
+    }
+
+    #[test]
+    fn provider_logit_bias_reaches_undeclared_model_names() {
+        // The strata server is called "strata-ubuntu" / "strata-proxy" on the
+        // wire — names no model entry declares. They route to the default
+        // provider with the key echoed as model ID, and the provider's guard
+        // must still apply (this is the exact shape of the 2026-10-29
+        // premature-end_turn traffic).
+        let cfg = cfg_with_logit_bias();
+        assert!(cfg.upstream_target("strata-ubuntu").is_none());
+        let mut payload = json!({"model": "strata-ubuntu", "messages": []});
+        apply_configured_logit_bias(&mut payload, &cfg, "strata-ubuntu");
+        let bias = payload.get("logit_bias").expect("provider bias applied");
+        assert_eq!(bias.get("248045").and_then(|v| v.as_f64()), Some(-100.0));
+    }
+
+    #[test]
+    fn configured_logit_bias_wins_over_a_client_sent_conflict() {
+        let cfg = cfg_with_logit_bias();
+        let mut payload = json!({
+            "model": "coder-pack",
+            "logit_bias": {"248045": 5, "100": 2}
+        });
+        apply_configured_logit_bias(&mut payload, &cfg, "coder-pack");
+        let bias = payload.get("logit_bias").expect("bias merged");
+        // The guard is not a preference: a client cannot un-ban the boundary
+        // token, but its own unrelated entries survive the merge.
+        assert_eq!(bias.get("248045").and_then(|v| v.as_f64()), Some(-100.0));
+        assert_eq!(bias.get("100").and_then(|v| v.as_f64()), Some(2.0));
+    }
+
+    #[test]
+    fn model_logit_bias_overrides_single_tokens_of_the_provider_map() {
+        let cfg = cfg_with_logit_bias();
+        let bias = cfg.effective_logit_bias("tuned").expect("merged bias");
+        // The mac provider declares nothing, so the model map stands alone…
+        assert_eq!(bias.get("248045"), Some(&-50.0));
+        // …while the default provider's model inherits every provider token.
+        let cfg_yaml: config::Config = serde_yaml::from_str(r#"
+port: 8317
+auth-dir: "/tmp"
+openai-compatibility:
+  - name: "default"
+    prefix: "default"
+    base-url: "http://192.168.124.14:8080/v1"
+    logit-bias:
+      "1": -100
+      "2": -100
+    models:
+      - name: m
+        alias: m
+        logit_bias:
+          "2": -10
+"#).expect("test config");
+        let merged = cfg_yaml.effective_logit_bias("m").expect("merged bias");
+        assert_eq!(merged.get("1"), Some(&-100.0));
+        assert_eq!(merged.get("2"), Some(&-10.0));
+    }
+
+    #[test]
+    fn models_without_configured_bias_are_left_untouched() {
+        let cfg = cfg_with_logit_bias();
+        let mut payload = json!({"model": "plain", "messages": []});
+        apply_configured_logit_bias(&mut payload, &cfg, "plain");
+        assert!(payload.get("logit_bias").is_none());
     }
 
     #[test]

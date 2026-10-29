@@ -107,6 +107,16 @@ pub struct OpenAICompatProvider {
     /// carries the secret itself.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Logit bias applied to every model this provider serves, regardless of
+    /// the name the client called it by. The sampler guards are a property of
+    /// the served model's tokenizer, i.e. of the endpoint: the strata server
+    /// is reached as "strata-ubuntu", "strata-proxy" and the declared model
+    /// name alike (undeclared names fall back to the default provider with the
+    /// key echoed as model ID), so a per-model guard would miss most traffic.
+    /// A model-level `logit_bias` entry overrides individual tokens of this
+    /// map.
+    #[serde(default)]
+    pub logit_bias: Option<HashMap<String, f64>>,
     pub models: Vec<OpenAICompatModel>,
 }
 
@@ -130,6 +140,12 @@ pub struct OpenAICompatModel {
     /// Absent means text-only.
     #[serde(default)]
     pub input_modalities: Option<Vec<String>>,
+    /// Per-model logit bias, merged OVER the provider's map (see
+    /// `effective_logit_bias`). Token IDs are tokenizer-specific, so most
+    /// guards belong on the provider; use this only when one aliased entry
+    /// behind the same endpoint needs a different bias.
+    #[serde(default)]
+    pub logit_bias: Option<HashMap<String, f64>>,
 }
 
 /// Which provider should serve a requested model, and the backend model ID that
@@ -278,6 +294,36 @@ impl Config {
     /// `model_tags`; absent means text-only.
     pub fn model_input_modalities(&self, alias: &str) -> Option<&[String]> {
         self.model_entry(alias).and_then(|m| m.input_modalities.as_deref())
+    }
+
+    /// The logit bias a request for `key` actually runs with: the serving
+    /// provider's map with the model entry's map merged over it (a model can
+    /// sharpen or relax a single token of the provider guard; it cannot
+    /// remove tokens — deleting an entry belongs in config.yaml). None when
+    /// neither declares anything. `key` may be an alias, a qualified alias,
+    /// a backend model ID, or an undeclared name (which routes to the default
+    /// provider — that fallback is exactly how the strata server receives
+    /// names like "strata-ubuntu", so the provider map still reaches them).
+    pub fn effective_logit_bias(&self, key: &str) -> Option<HashMap<String, f64>> {
+        let provider_idx = self
+            .upstream_target(key)
+            .map(|t| t.provider_idx)
+            .unwrap_or_else(|| self.default_provider_idx());
+        let provider_bias = self
+            .openai_compatibility
+            .get(provider_idx)
+            .and_then(|p| p.logit_bias.as_ref());
+        let model_bias = self.model_entry(key).and_then(|m| m.logit_bias.as_ref());
+        match (provider_bias, model_bias) {
+            (None, None) => None,
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(m)) => Some(m.clone()),
+            (Some(p), Some(m)) => {
+                let mut merged = p.clone();
+                merged.extend(m.iter().map(|(k, v)| (k.clone(), *v)));
+                Some(merged)
+            }
+        }
     }
 
     /// The provider model entry a key resolves to: plain alias, `provider/alias`

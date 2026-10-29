@@ -80,6 +80,19 @@ openai-compatibility:
       prefix: "default"
       base-url: "http://192.168.124.14:8080/v1"
       api-key-env: "STRATA_UBUNTU_KEY"
+      # Sampler guards for every model this server runs (token IDs from the
+      # pack's tokenizer/vocab.json — the bias is a property of the served
+      # tokenizer, and this server is reached under names that no model entry
+      # declares: "strata-ubuntu", "strata-proxy", ...). Never let the model
+      # emit the ChatML role-boundary opener (im_start, 248045) or endoftext
+      # (248044) as content: on 2026-10-29 it opened a fake user turn
+      # mid-generation (boundary, "user", boundary, "user", "Continue") and
+      # then hit its im_end stop token — 8 output tokens, surfaced to Claude
+      # Code as a premature end_turn mid-task. im_end (248046) must stay
+      # unbanned: it is how turns end.
+      logit-bias:
+          "248044": -100
+          "248045": -100
       models:
           - name: qwen3.8-flash-next-coder-iq1_m
             alias: qwen3.8-flash-next-coder-iq1_m
