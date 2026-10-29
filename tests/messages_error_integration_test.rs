@@ -137,6 +137,7 @@ openai-compatibility:
             &std::collections::HashMap::new(),
         )),
         conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        vision_caption_cache: vllm_proxy::main::new_vision_caption_cache(),
     };
 
     use axum::routing::post;

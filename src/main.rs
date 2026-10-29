@@ -54,6 +54,115 @@ pub struct AppState {
     /// Eviction order is unspecified (HashMap does not preserve insertion
     /// order) — only the size bound is guaranteed.
     pub conn_id_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Captions already produced by `vision-model`. Claude Code resends a Read
+    /// screenshot inside `tool_result` on every later turn; the key is a hash
+    /// of the vision alias and the image bytes, so Ollama is asked once.
+    pub vision_caption_cache: Arc<std::sync::Mutex<VisionCaptionCache>>,
+}
+
+/// How many image captions to keep. The payload stored is the description,
+/// not the image bytes.
+const MAX_VISION_CAPTIONS: usize = 64;
+
+/// In-process LRU of vision captions. Keys are process-local hashes.
+pub struct VisionCaptionCache {
+    entries: std::collections::HashMap<u64, String>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl VisionCaptionCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn get(&mut self, key: u64) -> Option<String> {
+        let caption = self.entries.get(&key)?.clone();
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
+            self.order.remove(pos);
+            self.order.push_back(key);
+        }
+        Some(caption)
+    }
+
+    pub fn insert(&mut self, key: u64, caption: String) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, caption);
+            if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
+            return;
+        }
+        while self.entries.len() >= MAX_VISION_CAPTIONS {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&old);
+        }
+        self.entries.insert(key, caption);
+        self.order.push_back(key);
+    }
+}
+
+pub fn new_vision_caption_cache() -> Arc<std::sync::Mutex<VisionCaptionCache>> {
+    Arc::new(std::sync::Mutex::new(VisionCaptionCache::new()))
+}
+
+#[cfg(test)]
+mod vision_caption_cache_tests {
+    use super::*;
+
+    #[test]
+    fn caption_cache_hits_and_evicts_the_oldest() {
+        let mut cache = VisionCaptionCache::new();
+        cache.insert(1, "first".to_string());
+        assert_eq!(cache.get(1).as_deref(), Some("first"));
+        cache.insert(1, "updated".to_string());
+        assert_eq!(cache.get(1).as_deref(), Some("updated"));
+        for i in 0..MAX_VISION_CAPTIONS {
+            cache.insert(1000 + i as u64, format!("c{i}"));
+        }
+        assert!(cache.get(1).is_none());
+        assert_eq!(cache.get(1000).as_deref(), Some("c0"));
+    }
+
+    #[test]
+    fn vision_cache_key_depends_on_bytes() {
+        let a = vision_cache_key("qwen36-35b", "image/png", "aaaa");
+        assert_eq!(a, vision_cache_key("qwen36-35b", "image/png", "aaaa"));
+        assert_ne!(a, vision_cache_key("qwen36-35b", "image/png", "aaab"));
+        assert_ne!(a, vision_cache_key("other", "image/png", "aaaa"));
+    }
+
+    #[test]
+    fn ollama_vision_body_disables_thinking_and_sends_raw_images() {
+        let images = [translate_anthropic::ExtractedImage {
+            media_type: "image/jpeg".to_string(),
+            data: "QUJD".to_string(),
+        }];
+        let prompt = vision_describe_prompt("这个是什么");
+        assert!(!prompt.contains("###"));
+        assert!(prompt.contains("这个是什么"));
+        let body = ollama_vision_chat_body("qwen3.6:35b", &images, &prompt);
+        assert_eq!(body["think"], false);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["options"]["num_predict"], 1024);
+        assert_eq!(body["messages"][0]["images"][0], "QUJD");
+        assert!(body["messages"][0]["content"].as_str().unwrap().contains("plain paragraph"));
+        assert_eq!(ollama_api_root("http://127.0.0.1:11434/v1"), "http://127.0.0.1:11434");
+    }
+}
+
+fn vision_cache_key(alias: &str, media_type: &str, data: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    alias.hash(&mut hasher);
+    media_type.hash(&mut hasher);
+    data.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Maximum number of peer→UUID entries to keep in `AppState::conn_id_cache`.
@@ -564,6 +673,7 @@ async fn main() {
         rate_limiter,
         model_throttle,
         conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        vision_caption_cache: new_vision_caption_cache(),
     };
 
     let app = axum::Router::new()
@@ -3295,6 +3405,133 @@ async fn retry_non_streaming(
         .cloned()
 }
 
+fn vision_describe_prompt(user_text: &str) -> String {
+    let base = "Describe this image in one complete plain paragraph for a coding agent. Include visible text, errors, UI, and code. No title and no markdown headings.";
+    if user_text.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} The user said: {user_text}")
+    }
+}
+
+fn ollama_api_root(base_url: &str) -> String {
+    base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string()
+}
+
+/// Ollama's OpenAI `/v1/chat/completions` ignores `enable_thinking`. Image
+/// description uses native `/api/chat` with `think: false` so the paragraph
+/// lands in `message.content` instead of a thinking trace.
+fn ollama_vision_chat_body(model: &str, images: &[translate_anthropic::ExtractedImage], prompt: &str) -> Value {
+    let raw_images: Vec<&str> = images.iter().map(|img| img.data.as_str()).collect();
+    json!({
+        "model": model,
+        "stream": false,
+        "think": false,
+        "options": {"num_predict": 1024},
+        "messages": [{
+            "role": "user",
+            "content": prompt,
+            "images": raw_images,
+        }]
+    })
+}
+
+/// Ask `vision_alias` to describe `images`. The coding transcript is not sent;
+/// only the pictures and a short excerpt of the user's last text.
+async fn describe_images_for_text_model(
+    state: &AppState,
+    vision_alias: &str,
+    images: &[translate_anthropic::ExtractedImage],
+    user_text: &str,
+) -> Result<String, String> {
+    if !get_model_supports_images(state, vision_alias) {
+        return Err(format!(
+            "vision-model {vision_alias} does not declare image input"
+        ));
+    }
+    let _permit = throttle_model(state, vision_alias)
+        .await
+        .map_err(|resp| format!("vision-model throttle rejected the request: {resp:?}"))?;
+    let upstream = state.cfg.upstream_for(vision_alias);
+    if upstream.base_url.is_empty() {
+        return Err(format!("vision-model {vision_alias} has no upstream"));
+    }
+    let prompt = vision_describe_prompt(user_text);
+    let ollama = upstream.base_url.contains(":11434");
+    let (url, req_body) = if ollama {
+        let url = format!("{}/api/chat", ollama_api_root(&upstream.base_url));
+        let body = ollama_vision_chat_body(&upstream.backend_model, images, &prompt);
+        (url, body)
+    } else {
+        let url = format!("{}/chat/completions", upstream.base_url);
+        let mut parts = Vec::new();
+        for img in images {
+            let data_url = format!("data:{};base64,{}", img.media_type, img.data);
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": {"url": data_url}
+            }));
+        }
+        parts.push(json!({"type": "text", "text": prompt}));
+        let body = json!({
+            "model": upstream.backend_model,
+            "stream": false,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": parts}]
+        });
+        (url, body)
+    };
+    let mut req = state
+        .http_client
+        .post(&url)
+        .json(&req_body)
+        .timeout(std::time::Duration::from_secs(180));
+    if let Some(key) = upstream.api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    logger::info(
+        "messages",
+        &format!(
+            "POST {} model={} stream=false think=false (vision describe, {} image(s))",
+            url,
+            upstream.backend_model,
+            images.len()
+        ),
+    );
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("vision request failed: {e}"))?;
+    let status = resp.status();
+    let parsed: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("vision response was not JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("vision model HTTP {status}: {parsed}"));
+    }
+    let text = if ollama {
+        parsed.pointer("/message/content")
+    } else {
+        parsed.pointer("/choices/0/message/content")
+    }
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .trim()
+    .to_string();
+    if text.is_empty() {
+        return Err("vision model returned an empty description".to_string());
+    }
+    logger::info(
+        "messages",
+        &format!("vision description chars={}", text.chars().count()),
+    );
+    Ok(text)
+}
+
 /// Native Anthropic Messages API endpoint. Translates Anthropic format to
 /// OpenAI Chat Completions internally, then translates the response back.
 /// This bypasses CCR (Claude Code Router) entirely, fixing broken streaming.
@@ -3302,7 +3539,7 @@ pub async fn handle_messages(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
-    let request_json: Value = match serde_json::from_slice(&body) {
+    let mut request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             logger::error("messages", &format!("Invalid JSON: {}", e));
@@ -3335,6 +3572,94 @@ pub async fn handle_messages(
     // hard 500 ("not a multimodal model").
     let vision_capable = get_model_supports_images(&state, &backend_model);
 
+    // Text-only backends (Strata coder) cannot take pixels. Ask the configured
+    // Ollama vision model to describe each image, then continue this request
+    // as text. Claude Code CLI has one model per request; it cannot switch
+    // by itself when the user attaches a picture.
+    let images = translate_anthropic::collect_anthropic_images(&request_json);
+    if !images.is_empty() && !vision_capable {
+        let Some(vision_alias) = state.cfg.vision_model.clone() else {
+            logger::info(
+                "messages",
+                "request has images but the model is text-only and vision-model is unset; images will be stripped",
+            );
+            // Fall through. Translation drops the image blocks.
+            return continue_messages(state, request_json, backend_model, is_stream, vision_capable).await;
+        };
+        logger::info(
+            "messages",
+            &format!(
+                "describing {} image(s) with vision-model {} (session model {} is text-only)",
+                images.len(),
+                vision_alias,
+                backend_model
+            ),
+        );
+        let excerpt = translate_anthropic::last_user_text_excerpt(&request_json, 1500);
+        let mut captions = Vec::with_capacity(images.len());
+        let mut cache_hits = 0usize;
+        for img in &images {
+            let key = vision_cache_key(&vision_alias, &img.media_type, &img.data);
+            let cached = {
+                let mut cache = recover_poisoned_lock(
+                    state.vision_caption_cache.lock(),
+                    "vision caption cache",
+                );
+                cache.get(key)
+            };
+            let caption = if let Some(caption) = cached {
+                cache_hits += 1;
+                caption
+            } else {
+                match describe_images_for_text_model(
+                    &state,
+                    &vision_alias,
+                    std::slice::from_ref(img),
+                    &excerpt,
+                )
+                .await
+                {
+                    Ok(caption) => {
+                        let mut cache = recover_poisoned_lock(
+                            state.vision_caption_cache.lock(),
+                            "vision caption cache",
+                        );
+                        cache.insert(key, caption.clone());
+                        caption
+                    }
+                    Err(e) => {
+                        logger::error("messages", &format!("vision-model failed: {e}"));
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            format!("vision-model failed: {e}"),
+                        )
+                            .into_response();
+                    }
+                }
+            };
+            captions.push(format!("[Image, described by {vision_alias}]\n{caption}"));
+        }
+        logger::info(
+            "messages",
+            &format!(
+                "vision captions ready: {} image(s), {} cache hit(s)",
+                captions.len(),
+                cache_hits
+            ),
+        );
+        translate_anthropic::replace_anthropic_images(&mut request_json, &captions);
+    }
+
+    continue_messages(state, request_json, backend_model, is_stream, vision_capable).await
+}
+
+async fn continue_messages(
+    state: AppState,
+    request_json: Value,
+    backend_model: String,
+    is_stream: bool,
+    vision_capable: bool,
+) -> Response {
     // Translate Anthropic → OpenAI Chat Completions
     let mut cc_request = translate_anthropic::anthropic_to_chat_completions_with_vision(
         &backend_model,
@@ -3484,7 +3809,7 @@ pub async fn handle_messages(
             .unwrap_or(0);
         let total_req_bytes = serde_json::to_string(&cc_request).unwrap_or_default().len();
         let estimated_tokens = estimate_tokens(&cc_request);
-        let context_window = get_context_window(&state, &model);
+        let context_window = get_context_window(&state, &backend_model);
         logger::info(
             "messages",
             &format!(
@@ -4804,6 +5129,7 @@ openai-compatibility:
             rate_limiter: Arc::new(RateLimiter::new(0)),
             model_throttle: Arc::new(ModelThrottle::new(3, &std::collections::HashMap::new())),
             conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            vision_caption_cache: new_vision_caption_cache(),
         }
     }
 
@@ -4977,6 +5303,7 @@ openai-compatibility:
             rate_limiter: Arc::new(RateLimiter::new(0)),
             model_throttle: Arc::new(ModelThrottle::new(3, &std::collections::HashMap::new())),
             conn_id_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            vision_caption_cache: new_vision_caption_cache(),
         }
     }
 

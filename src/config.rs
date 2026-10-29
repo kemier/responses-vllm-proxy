@@ -59,6 +59,12 @@ pub struct Config {
     /// Absent means no catalog: every window/modality comes from config.yaml.
     #[serde(default)]
     pub model_catalog: Option<String>,
+    /// Ollama (or other) model that accepts images. When a `/v1/messages`
+    /// request carries an image and the selected model is text-only, the proxy
+    /// asks this model to describe the image and splices that text into the
+    /// original request. The coding model never receives the pixels.
+    #[serde(default)]
+    pub vision_model: Option<String>,
     /// Alias → (provider index, backend model name) map, populated once at load
     /// time. Keyed by plain alias AND by `provider/alias`, so a client can name
     /// which machine serves a model when two providers carry the same family.

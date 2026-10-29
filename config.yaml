@@ -138,3 +138,13 @@ openai-compatibility:
             # this model really does take images. Without the declaration the
             # proxy strips every image block (unknown => text-only).
             input_modalities: [text, image]
+          # Ollama embedding model. Undeclared slugs fall through to the default
+          # Ubuntu vLLM upstream, so /v1/embeddings must name this alias.
+          - name: "bge-m3:latest"
+            alias: bge-m3
+            context_length: 8192
+            tags: [embedding]
+# Text-only backends (Strata coder) cannot take image blocks. A request that
+# includes one is described by this Ollama model, and the description is what
+# the coding model sees. Alias must resolve to the mac provider above.
+vision-model: qwen36-35b

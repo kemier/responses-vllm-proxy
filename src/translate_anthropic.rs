@@ -2529,6 +2529,154 @@ pub fn chat_completions_to_anthropic(model: &str, response: &Value) -> Value {
         "usage": {"input_tokens": 0, "output_tokens": 0}
     })
 }
+pub struct ExtractedImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// Claude Code's Read of a png nests the image inside `tool_result.content`,
+/// not as a top-level block. Walk both. Depth is capped so a malformed body
+/// cannot recurse without bound.
+const IMAGE_WALK_DEPTH: usize = 16;
+
+fn is_base64_image(block: &Value) -> bool {
+    if block.get("type").and_then(|t| t.as_str()) != Some("image") {
+        return false;
+    }
+    let Some(source) = block.get("source") else {
+        return false;
+    };
+    source.get("type").and_then(|t| t.as_str()) == Some("base64")
+        && source
+            .get("data")
+            .and_then(|d| d.as_str())
+            .is_some_and(|s| !s.is_empty())
+}
+
+fn extracted_image(block: &Value) -> Option<ExtractedImage> {
+    if !is_base64_image(block) {
+        return None;
+    }
+    let source = block.get("source")?;
+    let data = source.get("data")?.as_str()?.to_string();
+    let media_type = source
+        .get("media_type")
+        .and_then(|m| m.as_str())
+        .unwrap_or("image/png")
+        .to_string();
+    Some(ExtractedImage { media_type, data })
+}
+
+fn walk_image_blocks(blocks: &[Value], out: &mut Vec<ExtractedImage>, depth: usize) {
+    if depth >= IMAGE_WALK_DEPTH {
+        return;
+    }
+    for block in blocks {
+        if let Some(image) = extracted_image(block) {
+            out.push(image);
+            continue;
+        }
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
+                walk_image_blocks(inner, out, depth + 1);
+            }
+        }
+    }
+}
+
+fn walk_replace_image_blocks(
+    blocks: &mut [Value],
+    captions: &[String],
+    index: &mut usize,
+    depth: usize,
+) {
+    if depth >= IMAGE_WALK_DEPTH {
+        return;
+    }
+    for block in blocks.iter_mut() {
+        if is_base64_image(block) {
+            if let Some(caption) = captions.get(*index) {
+                *block = json!({"type": "text", "text": caption});
+            }
+            *index += 1;
+            continue;
+        }
+        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+            if let Some(inner) = block.get_mut("content").and_then(|c| c.as_array_mut()) {
+                walk_replace_image_blocks(inner, captions, index, depth + 1);
+            }
+        }
+    }
+}
+
+/// Image blocks on an Anthropic Messages body, including those nested in
+/// `tool_result` content. Empty when the turn is text-only. Order matches
+/// `replace_anthropic_images`.
+pub fn collect_anthropic_images(body: &Value) -> Vec<ExtractedImage> {
+    let mut out = Vec::new();
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return out;
+    };
+    for msg in messages {
+        let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        walk_image_blocks(blocks, &mut out, 0);
+    }
+    out
+}
+
+/// The last user text, capped, so the vision model knows what to look for
+/// without receiving the coding model's full transcript.
+pub fn last_user_text_excerpt(body: &Value, max_chars: usize) -> String {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
+        return String::new();
+    };
+    let mut excerpt = String::new();
+    for msg in messages.iter().rev() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                if !excerpt.is_empty() {
+                    excerpt.push('\n');
+                }
+                excerpt.push_str(text);
+            }
+        }
+        if !excerpt.is_empty() {
+            break;
+        }
+    }
+    if excerpt.chars().count() > max_chars {
+        excerpt = excerpt.chars().take(max_chars).collect();
+    }
+    excerpt
+}
+
+/// Swap each base64 image block for the caption at the same index.
+/// `captions` follows `collect_anthropic_images` order, including images
+/// nested inside `tool_result` content. The coding model then sees prose.
+pub fn replace_anthropic_images(body: &mut Value, captions: &[String]) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    let mut index = 0;
+    for msg in messages {
+        let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        walk_replace_image_blocks(blocks, captions, &mut index, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2560,6 +2708,65 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn test_replace_anthropic_images_with_caption() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aaaa"}}
+                ]
+            }]
+        });
+        let images = collect_anthropic_images(&body);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(last_user_text_excerpt(&body, 20), "what is this");
+        replace_anthropic_images(&mut body, &["[vision] a red button".to_string()]);
+        let text = body["messages"][0]["content"][1]["text"].as_str().unwrap();
+        assert_eq!(text, "[vision] a red button");
+        assert!(collect_anthropic_images(&body).is_empty());
+    }
+
+    /// Claude Code Read stores the png inside tool_result.content. That image
+    /// must be collected and replaced in place; the user's earlier text is the
+    /// excerpt, because the latest user turn is only the tool result.
+    #[test]
+    fn test_tool_result_image_is_replaced_in_place() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "look at the screenshot"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": [
+                        {"type": "text", "text": "file.png"},
+                        {"type": "image", "source": {"type": "url", "url": "https://example.test/skip.png"}},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "bbbb"}},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "cccc"}}
+                    ]
+                }]}
+            ]
+        });
+        let images = collect_anthropic_images(&body);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].data, "bbbb");
+        assert_eq!(images[1].media_type, "image/jpeg");
+        assert_eq!(last_user_text_excerpt(&body, 80), "look at the screenshot");
+        replace_anthropic_images(
+            &mut body,
+            &["[vision] red button".to_string(), "[vision] stack trace".to_string()],
+        );
+        let inner = &body["messages"][2]["content"][0]["content"];
+        assert_eq!(inner[0]["text"], "file.png");
+        assert_eq!(inner[1]["source"]["type"], "url");
+        assert_eq!(inner[2]["text"], "[vision] red button");
+        assert_eq!(inner[3]["text"], "[vision] stack trace");
+        assert!(collect_anthropic_images(&body).is_empty());
     }
 
     /// Strata streams the think channel as `reasoning_content`, not `reasoning`.
