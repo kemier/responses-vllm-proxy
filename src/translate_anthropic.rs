@@ -192,12 +192,30 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>, vision_capa
             if role == "assistant" {
                 let mut text_parts = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
+                let mut reasoning_parts: Vec<String> = Vec::new();
 
                 for block in blocks {
                     match block.get("type").and_then(|v| v.as_str()) {
                         Some("text") => {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                                 text_parts.push(text.to_string());
+                            }
+                        }
+                        // Replayed thinking becomes the OpenAI reasoning_content
+                        // field, which thinking-aware templates (strata) render
+                        // back inside <think> for the in-flight chain. Dropping
+                        // it (the old behavior) leaves the model unable to see
+                        // its own reasoning in later turns: in long sessions it
+                        // loses track of the task ("The user hasn't asked
+                        // anything yet" on repeat) and can end_turn right after
+                        // announcing work it never does (2026-10-30, tensorRT
+                        // session, 110k tokens). redacted_thinking stays
+                        // dropped — encrypted reasoning cannot be replayed.
+                        Some("thinking") => {
+                            if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                                if !t.is_empty() {
+                                    reasoning_parts.push(t.to_string());
+                                }
                             }
                         }
                         Some("tool_use") => {
@@ -234,6 +252,9 @@ fn convert_anthropic_message(msg: &Value, messages: &mut Vec<Value>, vision_capa
                     json!(text_parts.join("\n"))
                 };
                 let mut assistant_msg = json!({"role": "assistant", "content": content});
+                if !reasoning_parts.is_empty() {
+                    assistant_msg["reasoning_content"] = json!(reasoning_parts.join("\n"));
+                }
                 if !tool_calls.is_empty() {
                     assistant_msg["tool_calls"] = json!(tool_calls);
                 }
@@ -3746,6 +3767,53 @@ mod tests {
 
     /// A tool that declares no properties gets the placeholder for GLM, so the
     /// model emits `{"__noargs": ""}` instead of the dropped `{}`.
+    /// Replayed thinking blocks must become `reasoning_content` on the
+    /// OpenAI assistant message (strata renders them back inside <think> for
+    /// the in-flight chain). Dropping them is what made the model lose track
+    /// of the task in long sessions.
+    #[test]
+    fn test_assistant_thinking_becomes_reasoning_content() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "port the kernel"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "first check the arch", "signature": ""},
+                    {"type": "text", "text": "checking now"},
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "uname -m"}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "aarch64"}]}
+            ]
+        });
+        let out = anthropic_to_chat_completions("test-model", &body, true);
+        let msgs = out["messages"].as_array().unwrap();
+        let assistant = &msgs[1];
+        assert_eq!(
+            assistant.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("first check the arch"),
+            "thinking must be replayed as reasoning_content: {assistant}"
+        );
+        assert_eq!(assistant["content"].as_str(), Some("checking now"));
+        assert!(assistant.get("tool_calls").is_some());
+    }
+
+    /// redacted_thinking is another server's encrypted reasoning — it stays
+    /// dropped rather than replayed as garbage.
+    #[test]
+    fn test_redacted_thinking_is_dropped() {
+        let body = json!({
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "redacted_thinking", "data": "encrypted-blob"},
+                    {"type": "text", "text": "answer"}
+                ]}
+            ]
+        });
+        let out = anthropic_to_chat_completions("test-model", &body, false);
+        let assistant = &out["messages"][0];
+        assert!(assistant.get("reasoning_content").is_none());
+        assert_eq!(assistant["content"].as_str(), Some("answer"));
+    }
+
     #[test]
     fn test_noargs_tool_gets_placeholder_for_glm() {
         let body = json!({

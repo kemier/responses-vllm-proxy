@@ -3728,6 +3728,24 @@ async fn continue_messages(
             }
         }
     }
+    // Thinking replay, part 2: assistant thinking blocks arrive as
+    // reasoning_content (see convert_anthropic_message). preserve_thinking
+    // =false tells the template to render those think blocks only for the
+    // in-flight chain (after the last real user message) and to drop them
+    // from older turns — the model keeps its working memory for the current
+    // task without the prompt growing by every historical think block.
+    // Without any replay the model loses track in long sessions ("The user
+    // hasn't asked anything yet" on repeat) and can end_turn right after
+    // announcing work it never does (2026-10-30, tensorRT session, 110k
+    // tokens). Templates that don't know the kwarg ignore it.
+    if let Some(obj) = cc_request.as_object_mut() {
+        let kwargs = obj
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| json!({}));
+        if let Some(kw) = kwargs.as_object_mut() {
+            kw.entry("preserve_thinking").or_insert(json!(false));
+        }
+    }
     apply_configured_logit_bias(&mut cc_request, &state.cfg, &backend_model);
 
         let upstream = state.cfg.upstream_for(&backend_model);
