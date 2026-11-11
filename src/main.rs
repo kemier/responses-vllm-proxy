@@ -677,6 +677,22 @@ async fn main() {
         }
     };
 
+    // OTel: config fingerprint (Q52 "config version" gap) — FNV-1a over the
+    // raw config bytes, so a trace can be pinned to the config.yaml revision
+    // that served it. On read failure the getter stays total (attribute
+    // omitted).
+    match std::fs::read_to_string(&config_path) {
+        Ok(raw) => {
+            let mut h: u64 = 14695981039346656037;
+            for b in raw.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(1099511627775);
+            }
+            otel::set_config_version(format!("{:016x}", h));
+        }
+        Err(_) => {}
+    }
+
     // Initialize logger
     let to_stderr = !cfg.logging_to_file || cfg.debug;
     logger::init(
@@ -1211,7 +1227,7 @@ pub async fn handle_health() -> impl IntoResponse {
 pub async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
     // OTel: one trace per request lifecycle; the span ends on every return
     // path because the context drops at scope exit (tracing.md model).
-    let cx = otel::server_span("POST /v1/responses", vec![otel::kv("gen_ai.operation.name", "responses")]);
+    let cx = otel::server_span("POST /v1/responses", otel::root_span_attrs("responses"));
     let request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -1232,10 +1248,13 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
 
     // gen_ai conventions: request model = alias asked for; response model =
     // backend actually resolved to (the requested-vs-resolved pair).
+    // Sampling params are recorded only when the client sent them (absent =
+    // backend default, not zero).
     otel::add_attrs(&cx, vec![
         otel::kv("gen_ai.request.model", &model_alias),
         otel::kv("gen_ai.response.model", &backend_model),
     ]);
+    otel::add_attrs(&cx, otel::sampling_attrs(&request_json));
 
     // Per-model concurrency throttle — hold spot for the whole upstream call.
     let _permit = match throttle_model(&state, &backend_model).await {
@@ -1283,6 +1302,9 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     // 400 here beats a backend 400/503 storm on the shared vLLM.
     let context_window = get_context_window(&state, &model_alias);
     let estimated_tokens = estimate_tokens(&cc_payload);
+    // OTel: the proxy's own estimate (labeled estimated — exact upstream
+    // usage on the streaming path lives in the spawned SSE task, a gap).
+    otel::add_attrs(&cx, otel::estimated_input_attrs(estimated_tokens));
     if estimated_tokens as u64 > context_window {
         logger::warn("responses", &format!(
            "Context size warning: ~{} tokens may exceed context_window {} for model {} — codex should auto-compact",
@@ -1326,6 +1348,8 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
             otel::mark_error(&up_cx, &format!("upstream returned {}", r.status())),
         Ok(_) => {}
     }
+    // OTel: how many tries the retry loop used — attempt count on the span.
+    otel::add_attrs(&up_cx, otel::attempt_attrs(upstream_attempts));
         let resp = match resp_result
     {
         Ok(r) => r,
@@ -2628,7 +2652,7 @@ pub async fn handle_chat_completions(
     body: axum::body::Bytes,
 ) -> Response {
     // OTel: one trace per request lifecycle (see otel.rs / tracing.md).
-    let cx = otel::server_span("POST /v1/chat/completions", vec![otel::kv("gen_ai.operation.name", "chat")]);
+    let cx = otel::server_span("POST /v1/chat/completions", otel::root_span_attrs("chat"));
     let mut request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -2651,6 +2675,7 @@ pub async fn handle_chat_completions(
         otel::kv("gen_ai.request.model", &model),
         otel::kv("gen_ai.response.model", &backend_model),
     ]);
+    otel::add_attrs(&cx, otel::sampling_attrs(&request_json));
 
     // Per-model concurrency throttle — hold spot for the whole upstream call.
     let _permit = match throttle_model(&state, &backend_model).await {
@@ -2992,7 +3017,7 @@ pub async fn handle_chat_completions(
     }
 
     let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
-    let (resp, _cc_attempts) = send_upstream_retry(
+    let (resp, cc_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
             let req = state
@@ -3013,6 +3038,8 @@ pub async fn handle_chat_completions(
             otel::mark_error(&up_cx, &format!("upstream returned {}", r.status())),
         Ok(_) => {}
     }
+    // OTel: how many tries the retry loop used — attempt count on the span.
+    otel::add_attrs(&up_cx, otel::attempt_attrs(cc_attempts));
 
     match resp {
         Ok(r) => {
@@ -3683,7 +3710,7 @@ pub async fn handle_messages(
     body: axum::body::Bytes,
 ) -> Response {
     // OTel: one trace per request lifecycle (see otel.rs / tracing.md).
-    let cx = otel::server_span("POST /v1/messages", vec![otel::kv("gen_ai.operation.name", "chat")]);
+    let cx = otel::server_span("POST /v1/messages", otel::root_span_attrs("chat"));
     let mut request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -3706,6 +3733,7 @@ pub async fn handle_messages(
         otel::kv("gen_ai.request.model", &model),
         otel::kv("gen_ai.response.model", &backend_model),
     ]);
+    otel::add_attrs(&cx, otel::sampling_attrs(&request_json));
 
     // Per-model concurrency throttle — hold spot for the whole upstream call.
     let _permit = match throttle_model(&state, &backend_model).await {
@@ -3998,6 +4026,8 @@ async fn continue_messages(
             .unwrap_or(0);
         let total_req_bytes = serde_json::to_string(&cc_request).unwrap_or_default().len();
         let estimated_tokens = estimate_tokens(&cc_request);
+        // OTel: proxy-side estimate on the root span (see gap note above).
+        otel::add_attrs(&cx, otel::estimated_input_attrs(estimated_tokens));
         let context_window = get_context_window(&state, &backend_model);
         logger::info(
             "messages",
@@ -4025,7 +4055,7 @@ async fn continue_messages(
     }
 
     let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
-    let (resp, _msg_attempts) = send_upstream_retry(
+    let (resp, msg_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
             let req = state
@@ -4046,6 +4076,8 @@ async fn continue_messages(
             otel::mark_error(&up_cx, &format!("upstream returned {}", r.status())),
         Ok(_) => {}
     }
+    // OTel: how many tries the retry loop used — attempt count on the span.
+    otel::add_attrs(&up_cx, otel::attempt_attrs(msg_attempts));
 
     match resp {
         Ok(r) => {

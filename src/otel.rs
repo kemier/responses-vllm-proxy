@@ -26,6 +26,7 @@ use opentelemetry::{Context, KeyValue, global};
 use opentelemetry::trace::{SpanKind, Status, Tracer, TraceContextExt};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use serde_json::Value;
 
 /// Install the OTLP/HTTP span pipeline if `OTEL_TRACES_ENDPOINT` is set.
 /// Uses the simple (synchronous) exporter: spans are flushed as soon as
@@ -106,4 +107,66 @@ pub fn server_span(name: &str, attrs: Vec<KeyValue>) -> Context {
 /// Client-kind child span (an outbound call to the upstream vLLM).
 pub fn client_span(parent: &Context, name: &str, attrs: Vec<KeyValue>) -> Context {
     child_span(parent, name, SpanKind::Client, attrs)
+}
+
+/// Sampling params the client actually sent (gen_ai.request.* convention).
+/// Recorded only when the key is present in the request body — absent means
+/// "backend default", which must stay distinguishable from "explicitly zero".
+pub fn sampling_attrs(request: &Value) -> Vec<KeyValue> {
+    let mut attrs: Vec<KeyValue> = vec![];
+    for (json_key, attr_name) in [
+        ("temperature", "gen_ai.request.temperature"),
+        ("top_p", "gen_ai.request.top_p"),
+        ("max_tokens", "gen_ai.request.max_tokens"),
+    ] {
+        if let Some(v) = request.get(json_key) {
+            if let Some(f) = v.as_f64() {
+                attrs.push(kv(attr_name, &format!("{}", f)));
+            } else if let Some(s) = v.as_str() {
+                attrs.push(kv(attr_name, s));
+            }
+        }
+    }
+    attrs
+}
+
+/// Attempt count on the upstream child span (Q52 "attempt count" gap):
+/// how many tries send_upstream_retry used before this response landed.
+pub fn attempt_attrs(attempts: u32) -> Vec<KeyValue> {
+    vec![kv("proxy.attempt_count", &format!("{}", attempts))]
+}
+
+/// Estimated input tokens on the root span (Q52 "token counts" gap, partial):
+/// the proxy's own estimate — exact upstream usage on the streaming path
+/// lives inside the spawned SSE task and stays a documented gap.
+pub fn estimated_input_attrs(estimated: usize) -> Vec<KeyValue> {
+    vec![kv("proxy.estimated_input_tokens", &format!("{}", estimated))]
+}
+
+/// Config fingerprint backing proxy.config.version (Q52 "config version"
+/// gap): written once at startup from an FNV-1a hash of the raw config
+/// bytes, read by every root span. Mutex<Option<String>> is the simplest
+/// write-once that keeps the getter total when hashing failed.
+static CONFIG_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_config_version(version: String) {
+    let mut slot = CONFIG_VERSION.lock().unwrap();
+    *slot = Some(version);
+}
+
+pub fn config_version() -> String {
+    let slot = CONFIG_VERSION.lock().unwrap();
+    (*slot).clone().unwrap_or_default()
+}
+
+/// Root-span attrs = operation name + config version (when the startup
+/// fingerprint succeeded). Every root span gets this so a trace can be
+/// pinned to the config.yaml revision that served it.
+pub fn root_span_attrs(operation: &str) -> Vec<KeyValue> {
+    let mut attrs: Vec<KeyValue> = vec![kv("gen_ai.operation.name", operation)];
+    let version = config_version();
+    if !version.is_empty() {
+        attrs.push(kv("proxy.config.version", &version));
+    }
+    attrs
 }
