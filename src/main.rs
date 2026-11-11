@@ -1326,7 +1326,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
         &format!("POST {} model={} stream={}", url, backend_model, is_stream),
     );
 
-    let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
+    let up_cx = otel::client_span(&cx, &format!("chat {}", backend_model), vec![otel::kv("gen_ai.request.model", &backend_model)]);
     let (resp_result, upstream_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
@@ -3016,7 +3016,7 @@ pub async fn handle_chat_completions(
         }
     }
 
-    let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
+    let up_cx = otel::client_span(&cx, &format!("chat {}", backend_model), vec![otel::kv("gen_ai.request.model", &backend_model)]);
     let (resp, cc_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
@@ -4054,7 +4054,7 @@ async fn continue_messages(
         );
     }
 
-    let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
+    let up_cx = otel::client_span(&cx, &format!("chat {}", backend_model), vec![otel::kv("gen_ai.request.model", &backend_model)]);
     let (resp, msg_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
