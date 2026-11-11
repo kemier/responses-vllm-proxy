@@ -9,6 +9,8 @@ pub mod translate_anthropic;
 pub mod translate_request;
 #[allow(clippy::duplicate_mod)]
 pub mod translate_response;
+#[allow(clippy::duplicate_mod)]
+pub mod otel;
 
 use axum::{
     body::Body,
@@ -21,6 +23,7 @@ use axum::{
 };
 use axum::extract::Request;
 use futures_util::StreamExt;
+use opentelemetry::Context;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -505,6 +508,95 @@ fn apply_configured_logit_bias(payload: &mut Value, cfg: &config::Config, backen
     }
 }
 
+/// Rough char→token estimate used only for classifier prompt trimming.
+fn approx_tokens(s: &str) -> usize {
+    // English/code mix ≈ 4 chars/token; round up so we stay under budget.
+    (s.len() + 3) / 4
+}
+
+fn anthropic_content_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                } else {
+                    // Keep a short stub for non-text parts so the role is clear.
+                    Some(format!("[{}]", p.get("type").and_then(|t| t.as_str()).unwrap_or("part")))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => content.to_string(),
+    }
+}
+
+/// Keep the classifier prompt inside `max_tokens` by retaining the system
+/// prompt and the newest messages (Claude Code ships the whole session).
+fn truncate_anthropic_classifier_prompt(body: &mut Value, max_tokens: usize) {
+    let system_text = body
+        .get("system")
+        .map(|s| match s {
+            Value::String(t) => t.clone(),
+            Value::Array(_) => anthropic_content_text(s),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    let system_tok = approx_tokens(&system_text);
+
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+
+    let before = messages.len();
+    let mut kept: Vec<Value> = Vec::new();
+    let mut used = system_tok.min(max_tokens / 4); // reserve most of the budget for the action
+    // Walk newest → oldest.
+    for msg in messages.iter().rev() {
+        let text = msg
+            .get("content")
+            .map(anthropic_content_text)
+            .unwrap_or_default();
+        let tok = approx_tokens(&text).max(1);
+        if !kept.is_empty() && used + tok > max_tokens {
+            break;
+        }
+        // Always keep at least the newest message, even if oversized: trim it.
+        if kept.is_empty() && used + tok > max_tokens {
+            let budget_chars = max_tokens.saturating_sub(used).saturating_mul(4);
+            let trimmed = if text.len() > budget_chars {
+                text[text.len() - budget_chars..].to_string()
+            } else {
+                text
+            };
+            let mut m = msg.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("content".into(), Value::String(trimmed));
+            }
+            kept.push(m);
+            break;
+        }
+        kept.push(msg.clone());
+        used += tok;
+    }
+    kept.reverse();
+    let after = kept.len();
+    *messages = kept;
+    if after < before {
+        logger::info(
+            "messages",
+            &format!(
+                "classifier prompt truncated: kept {after}/{before} messages (~{used} tok budget {max_tokens})"
+            ),
+        );
+    }
+}
+
 /// Build an HTTP 400 response when a request's estimated token count exceeds
 /// the model's effective context window. Returns `None` when the request fits
 /// (or the window is unknown), so callers fall through to normal forwarding.
@@ -593,6 +685,12 @@ async fn main() {
         to_stderr,
         &cfg.log_level,
     );
+
+    // OTel span tracing: no-op unless OTEL_TRACES_ENDPOINT is set
+    // (e.g. http://localhost:4318/v1/traces for otel-desktop-viewer).
+    // The provider stays alive for the process lifetime; the simple
+    // exporter flushes each span as it ends, so no shutdown is needed.
+    let _otel_provider = otel::init_from_env();
 
     if cfg.provider().is_none() {
         logger::error("main", "No provider found in config");
@@ -1111,10 +1209,14 @@ pub async fn handle_health() -> impl IntoResponse {
 
 // ─── POST /v1/responses ────────────────────────────────────────────────────
 pub async fn handle_responses(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+    // OTel: one trace per request lifecycle; the span ends on every return
+    // path because the context drops at scope exit (tracing.md model).
+    let cx = otel::server_span("POST /v1/responses", vec![otel::kv("gen_ai.operation.name", "responses")]);
     let request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             logger::error("responses", &format!("Invalid JSON: {}", e));
+            otel::mark_error(&cx, &format!("Invalid JSON: {}", e));
             return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
         }
     };
@@ -1128,10 +1230,20 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
     // Resolve alias → backend model ID
     let backend_model = state.cfg.resolve_model(&model_alias);
 
+    // gen_ai conventions: request model = alias asked for; response model =
+    // backend actually resolved to (the requested-vs-resolved pair).
+    otel::add_attrs(&cx, vec![
+        otel::kv("gen_ai.request.model", &model_alias),
+        otel::kv("gen_ai.response.model", &backend_model),
+    ]);
+
     // Per-model concurrency throttle — hold spot for the whole upstream call.
     let _permit = match throttle_model(&state, &backend_model).await {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => {
+            otel::mark_error(&cx, "throttle timeout (503)");
+            return e;
+        }
     };
 
     let is_stream = request_json
@@ -1178,6 +1290,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
        ));
     }
     if let Some(resp) = context_overflow_response(&state, &model_alias, estimated_tokens) {
+        otel::mark_error(&cx, "context overflow (400)");
         return resp;
     }
 
@@ -1191,6 +1304,7 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
         &format!("POST {} model={} stream={}", url, backend_model, is_stream),
     );
 
+    let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
     let (resp_result, upstream_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
@@ -1204,6 +1318,14 @@ pub async fn handle_responses(State(state): State<AppState>, body: axum::body::B
                 .json(&cc_payload)
         },
     ).await;
+    // OTel: mark the upstream child span red on transport failure or a
+    // non-2xx upstream status — the first red span names the broken layer.
+    match &resp_result {
+        Err(e) => otel::mark_error(&up_cx, &format!("upstream transport error: {}", e)),
+        Ok(r) if !r.status().is_success() =>
+            otel::mark_error(&up_cx, &format!("upstream returned {}", r.status())),
+        Ok(_) => {}
+    }
         let resp = match resp_result
     {
         Ok(r) => r,
@@ -2505,10 +2627,13 @@ pub async fn handle_chat_completions(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
+    // OTel: one trace per request lifecycle (see otel.rs / tracing.md).
+    let cx = otel::server_span("POST /v1/chat/completions", vec![otel::kv("gen_ai.operation.name", "chat")]);
     let mut request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             logger::error("chat", &format!("Invalid JSON: {}", e));
+            otel::mark_error(&cx, &format!("Invalid JSON: {}", e));
             return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
         }
     };
@@ -2521,10 +2646,19 @@ pub async fn handle_chat_completions(
 
     let backend_model = state.cfg.resolve_model(&model);
 
+    // gen_ai conventions: requested alias vs the backend it resolves to.
+    otel::add_attrs(&cx, vec![
+        otel::kv("gen_ai.request.model", &model),
+        otel::kv("gen_ai.response.model", &backend_model),
+    ]);
+
     // Per-model concurrency throttle — hold spot for the whole upstream call.
     let _permit = match throttle_model(&state, &backend_model).await {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => {
+            otel::mark_error(&cx, "throttle timeout (503)");
+            return e;
+        }
     };
 
     // Resolve alias in the request
@@ -2857,6 +2991,7 @@ pub async fn handle_chat_completions(
         }
     }
 
+    let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
     let (resp, _cc_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
@@ -2870,6 +3005,14 @@ pub async fn handle_chat_completions(
                 req
         },
     ).await;
+    // OTel: mark the upstream child span red on transport failure or a
+    // non-2xx upstream status — the first red span names the broken layer.
+    match &resp {
+        Err(e) => otel::mark_error(&up_cx, &format!("upstream transport error: {}", e)),
+        Ok(r) if !r.status().is_success() =>
+            otel::mark_error(&up_cx, &format!("upstream returned {}", r.status())),
+        Ok(_) => {}
+    }
 
     match resp {
         Ok(r) => {
@@ -3539,10 +3682,13 @@ pub async fn handle_messages(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> Response {
+    // OTel: one trace per request lifecycle (see otel.rs / tracing.md).
+    let cx = otel::server_span("POST /v1/messages", vec![otel::kv("gen_ai.operation.name", "chat")]);
     let mut request_json: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
             logger::error("messages", &format!("Invalid JSON: {}", e));
+            otel::mark_error(&cx, &format!("Invalid JSON: {}", e));
             return (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)).into_response();
         }
     };
@@ -3555,11 +3701,33 @@ pub async fn handle_messages(
 
     let backend_model = state.cfg.resolve_model(&model);
 
+    // gen_ai conventions: requested alias vs the backend it resolves to.
+    otel::add_attrs(&cx, vec![
+        otel::kv("gen_ai.request.model", &model),
+        otel::kv("gen_ai.response.model", &backend_model),
+    ]);
+
     // Per-model concurrency throttle — hold spot for the whole upstream call.
     let _permit = match throttle_model(&state, &backend_model).await {
         Ok(p) => p,
-        Err(e) => return e,
+        Err(e) => {
+            otel::mark_error(&cx, "throttle timeout (503)");
+            return e;
+        }
     };
+
+    // Claude Code auto-mode classifier requests ship the full session
+    // transcript (observed 34k tokens). The gpu-1050 classifier is a 1.7B
+    // CPU model with a small window; forwarding the whole prompt yields a
+    // 400 "exceeds context" that Claude Code surfaces as
+    // "Not run · auto mode's check had no usable answer". Keep the tail
+    // that fits a fast check (~6k tokens ≈ under the ~60s classifier budget
+    // at ~85 tok/s). Tagged via config.yaml `tags: [classifier]`.
+    if state.cfg.model_has_tag(&model, "classifier")
+        || state.cfg.model_has_tag(&backend_model, "classifier")
+    {
+        truncate_anthropic_classifier_prompt(&mut request_json, 6_000);
+    }
 
     let is_stream = request_json
         .get("stream")
@@ -3584,7 +3752,7 @@ pub async fn handle_messages(
                 "request has images but the model is text-only and vision-model is unset; images will be stripped",
             );
             // Fall through. Translation drops the image blocks.
-            return continue_messages(state, request_json, backend_model, is_stream, vision_capable).await;
+            return continue_messages(state, request_json, backend_model, is_stream, vision_capable, cx).await;
         };
         logger::info(
             "messages",
@@ -3650,7 +3818,7 @@ pub async fn handle_messages(
         translate_anthropic::replace_anthropic_images(&mut request_json, &captions);
     }
 
-    continue_messages(state, request_json, backend_model, is_stream, vision_capable).await
+    continue_messages(state, request_json, backend_model, is_stream, vision_capable, cx).await
 }
 
 async fn continue_messages(
@@ -3659,6 +3827,7 @@ async fn continue_messages(
     backend_model: String,
     is_stream: bool,
     vision_capable: bool,
+    cx: Context,
 ) -> Response {
     // Translate Anthropic → OpenAI Chat Completions
     let mut cc_request = translate_anthropic::anthropic_to_chat_completions_with_vision(
@@ -3699,7 +3868,8 @@ async fn continue_messages(
     // tools for that request only — gating on the instruction rather than on
     // `thinking: disabled` keeps tool use working for non-reasoning models.
     let text_only = is_text_only_turn(&request_json);
-    if text_only {
+    let is_classifier = state.cfg.model_has_tag(&backend_model, "classifier");
+    if text_only || is_classifier {
         if let Some(obj) = cc_request.as_object_mut() {
             obj.remove("tools");
             obj.remove("tool_choice");
@@ -3711,9 +3881,10 @@ async fn continue_messages(
             .entry("chat_template_kwargs")
             .or_insert_with(|| json!({}));
         if let Some(kw) = kwargs.as_object_mut() {
-            if client_thinking_disabled || text_only {
+            if client_thinking_disabled || text_only || is_classifier {
                 // Client explicitly disabled thinking, or this is a text-only
-                // summarization turn — honor it.
+                // summarization / classifier turn — honor it. Classifier
+                // models must answer ALLOW/DENY without a think block.
                 kw.insert("enable_thinking".to_string(), json!(false));
             } else if let Some(ref effort) = effort {
                 if lower_model.contains("glm") {
@@ -3853,6 +4024,7 @@ async fn continue_messages(
         );
     }
 
+    let up_cx = otel::client_span(&cx, "upstream.chat", vec![otel::kv("gen_ai.request.model", &backend_model)]);
     let (resp, _msg_attempts) = send_upstream_retry(
         state.cfg.request_retry,
         || {
@@ -3866,6 +4038,14 @@ async fn continue_messages(
                 .json(&cc_request)
         },
     ).await;
+    // OTel: mark the upstream child span red on transport failure or a
+    // non-2xx upstream status — the first red span names the broken layer.
+    match &resp {
+        Err(e) => otel::mark_error(&up_cx, &format!("upstream transport error: {}", e)),
+        Ok(r) if !r.status().is_success() =>
+            otel::mark_error(&up_cx, &format!("upstream returned {}", r.status())),
+        Ok(_) => {}
+    }
 
     match resp {
         Ok(r) => {

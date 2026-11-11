@@ -20,6 +20,11 @@ log = "0.4"
 once_cell = "1"
 tokio-util = "0.7"
 socket2 = "0.5"
+# OTel span tracing (OTLP/HTTP) — no-op unless OTEL_TRACES_ENDPOINT is set.
+# Pinned to the same release train the exporter depends on internally.
+opentelemetry = "0.33.1"
+opentelemetry_sdk = "0.33.1"
+opentelemetry-otlp = "0.33.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
